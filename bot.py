@@ -12,8 +12,8 @@ import math
 import pytz
 
 # Конфигурация
-TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
-ADMIN_ID = 2010296191
+TOKEN = "8574655444:AAGlqVwKq1R_t0JcW9frVeo1ZEmnJirBwSI"
+ADMIN_ID = 7517164478
 TIMEZONE = pytz.timezone('Europe/Moscow')
 
 # Настройка логирования
