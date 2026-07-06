@@ -84,6 +84,7 @@ def init_db():
         skipped_count INTEGER DEFAULT 0,
         last_shown TEXT,
         is_archived BOOLEAN DEFAULT 0,
+        show_in_profit BOOLEAN DEFAULT 1,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
@@ -193,15 +194,15 @@ def add_user(user_id, username, full_name):
 def add_tag(user_id, tag, deadline):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO tags (user_id, tag, deadline, created_at, skipped_count, last_shown) VALUES (?, ?, ?, ?, ?, ?)", 
-                  (user_id, tag, deadline, get_current_time().strftime("%Y-%m-%d %H:%M:%S"), 0, ''))
+    cursor.execute("INSERT INTO tags (user_id, tag, deadline, created_at, skipped_count, last_shown, show_in_profit) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                  (user_id, tag, deadline, get_current_time().strftime("%Y-%m-%d %H:%M:%S"), 0, '', 1))
     conn.commit()
     conn.close()
 
 def get_tag_by_name(tag_name):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tags WHERE tag = ? AND is_active = 1 AND is_archived = 0", (tag_name,))
+    cursor.execute("SELECT * FROM tags WHERE tag = ? AND is_active = 1 AND show_in_profit = 1", (tag_name,))
     tag = cursor.fetchone()
     conn.close()
     return tag
@@ -215,7 +216,7 @@ def get_tag_info(tag_name):
     FROM tags t 
     JOIN users u ON t.user_id = u.user_id 
     LEFT JOIN unsubscribed u2 ON t.id = u2.tag_id
-    WHERE t.tag = ? AND t.is_active = 1 AND t.is_archived = 0
+    WHERE t.tag = ? AND t.is_active = 1 AND t.show_in_profit = 1
     ''', (tag_name,))
     tag = cursor.fetchone()
     conn.close()
@@ -231,7 +232,7 @@ def get_all_user_tags_with_status(user_id):
     FROM tags t 
     LEFT JOIN unsubscribed u ON t.id = u.tag_id 
     LEFT JOIN payments p ON t.id = p.tag_id
-    WHERE t.user_id = ? AND t.is_active = 1 AND t.is_archived = 0
+    WHERE t.user_id = ? AND t.is_active = 1 AND t.show_in_profit = 1
     ORDER BY t.created_at DESC
     ''', (user_id,))
     tags = cursor.fetchall()
@@ -255,12 +256,20 @@ def add_unsubscribed(tag_id):
     conn.close()
     set_last_update_time(get_current_time().strftime("%H:%M"))
 
+def remove_from_unsubscribed(tag_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM unsubscribed WHERE tag_id = ?", (tag_id,))
+    conn.commit()
+    conn.close()
+
 def get_unsubscribed_tags():
     today = get_current_time().strftime("%d.%m")
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
-    # Архивируем теги с истекшим сроком (для проверки отписок они больше не показываются)
+    # Удаляем из проверки отписок теги с истекшим сроком (на следующий день)
+    # Они помечаются is_archived = 1, но show_in_profit остается 1
     cursor.execute('''
     UPDATE tags 
     SET is_archived = 1 
@@ -320,7 +329,7 @@ def decrement_tag_skipped(tag_id):
 def update_deadline(tag_name, new_deadline):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
-    cursor.execute("UPDATE tags SET deadline = ? WHERE tag = ? AND is_active = 1 AND is_archived = 0", 
+    cursor.execute("UPDATE tags SET deadline = ? WHERE tag = ? AND is_active = 1 AND show_in_profit = 1", 
                   (new_deadline, tag_name))
     conn.commit()
     conn.close()
@@ -339,7 +348,7 @@ def get_user_stats(user_id):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
-    cursor.execute("SELECT id FROM tags WHERE user_id = ? AND is_active = 1 AND is_archived = 0", (user_id,))
+    cursor.execute("SELECT id FROM tags WHERE user_id = ? AND is_active = 1 AND show_in_profit = 1", (user_id,))
     tags = cursor.fetchall()
     tag_ids = [tag[0] for tag in tags]
     
@@ -390,7 +399,7 @@ def get_worker_unsubscribed_amount(user_id):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
-    cursor.execute("SELECT id FROM tags WHERE user_id = ? AND is_active = 1 AND is_archived = 0", (user_id,))
+    cursor.execute("SELECT id FROM tags WHERE user_id = ? AND is_active = 1 AND show_in_profit = 1", (user_id,))
     tags = cursor.fetchall()
     tag_ids = [tag[0] for tag in tags]
     
@@ -429,7 +438,7 @@ def get_team_stats():
         'total_unsubscribed': 0
     }
     
-    cursor.execute("SELECT COUNT(DISTINCT user_id) FROM tags WHERE is_active = 1 AND is_archived = 0")
+    cursor.execute("SELECT COUNT(DISTINCT user_id) FROM tags WHERE is_active = 1 AND show_in_profit = 1")
     stats['active_workers'] = cursor.fetchone()[0]
     
     cursor.execute("SELECT SUM(amount_rub) FROM payments")
@@ -448,7 +457,7 @@ def get_team_stats():
     result = cursor.fetchone()[0]
     stats['total_profit_usd'] = result if result else 0
     
-    cursor.execute("SELECT COUNT(*) FROM tags WHERE is_active = 1 AND is_archived = 0")
+    cursor.execute("SELECT COUNT(*) FROM tags WHERE is_active = 1 AND show_in_profit = 1")
     stats['total_clients'] = cursor.fetchone()[0]
     
     cursor.execute("SELECT COUNT(*) FROM unsubscribed")
@@ -493,13 +502,13 @@ def get_team_weekly_stats():
     stats['total_profit'] = result[0] if result[0] else 0
     stats['total_payments'] = result[1] if result[1] else 0
     
-    cursor.execute("SELECT COUNT(*) FROM tags WHERE created_at > ? AND is_archived = 0", (week_ago,))
+    cursor.execute("SELECT COUNT(*) FROM tags WHERE created_at > ? AND show_in_profit = 1", (week_ago,))
     stats['new_clients'] = cursor.fetchone()[0]
     
     cursor.execute("SELECT COUNT(*) FROM unsubscribed WHERE unsubscribed_date > ?", (week_ago,))
     stats['unsubscribed'] = cursor.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(DISTINCT user_id) FROM tags WHERE is_active = 1 AND is_archived = 0")
+    cursor.execute("SELECT COUNT(DISTINCT user_id) FROM tags WHERE is_active = 1 AND show_in_profit = 1")
     stats['active_workers'] = cursor.fetchone()[0]
     
     conn.close()
@@ -512,7 +521,7 @@ def get_expiring_tags(user_id):
     cursor.execute('''
     SELECT tag, deadline 
     FROM tags 
-    WHERE user_id = ? AND is_active = 1 AND is_archived = 0 AND deadline = ?
+    WHERE user_id = ? AND is_active = 1 AND show_in_profit = 1 AND deadline = ?
     ''', (user_id, today))
     tags = cursor.fetchall()
     conn.close()
@@ -524,7 +533,7 @@ def get_all_unsubscribed_tags():
     
     today = get_current_time().strftime("%d.%m")
     
-    # Архивируем теги с истекшим сроком (для проверки отписок они больше не показываются)
+    # Помечаем как архивные для проверки отписок теги с истекшим сроком (на следующий день)
     cursor.execute('''
     UPDATE tags 
     SET is_archived = 1 
@@ -543,6 +552,14 @@ def get_all_unsubscribed_tags():
     tags = cursor.fetchall()
     conn.close()
     return tags
+
+def get_tag_by_id(tag_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM tags WHERE id = ? AND is_active = 1", (tag_id,))
+    tag = cursor.fetchone()
+    conn.close()
+    return tag
 
 def paginate_items(items, page, per_page=20):
     total_pages = math.ceil(len(items) / per_page)
@@ -625,13 +642,7 @@ async def send_reminder():
                 )
             except Exception as e:
                 logging.error(f"Ошибка отправки напоминания: {e}")
-        
-        # Ждем до следующего получаса
-        now = get_current_time()
-        next_minute = 30 - (now.minute % 30)
-        if next_minute == 0:
-            next_minute = 30
-        await asyncio.sleep(next_minute * 60 - now.second)
+        await asyncio.sleep(1800)
 
 async def check_deadlines():
     while True:
@@ -645,7 +656,7 @@ async def check_deadlines():
                 SELECT DISTINCT u.user_id, u.username 
                 FROM tags t 
                 JOIN users u ON t.user_id = u.user_id 
-                WHERE t.deadline = ? AND t.is_active = 1 AND t.is_archived = 0
+                WHERE t.deadline = ? AND t.is_active = 1 AND t.show_in_profit = 1
                 ''', (today,))
                 workers = cursor.fetchall()
                 conn.close()
@@ -708,7 +719,7 @@ async def top_command(message: types.Message):
     FROM users u
     JOIN tags t ON u.user_id = t.user_id
     LEFT JOIN payments p ON t.id = p.tag_id
-    WHERE t.is_active = 1 AND t.is_archived = 0
+    WHERE t.is_active = 1 AND t.show_in_profit = 1
     GROUP BY u.user_id
     ORDER BY total_usd DESC
     LIMIT 10
@@ -926,7 +937,8 @@ async def admin_add_profit_start(message: types.Message):
     
     if not user or not user[3]:
         await message.answer("❌ У вас нет прав для этого действия!")
-        return    
+        return
+    
     await AdminAddProfit.waiting_for_tag.set()
     back_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     back_keyboard.add(KeyboardButton("◀️ Назад"))
@@ -1083,12 +1095,12 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
         text = f"{i}. {tag_name} (@{username}) {deadline}\n"
         text += f"   изменено {created_str}"
         
-        # Создаем клавиатуру с кнопкой для отметки
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        keyboard.add(InlineKeyboardButton(
-            f"✅ Отметить отписку #{i}", 
-            callback_data=f"mark_unsub_{i}"
-        ))
+        # Создаем клавиатуру с кнопками для отметки и отмены
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        keyboard.add(
+            InlineKeyboardButton(f"✅ Отметить #{i}", callback_data=f"mark_unsub_{i}"),
+            InlineKeyboardButton(f"❌ Отменить #{i}", callback_data=f"cancel_unsub_{i}")
+        )
         
         if isinstance(message_or_callback, types.Message):
             await message_or_callback.answer(text, reply_markup=keyboard)
@@ -1101,18 +1113,17 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
     
     if isinstance(message_or_callback, types.Message):
         await message_or_callback.answer(
-            "📌 Для отметки отписки нажмите кнопку под соответствующим тегом.",
+            "📌 Для отметки/отмены отписки нажмите соответствующую кнопку под тегом.",
             reply_markup=keyboard
         )
     else:
         await message_or_callback.message.answer(
-            "📌 Для отметки отписки нажмите кнопку под соответствующим тегом.",
+            "📌 Для отметки/отмены отписки нажмите соответствующую кнопку под тегом.",
             reply_markup=keyboard
         )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("mark_unsub_"), state=MarkUnsubscribed.waiting_for_selection)
 async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state: FSMContext):
-    # Получаем номер из callback_data
     index = int(callback_query.data.split('_')[2]) - 1
     
     data = await state.get_data()
@@ -1125,14 +1136,45 @@ async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state:
     tag_id = tags_list[index][0]
     tag_name = tags_list[index][1]
     
-    # Отмечаем отписку
     add_unsubscribed(tag_id)
     
+    # Обновляем сообщение, показывая что тег отмечен
     await callback_query.message.edit_text(
         f"✅ Отмечен: {tag_name}",
         reply_markup=None
     )
     await callback_query.answer(f"✅ Отписка для {tag_name} отмечена!")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cancel_unsub_"), state=MarkUnsubscribed.waiting_for_selection)
+async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    index = int(callback_query.data.split('_')[2]) - 1
+    
+    data = await state.get_data()
+    tags_list = data.get('tags_list', [])
+    
+    if not tags_list or index >= len(tags_list):
+        await callback_query.answer("❌ Ошибка! Тег не найден.")
+        return
+    
+    tag_id = tags_list[index][0]
+    tag_name = tags_list[index][1]
+    
+    # Проверяем, отмечен ли тег
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM unsubscribed WHERE tag_id = ?", (tag_id,))
+    exists = cursor.fetchone()
+    conn.close()
+    
+    if exists:
+        remove_from_unsubscribed(tag_id)
+        await callback_query.message.edit_text(
+            f"❌ Отменено: {tag_name}",
+            reply_markup=None
+        )
+        await callback_query.answer(f"❌ Отписка для {tag_name} отменена!")
+    else:
+        await callback_query.answer("❌ Этот тег не был отмечен как отписавшийся.")
 
 @dp.callback_query_handler(lambda c: c.data == "finish_unsub", state=MarkUnsubscribed.waiting_for_selection)
 async def finish_unsub_callback(callback_query: types.CallbackQuery, state: FSMContext):
