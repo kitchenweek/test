@@ -10,6 +10,7 @@ from aiogram.utils import executor
 import sqlite3
 import math
 import pytz
+import json
 
 # Конфигурация
 TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
@@ -53,6 +54,7 @@ class EditDeadlineState(StatesGroup):
 
 # Глобальная переменная для времени (для тестов)
 TEST_TIME = None
+last_check_time = {}
 
 def get_current_time():
     if TEST_TIME:
@@ -128,7 +130,6 @@ def init_db():
     )
     ''')
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_update', '')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_check', '')")
     
     cursor.execute("INSERT OR IGNORE INTO users (user_id, username, is_admin) VALUES (?, ?, ?)", 
                   (ADMIN_ID, "admin", 1))
@@ -148,21 +149,6 @@ def set_last_update_time(time_str):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("UPDATE settings SET value = ? WHERE key = 'last_update'", (time_str,))
-    conn.commit()
-    conn.close()
-
-def get_last_check_time():
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = 'last_check'")
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else ''
-
-def set_last_check_time(time_str):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE settings SET value = ? WHERE key = 'last_check'", (time_str,))
     conn.commit()
     conn.close()
 
@@ -263,13 +249,30 @@ def remove_from_unsubscribed(tag_id):
     conn.commit()
     conn.close()
 
+def is_tag_unsubscribed(tag_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM unsubscribed WHERE tag_id = ?", (tag_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+def update_skipped_count(tag_id, increment=True):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    if increment:
+        cursor.execute("UPDATE tags SET skipped_count = skipped_count + 1 WHERE id = ?", (tag_id,))
+    else:
+        cursor.execute("UPDATE tags SET skipped_count = 0 WHERE id = ?", (tag_id,))
+    conn.commit()
+    conn.close()
+
 def get_unsubscribed_tags():
     today = get_current_time().strftime("%d.%m")
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
-    # Удаляем из проверки отписок теги с истекшим сроком (на следующий день)
-    # Они помечаются is_archived = 1, но show_in_profit остается 1
+    # Архивируем теги с истекшим сроком
     cursor.execute('''
     UPDATE tags 
     SET is_archived = 1 
@@ -533,7 +536,7 @@ def get_all_unsubscribed_tags():
     
     today = get_current_time().strftime("%d.%m")
     
-    # Помечаем как архивные для проверки отписок теги с истекшим сроком (на следующий день)
+    # Архивируем теги с истекшим сроком
     cursor.execute('''
     UPDATE tags 
     SET is_archived = 1 
@@ -552,14 +555,6 @@ def get_all_unsubscribed_tags():
     tags = cursor.fetchall()
     conn.close()
     return tags
-
-def get_tag_by_id(tag_id):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tags WHERE id = ? AND is_active = 1", (tag_id,))
-    tag = cursor.fetchone()
-    conn.close()
-    return tag
 
 def paginate_items(items, page, per_page=20):
     total_pages = math.ceil(len(items) / per_page)
@@ -1039,6 +1034,9 @@ async def admin_process_message(message: types.Message, state: FSMContext):
         reply_markup=get_main_keyboard(ADMIN_ID)
     )
 
+# Хранилище для отслеживания отметок в текущей сессии
+marked_tags = {}
+
 @dp.message_handler(lambda message: message.text == "📌 Отметить отписку")
 async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -1048,7 +1046,7 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
         await message.answer("❌ У вас нет прав для этого действия!")
         return
     
-    # Проверяем КД (30 минут)
+    # Проверяем КД (30 минут) - для кнопки
     last_check = get_last_check_time()
     if last_check:
         try:
@@ -1067,6 +1065,10 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
     
     set_last_check_time(get_current_time().strftime("%Y-%m-%d %H:%M:%S"))
     await state.finish()
+    
+    # Очищаем marked_tags для текущего пользователя
+    marked_tags[user_id] = set()
+    
     await show_unsubscribed_tags(message, state)
 
 async def show_unsubscribed_tags(message_or_callback, state, force=False):
@@ -1084,23 +1086,33 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
         await state.update_data(tags_list=tags)
         await MarkUnsubscribed.waiting_for_selection.set()
     
+    user_id = message_or_callback.from_user.id if hasattr(message_or_callback, 'from_user') else message_or_callback.message.from_user.id
+    
     # Отправляем каждый тег отдельным сообщением
     for i, tag in enumerate(tags, 1):
         tag_id, tag_name, username, user_id, deadline, created_at = tag
         
-        # Форматируем дату создания
         created_date = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
         created_str = created_date.astimezone(TIMEZONE).strftime("%d.%m %H:%M")
         
-        text = f"{i}. {tag_name} (@{username}) {deadline}\n"
-        text += f"   изменено {created_str}"
+        # Проверяем, отмечен ли уже этот тег
+        is_marked = tag_id in marked_tags.get(user_id, set())
         
-        # Создаем клавиатуру с кнопками для отметки и отмены
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            InlineKeyboardButton(f"✅ Отметить #{i}", callback_data=f"mark_unsub_{i}"),
-            InlineKeyboardButton(f"❌ Отменить #{i}", callback_data=f"cancel_unsub_{i}")
-        )
+        text = f"{i}. {tag_name} (@{username}) {deadline}\n"
+        text += f"   изменено {created_str}\n"
+        
+        if is_marked:
+            text += f"   ✅ Отмечен"
+        
+        # Создаем клавиатуру
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        
+        if is_marked:
+            # Если уже отмечен, показываем только кнопку "Отменить"
+            keyboard.add(InlineKeyboardButton(f"❌ Отменить #{i}", callback_data=f"cancel_unsub_{i}"))
+        else:
+            # Если не отмечен, показываем кнопку "Отметить"
+            keyboard.add(InlineKeyboardButton(f"✅ Отметить #{i}", callback_data=f"mark_unsub_{i}"))
         
         if isinstance(message_or_callback, types.Message):
             await message_or_callback.answer(text, reply_markup=keyboard)
@@ -1124,6 +1136,7 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("mark_unsub_"), state=MarkUnsubscribed.waiting_for_selection)
 async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
     index = int(callback_query.data.split('_')[2]) - 1
     
     data = await state.get_data()
@@ -1136,9 +1149,20 @@ async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state:
     tag_id = tags_list[index][0]
     tag_name = tags_list[index][1]
     
+    # Проверяем, не отмечен ли уже тег
+    if tag_id in marked_tags.get(user_id, set()):
+        await callback_query.answer("❌ Этот тег уже отмечен!")
+        return
+    
+    # Добавляем в отмеченные
+    if user_id not in marked_tags:
+        marked_tags[user_id] = set()
+    marked_tags[user_id].add(tag_id)
+    
+    # Отмечаем отписку в БД
     add_unsubscribed(tag_id)
     
-    # Обновляем сообщение, показывая что тег отмечен
+    # Обновляем сообщение
     await callback_query.message.edit_text(
         f"✅ Отмечен: {tag_name}",
         reply_markup=None
@@ -1147,6 +1171,7 @@ async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state:
 
 @dp.callback_query_handler(lambda c: c.data.startswith("cancel_unsub_"), state=MarkUnsubscribed.waiting_for_selection)
 async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
     index = int(callback_query.data.split('_')[2]) - 1
     
     data = await state.get_data()
@@ -1160,24 +1185,31 @@ async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, stat
     tag_name = tags_list[index][1]
     
     # Проверяем, отмечен ли тег
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM unsubscribed WHERE tag_id = ?", (tag_id,))
-    exists = cursor.fetchone()
-    conn.close()
+    if tag_id not in marked_tags.get(user_id, set()):
+        await callback_query.answer("❌ Этот тег не был отмечен!")
+        return
     
-    if exists:
-        remove_from_unsubscribed(tag_id)
-        await callback_query.message.edit_text(
-            f"❌ Отменено: {tag_name}",
-            reply_markup=None
-        )
-        await callback_query.answer(f"❌ Отписка для {tag_name} отменена!")
-    else:
-        await callback_query.answer("❌ Этот тег не был отмечен как отписавшийся.")
+    # Удаляем из отмеченных
+    marked_tags[user_id].remove(tag_id)
+    
+    # Удаляем из БД
+    remove_from_unsubscribed(tag_id)
+    
+    # Обновляем сообщение
+    await callback_query.message.edit_text(
+        f"❌ Отменено: {tag_name}",
+        reply_markup=None
+    )
+    await callback_query.answer(f"❌ Отписка для {tag_name} отменена!")
 
 @dp.callback_query_handler(lambda c: c.data == "finish_unsub", state=MarkUnsubscribed.waiting_for_selection)
 async def finish_unsub_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    
+    # Очищаем marked_tags для пользователя
+    if user_id in marked_tags:
+        del marked_tags[user_id]
+    
     await state.finish()
     await callback_query.message.delete()
     await callback_query.answer("✅ Проверка завершена!")
