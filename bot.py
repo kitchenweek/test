@@ -248,7 +248,7 @@ def get_unsubscribed_tags():
     
     # Получаем теги для показа с учетом пропусков
     cursor.execute('''
-    SELECT t.id, t.tag, u.username, u.user_id, t.skipped_count, t.last_shown
+    SELECT t.id, t.tag, u.username, u.user_id, t.skipped_count, t.last_shown, t.deadline
     FROM tags t 
     JOIN users u ON t.user_id = u.user_id 
     WHERE t.is_active = 1 
@@ -261,20 +261,17 @@ def get_unsubscribed_tags():
     # Фильтруем по правилу пропусков
     result = []
     for tag in all_tags:
-        tag_id, tag_name, username, user_id, skipped_count, last_shown = tag
+        tag_id, tag_name, username, user_id, skipped_count, last_shown, deadline = tag
         # Если тег еще не показывался - показываем
         if not last_shown:
             result.append(tag)
-            # Обновляем last_shown
             update_tag_shown(tag_id)
         else:
             # Проверяем, нужно ли показать сейчас
             if skipped_count == 0:
                 result.append(tag)
-                # Сбрасываем счетчик после показа
                 reset_tag_skipped(tag_id)
             else:
-                # Уменьшаем счетчик
                 decrement_tag_skipped(tag_id)
     
     return result
@@ -502,71 +499,29 @@ def get_expiring_tags(user_id):
     conn.close()
     return tags
 
-def get_all_unsubscribed_tags_paginated(page, per_page=20):
+def get_all_unsubscribed_tags():
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
-    offset = (page - 1) * per_page
+    
+    today = datetime.now().strftime("%d.%m")
+    cursor.execute('''
+    UPDATE tags 
+    SET is_active = 0 
+    WHERE deadline < ? AND is_active = 1
+    ''', (today,))
+    conn.commit()
     
     cursor.execute('''
-    SELECT t.id, t.tag, u.username, u.user_id, t.deadline
+    SELECT t.id, t.tag, u.username, u.user_id, t.deadline, t.created_at
     FROM tags t 
     JOIN users u ON t.user_id = u.user_id 
     WHERE t.is_active = 1 
     AND t.id NOT IN (SELECT tag_id FROM unsubscribed)
     ORDER BY t.created_at DESC
-    LIMIT ? OFFSET ?
-    ''', (per_page, offset))
-    tags = cursor.fetchall()
-    
-    cursor.execute('''
-    SELECT COUNT(*) 
-    FROM tags t 
-    WHERE t.is_active = 1 
-    AND t.id NOT IN (SELECT tag_id FROM unsubscribed)
     ''')
-    total = cursor.fetchone()[0]
-    
+    tags = cursor.fetchall()
     conn.close()
-    return tags, total
-
-def get_tag_by_id(tag_id):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tags WHERE id = ? AND is_active = 1", (tag_id,))
-    tag = cursor.fetchone()
-    conn.close()
-    return tag
-
-def paginate_items(items, page, per_page=20):
-    total_pages = math.ceil(len(items) / per_page)
-    if page < 1:
-        page = 1
-    if page > total_pages and total_pages > 0:
-        page = total_pages
-    
-    start = (page - 1) * per_page
-    end = start + per_page
-    page_items = items[start:end]
-    
-    return page_items, page, total_pages
-
-def get_pagination_keyboard(current_page, total_pages, prefix):
-    keyboard = InlineKeyboardMarkup(row_width=3)
-    buttons = []
-    
-    if current_page > 1:
-        buttons.append(InlineKeyboardButton("⬅️", callback_data=f"{prefix}_page_{current_page-1}"))
-    
-    buttons.append(InlineKeyboardButton(f"{current_page}/{total_pages}", callback_data="current"))
-    
-    if current_page < total_pages:
-        buttons.append(InlineKeyboardButton("➡️", callback_data=f"{prefix}_page_{current_page+1}"))
-    
-    if buttons:
-        keyboard.row(*buttons)
-    
-    keyboard.row(InlineKeyboardButton("❌ Закрыть", callback_data="close"))
-    return keyboard
+    return tags
 
 def get_main_keyboard(user_id):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -622,9 +577,11 @@ async def back_to_menu(message: types.Message, state: FSMContext):
         reply_markup=get_main_keyboard(user_id)
     )
 
+# Функция для отправки напоминания админу (каждые 30 минут с 10:00 до 22:00)
 async def send_reminder():
     while True:
         now = datetime.now(TIMEZONE)
+        # Проверяем рабочее время (10:00 - 22:00)
         if 10 <= now.hour < 22:
             try:
                 await bot.send_message(
@@ -635,7 +592,13 @@ async def send_reminder():
                 )
             except Exception as e:
                 logging.error(f"Ошибка отправки напоминания: {e}")
-        await asyncio.sleep(1800)
+        
+        # Ждем до следующего получаса
+        now = datetime.now(TIMEZONE)
+        next_minute = 30 - (now.minute % 30)
+        if next_minute == 0:
+            next_minute = 30
+        await asyncio.sleep(next_minute * 60 - now.second)
 
 async def check_deadlines():
     while True:
@@ -666,6 +629,7 @@ async def check_deadlines():
                         await bot.send_message(worker_id, text)
             except Exception as e:
                 logging.error(f"Ошибка проверки дедлайнов: {e}")
+        
         await asyncio.sleep(60)
 
 # Обработчики команд
@@ -1005,10 +969,10 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
         return
     
     await state.finish()
-    await show_unsubscribed_page(message, state, page=1)
+    await show_unsubscribed_tags(message, state)
 
-async def show_unsubscribed_page(message_or_callback, state, page):
-    tags, total = get_all_unsubscribed_tags_paginated(page)
+async def show_unsubscribed_tags(message_or_callback, state):
+    tags = get_all_unsubscribed_tags()
     
     if not tags:
         if isinstance(message_or_callback, types.Message):
@@ -1017,43 +981,112 @@ async def show_unsubscribed_page(message_or_callback, state, page):
             await message_or_callback.message.edit_text("✅ Нет активных тегов для отметки!")
         return
     
-    total_pages = math.ceil(total / 20)
+    # Сохраняем теги в состояние
+    await state.update_data(tags_list=tags)
+    await MarkUnsubscribed.waiting_for_selection.set()
     
-    text = f"📋 Список мамонтов для отметки отписки (стр. {page}/{total_pages}):\n\n"
+    # Отправляем каждый тег отдельным сообщением
     for i, tag in enumerate(tags, 1):
-        text += f"{i}. {tag[1]} (@{tag[2]}) | 📅 {tag[4]}\n"
+        tag_id, tag_name, username, user_id, deadline, created_at = tag
+        
+        # Форматируем дату создания
+        created_date = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+        created_str = created_date.astimezone(TIMEZONE).strftime("%d.%m %H:%M")
+        
+        text = f"{i}. {tag_name} (@{username}) {deadline}\n"
+        text += f"   изменено {created_str}"
+        
+        # Создаем клавиатуру с кнопкой для отметки
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(InlineKeyboardButton(
+            f"✅ Отметить отписку #{i}", 
+            callback_data=f"mark_unsub_{i}"
+        ))
+        
+        if isinstance(message_or_callback, types.Message):
+            await message_or_callback.answer(text, reply_markup=keyboard)
+        else:
+            await message_or_callback.message.answer(text, reply_markup=keyboard)
     
-    text += f"\nВсего: {total} мамонтов"
-    
-    keyboard = get_pagination_keyboard(page, total_pages, "unsub")
-    
+    # Отправляем сообщение с инструкцией
     if isinstance(message_or_callback, types.Message):
-        await message_or_callback.answer(text, reply_markup=keyboard)
+        await message_or_callback.answer(
+            "📌 Для отметки отписки нажмите кнопку под соответствующим тегом.\n"
+            "Или отправьте номера через запятую (например: 1,2,3)"
+        )
     else:
-        await message_or_callback.message.edit_text(text, reply_markup=keyboard)
+        await message_or_callback.message.answer(
+            "📌 Для отметки отписки нажмите кнопку под соответствующим тегом.\n"
+            "Или отправьте номера через запятую (например: 1,2,3)"
+        )
 
-@dp.callback_query_handler(lambda c: c.data.startswith("unsub_page_"))
-async def unsub_pagination_callback(callback_query: types.CallbackQuery, state: FSMContext):
-    page = int(callback_query.data.split('_')[2])
-    await show_unsubscribed_page(callback_query, state, page)
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "close")
-async def close_callback(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.message.delete()
-    await state.finish()
-    user_id = callback_query.from_user.id
-    await bot.send_message(
-        user_id, 
-        "👋 Добро пожаловать в главное меню!\n\n"
-        "Используй кнопки, чтобы:\n"
-        "🦣 Ввести тег мамонта\n"
-        "🔎 Проверить мамонтов\n"
-        "📊 Посмотреть свою статистику\n\n"
-        "Также сюда приходят уведомления о профите 💰",
-        reply_markup=get_main_keyboard(user_id)
+@dp.callback_query_handler(lambda c: c.data.startswith("mark_unsub_"), state=MarkUnsubscribed.waiting_for_selection)
+async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    # Получаем номер из callback_data
+    index = int(callback_query.data.split('_')[2]) - 1
+    
+    data = await state.get_data()
+    tags_list = data.get('tags_list', [])
+    
+    if not tags_list or index >= len(tags_list):
+        await callback_query.answer("❌ Ошибка! Тег не найден.")
+        return
+    
+    tag_id = tags_list[index][0]
+    tag_name = tags_list[index][1]
+    
+    # Отмечаем отписку
+    add_unsubscribed(tag_id)
+    
+    await callback_query.message.edit_text(
+        f"✅ Отмечен: {tag_name}",
+        reply_markup=None
     )
-    await callback_query.answer()
+    await callback_query.answer(f"✅ Отписка для {tag_name} отмечена!")
+
+@dp.message_handler(state=MarkUnsubscribed.waiting_for_selection)
+async def process_unsubscribed_selection(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await back_to_menu(message, state)
+        return
+    
+    try:
+        # Пробуем распарсить номера
+        numbers = [int(x.strip()) for x in message.text.split(',')]
+        data = await state.get_data()
+        tags_list = data.get('tags_list', [])
+        
+        if not tags_list:
+            await message.answer("❌ Список тегов пуст. Нажмите 'Отметить отписку' заново.")
+            await state.finish()
+            return
+        
+        max_index = len(tags_list)
+        invalid_numbers = [n for n in numbers if n < 1 or n > max_index]
+        
+        if invalid_numbers:
+            await message.answer(f"❌ Некорректные номера: {', '.join(map(str, invalid_numbers))}\nВведите номера от 1 до {max_index}:")
+            return
+        
+        # Отмечаем отписавшихся
+        marked_count = 0
+        marked_names = []
+        for num in numbers:
+            tag_id = tags_list[num-1][0]
+            tag_name = tags_list[num-1][1]
+            add_unsubscribed(tag_id)
+            marked_count += 1
+            marked_names.append(tag_name)
+        
+        await state.finish()
+        await message.answer(
+            f"✅ Отмечено {marked_count} мамонтов как отписавшиеся!\n\n"
+            f"Отмечены: {', '.join(marked_names)}",
+            reply_markup=get_main_keyboard(ADMIN_ID)
+        )
+        
+    except ValueError:
+        await message.answer("❌ Введите номера через запятую (например: 1,2,3,4,5) или нажмите кнопку под тегом:")
 
 @dp.message_handler(lambda message: message.text == "👥 Мои мамонты")
 async def view_all_clients(message: types.Message, state: FSMContext):
