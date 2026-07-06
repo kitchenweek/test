@@ -51,8 +51,13 @@ class EditDeadlineState(StatesGroup):
     waiting_for_tag = State()
     waiting_for_new_deadline = State()
 
-class UnsubscribedListState(StatesGroup):
-    viewing = State()
+# Глобальная переменная для времени (для тестов)
+TEST_TIME = None
+
+def get_current_time():
+    if TEST_TIME:
+        return TEST_TIME
+    return datetime.now(TIMEZONE)
 
 # Инициализация БД
 def init_db():
@@ -78,6 +83,7 @@ def init_db():
         created_at TEXT,
         skipped_count INTEGER DEFAULT 0,
         last_shown TEXT,
+        expired_date TEXT,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
@@ -121,6 +127,7 @@ def init_db():
     )
     ''')
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_update', '')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_check', '')")
     
     cursor.execute("INSERT OR IGNORE INTO users (user_id, username, is_admin) VALUES (?, ?, ?)", 
                   (ADMIN_ID, "admin", 1))
@@ -140,6 +147,21 @@ def set_last_update_time(time_str):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("UPDATE settings SET value = ? WHERE key = 'last_update'", (time_str,))
+    conn.commit()
+    conn.close()
+
+def get_last_check_time():
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = 'last_check'")
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else ''
+
+def set_last_check_time(time_str):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE settings SET value = ? WHERE key = 'last_check'", (time_str,))
     conn.commit()
     conn.close()
 
@@ -172,7 +194,7 @@ def add_tag(user_id, tag, deadline):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("INSERT INTO tags (user_id, tag, deadline, created_at, skipped_count, last_shown) VALUES (?, ?, ?, ?, ?, ?)", 
-                  (user_id, tag, deadline, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0, ''))
+                  (user_id, tag, deadline, get_current_time().strftime("%Y-%m-%d %H:%M:%S"), 0, ''))
     conn.commit()
     conn.close()
 
@@ -220,7 +242,7 @@ def add_payment(tag_id, amount_usd, amount_rub, profit, message=""):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("INSERT INTO payments (tag_id, amount_usd, amount_rub, profit, message, payment_date) VALUES (?, ?, ?, ?, ?, ?)", 
-                  (tag_id, amount_usd, amount_rub, profit, message, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                  (tag_id, amount_usd, amount_rub, profit, message, get_current_time().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
 
@@ -228,22 +250,23 @@ def add_unsubscribed(tag_id):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("INSERT INTO unsubscribed (tag_id, unsubscribed_date) VALUES (?, ?)", 
-                  (tag_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                  (tag_id, get_current_time().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
-    set_last_update_time(datetime.now(TIMEZONE).strftime("%H:%M"))
+    set_last_update_time(get_current_time().strftime("%H:%M"))
 
 def get_unsubscribed_tags():
-    today = datetime.now().strftime("%d.%m")
+    today = get_current_time().strftime("%d.%m")
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
-    # Сначала удаляем теги с истекшим сроком
+    # Удаляем теги с истекшим сроком (хранятся 3 дня)
+    three_days_ago = (get_current_time() - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute('''
     UPDATE tags 
     SET is_active = 0 
-    WHERE deadline < ? AND is_active = 1
-    ''', (today,))
+    WHERE deadline < ? AND is_active = 1 AND created_at < ?
+    ''', (today, three_days_ago))
     conn.commit()
     
     # Получаем теги для показа с учетом пропусков
@@ -258,16 +281,13 @@ def get_unsubscribed_tags():
     all_tags = cursor.fetchall()
     conn.close()
     
-    # Фильтруем по правилу пропусков
     result = []
     for tag in all_tags:
         tag_id, tag_name, username, user_id, skipped_count, last_shown, deadline = tag
-        # Если тег еще не показывался - показываем
         if not last_shown:
             result.append(tag)
             update_tag_shown(tag_id)
         else:
-            # Проверяем, нужно ли показать сейчас
             if skipped_count == 0:
                 result.append(tag)
                 reset_tag_skipped(tag_id)
@@ -280,7 +300,7 @@ def update_tag_shown(tag_id):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("UPDATE tags SET last_shown = ? WHERE id = ?", 
-                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tag_id))
+                  (get_current_time().strftime("%Y-%m-%d %H:%M:%S"), tag_id))
     conn.commit()
     conn.close()
 
@@ -392,7 +412,7 @@ def add_payoff(user_id, amount):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("INSERT INTO payoffs (user_id, amount, payoff_date) VALUES (?, ?, ?)", 
-                  (user_id, amount, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                  (user_id, amount, get_current_time().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
 
@@ -442,7 +462,7 @@ def get_team_weekly_stats():
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
-    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    week_ago = (get_current_time() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     
     stats = {
         'daily': [],
@@ -487,7 +507,7 @@ def get_team_weekly_stats():
     return stats
 
 def get_expiring_tags(user_id):
-    today = datetime.now().strftime("%d.%m")
+    today = get_current_time().strftime("%d.%m")
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute('''
@@ -503,12 +523,14 @@ def get_all_unsubscribed_tags():
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
-    today = datetime.now().strftime("%d.%m")
+    today = get_current_time().strftime("%d.%m")
+    three_days_ago = (get_current_time() - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    
     cursor.execute('''
     UPDATE tags 
     SET is_active = 0 
-    WHERE deadline < ? AND is_active = 1
-    ''', (today,))
+    WHERE deadline < ? AND is_active = 1 AND created_at < ?
+    ''', (today, three_days_ago))
     conn.commit()
     
     cursor.execute('''
@@ -522,6 +544,19 @@ def get_all_unsubscribed_tags():
     tags = cursor.fetchall()
     conn.close()
     return tags
+
+def paginate_items(items, page, per_page=20):
+    total_pages = math.ceil(len(items) / per_page)
+    if page < 1:
+        page = 1
+    if page > total_pages and total_pages > 0:
+        page = total_pages
+    
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = items[start:end]
+    
+    return page_items, page, total_pages
 
 def get_main_keyboard(user_id):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -580,8 +615,7 @@ async def back_to_menu(message: types.Message, state: FSMContext):
 # Функция для отправки напоминания админу (каждые 30 минут с 10:00 до 22:00)
 async def send_reminder():
     while True:
-        now = datetime.now(TIMEZONE)
-        # Проверяем рабочее время (10:00 - 22:00)
+        now = get_current_time()
         if 10 <= now.hour < 22:
             try:
                 await bot.send_message(
@@ -593,16 +627,11 @@ async def send_reminder():
             except Exception as e:
                 logging.error(f"Ошибка отправки напоминания: {e}")
         
-        # Ждем до следующего получаса
-        now = datetime.now(TIMEZONE)
-        next_minute = 30 - (now.minute % 30)
-        if next_minute == 0:
-            next_minute = 30
-        await asyncio.sleep(next_minute * 60 - now.second)
+        await asyncio.sleep(1800)
 
 async def check_deadlines():
     while True:
-        now = datetime.now(TIMEZONE)
+        now = get_current_time()
         if now.hour == 10 and now.minute == 0:
             try:
                 today = now.strftime("%d.%m")
@@ -629,7 +658,6 @@ async def check_deadlines():
                         await bot.send_message(worker_id, text)
             except Exception as e:
                 logging.error(f"Ошибка проверки дедлайнов: {e}")
-        
         await asyncio.sleep(60)
 
 # Обработчики команд
@@ -770,7 +798,40 @@ async def check_command(message: types.Message):
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
-@dp.message_handler(state='*', commands=["start", "stats", "top", "add", "check"])
+@dp.message_handler(commands=["checkmsg"])
+async def checkmsg_command(message: types.Message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if not user or not user[3]:
+        await message.answer("❌ У вас нет прав для этого действия!")
+        return
+    
+    await show_unsubscribed_tags(message, None, force=True)
+
+@dp.message_handler(commands=["time"])
+async def time_command(message: types.Message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if not user or not user[3]:
+        await message.answer("❌ У вас нет прав для этого действия!")
+        return
+    
+    args = message.get_args()
+    if not args:
+        await message.answer("❌ Использование: /time X (X - количество часов для прокрута)")
+        return
+    
+    try:
+        hours = int(args)
+        global TEST_TIME
+        TEST_TIME = datetime.now(TIMEZONE) + timedelta(hours=hours)
+        await message.answer(f"✅ Время прокручено на {hours} часов.\nТекущее время: {TEST_TIME.strftime('%d.%m.%Y %H:%M')}")
+    except ValueError:
+        await message.answer("❌ Введите корректное число часов")
+
+@dp.message_handler(state='*', commands=["start", "stats", "top", "add", "check", "checkmsg", "time"])
 async def command_state_handler(message: types.Message, state: FSMContext):
     await state.finish()
     command = message.get_command()
@@ -784,6 +845,10 @@ async def command_state_handler(message: types.Message, state: FSMContext):
         await add_command(message)
     elif command == "/check":
         await check_command(message)
+    elif command == "/checkmsg":
+        await checkmsg_command(message)
+    elif command == "/time":
+        await time_command(message)
 
 @dp.message_handler(lambda message: message.text == "📝 Добавить мамонта")
 async def add_tag_start(message: types.Message):
@@ -968,10 +1033,28 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
         await message.answer("❌ У вас нет прав для этого действия!")
         return
     
+    # Проверяем КД (30 минут)
+    last_check = get_last_check_time()
+    if last_check:
+        try:
+            last_time = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
+            time_diff = (get_current_time() - last_time).total_seconds()
+            if time_diff < 1800:  # 30 минут
+                remaining = int(1800 - time_diff)
+                minutes = remaining // 60
+                seconds = remaining % 60
+                await message.answer(
+                    f"⏳ Подождите {minutes} минут {seconds} секунд до следующей проверки."
+                )
+                return
+        except:
+            pass
+    
+    set_last_check_time(get_current_time().strftime("%Y-%m-%d %H:%M:%S"))
     await state.finish()
     await show_unsubscribed_tags(message, state)
 
-async def show_unsubscribed_tags(message_or_callback, state):
+async def show_unsubscribed_tags(message_or_callback, state, force=False):
     tags = get_all_unsubscribed_tags()
     
     if not tags:
@@ -982,8 +1065,9 @@ async def show_unsubscribed_tags(message_or_callback, state):
         return
     
     # Сохраняем теги в состояние
-    await state.update_data(tags_list=tags)
-    await MarkUnsubscribed.waiting_for_selection.set()
+    if state:
+        await state.update_data(tags_list=tags)
+        await MarkUnsubscribed.waiting_for_selection.set()
     
     # Отправляем каждый тег отдельным сообщением
     for i, tag in enumerate(tags, 1):
@@ -1011,13 +1095,11 @@ async def show_unsubscribed_tags(message_or_callback, state):
     # Отправляем сообщение с инструкцией
     if isinstance(message_or_callback, types.Message):
         await message_or_callback.answer(
-            "📌 Для отметки отписки нажмите кнопку под соответствующим тегом.\n"
-            "Или отправьте номера через запятую (например: 1,2,3)"
+            "📌 Для отметки отписки нажмите кнопку под соответствующим тегом."
         )
     else:
         await message_or_callback.message.answer(
-            "📌 Для отметки отписки нажмите кнопку под соответствующим тегом.\n"
-            "Или отправьте номера через запятую (например: 1,2,3)"
+            "📌 Для отметки отписки нажмите кнопку под соответствующим тегом."
         )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("mark_unsub_"), state=MarkUnsubscribed.waiting_for_selection)
@@ -1044,52 +1126,11 @@ async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state:
     )
     await callback_query.answer(f"✅ Отписка для {tag_name} отмечена!")
 
-@dp.message_handler(state=MarkUnsubscribed.waiting_for_selection)
-async def process_unsubscribed_selection(message: types.Message, state: FSMContext):
-    if message.text == "◀️ Назад":
-        await back_to_menu(message, state)
-        return
-    
-    try:
-        # Пробуем распарсить номера
-        numbers = [int(x.strip()) for x in message.text.split(',')]
-        data = await state.get_data()
-        tags_list = data.get('tags_list', [])
-        
-        if not tags_list:
-            await message.answer("❌ Список тегов пуст. Нажмите 'Отметить отписку' заново.")
-            await state.finish()
-            return
-        
-        max_index = len(tags_list)
-        invalid_numbers = [n for n in numbers if n < 1 or n > max_index]
-        
-        if invalid_numbers:
-            await message.answer(f"❌ Некорректные номера: {', '.join(map(str, invalid_numbers))}\nВведите номера от 1 до {max_index}:")
-            return
-        
-        # Отмечаем отписавшихся
-        marked_count = 0
-        marked_names = []
-        for num in numbers:
-            tag_id = tags_list[num-1][0]
-            tag_name = tags_list[num-1][1]
-            add_unsubscribed(tag_id)
-            marked_count += 1
-            marked_names.append(tag_name)
-        
-        await state.finish()
-        await message.answer(
-            f"✅ Отмечено {marked_count} мамонтов как отписавшиеся!\n\n"
-            f"Отмечены: {', '.join(marked_names)}",
-            reply_markup=get_main_keyboard(ADMIN_ID)
-        )
-        
-    except ValueError:
-        await message.answer("❌ Введите номера через запятую (например: 1,2,3,4,5) или нажмите кнопку под тегом:")
-
 @dp.message_handler(lambda message: message.text == "👥 Мои мамонты")
 async def view_all_clients(message: types.Message, state: FSMContext):
+    # Сначала сбрасываем состояние, чтобы избежать конфликтов
+    await state.finish()
+    
     user_id = message.from_user.id
     tags = get_all_user_tags_with_status(user_id)
     
@@ -1423,7 +1464,7 @@ async def confirm_payoff(callback_query: types.CallbackQuery, state: FSMContext)
         f"✅ Списание выполнено!\n\n"
         f"👤 Воркер: @{worker_username}\n"
         f"💲 Сумма: {amount:.2f}$\n"
-        f"📅 Дата: {datetime.now(TIMEZONE).strftime('%d.%m.%Y %H:%M')}"
+        f"📅 Дата: {get_current_time().strftime('%d.%m.%Y %H:%M')}"
     )
     
     await bot.send_message(
