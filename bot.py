@@ -55,7 +55,6 @@ class EditDeadlineState(StatesGroup):
 # Глобальная переменная для времени (для тестов)
 TEST_TIME = None
 marked_tags = {}
-last_check_time = {}
 
 def get_current_time():
     if TEST_TIME:
@@ -266,20 +265,11 @@ def remove_from_unsubscribed(tag_id):
     conn.commit()
     conn.close()
 
-def is_tag_unsubscribed(tag_id):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM unsubscribed WHERE tag_id = ?", (tag_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
-
 def get_unsubscribed_tags():
     today = get_current_time().strftime("%d.%m")
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
-    # Архивируем теги с истекшим сроком
     cursor.execute('''
     UPDATE tags 
     SET is_archived = 1 
@@ -287,7 +277,6 @@ def get_unsubscribed_tags():
     ''', (today,))
     conn.commit()
     
-    # Получаем теги для показа с учетом пропусков
     cursor.execute('''
     SELECT t.id, t.tag, u.username, u.user_id, t.skipped_count, t.last_shown, t.deadline
     FROM tags t 
@@ -543,7 +532,6 @@ def get_all_unsubscribed_tags():
     
     today = get_current_time().strftime("%d.%m")
     
-    # Архивируем теги с истекшим сроком
     cursor.execute('''
     UPDATE tags 
     SET is_archived = 1 
@@ -912,8 +900,6 @@ async def add_tag_start(message: types.Message):
     await AddTagStates.waiting_for_tag_and_deadline.set()
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(InlineKeyboardButton("📤 Отправить группой", callback_data="bulk_add"))
-    back_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    back_keyboard.add(KeyboardButton("◀️ Назад"))
     await message.answer(
         "Введите тег мамонта и срок одним сообщением:\n"
         "Формат: @user ДД.ММ\n"
@@ -1093,13 +1079,13 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
         await message.answer("❌ У вас нет прав для этого действия!")
         return
     
-    # Проверяем КД (30 минут) - для кнопки
+    # Проверяем КД (30 минут)
     last_check = get_last_check_time()
     if last_check:
         try:
             last_time = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
             time_diff = (get_current_time() - last_time).total_seconds()
-            if time_diff < 1800:  # 30 минут
+            if time_diff < 1800:
                 remaining = int(1800 - time_diff)
                 minutes = remaining // 60
                 seconds = remaining % 60
@@ -1114,7 +1100,8 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
     await state.finish()
     
     # Очищаем marked_tags для текущего пользователя
-    marked_tags[user_id] = {}
+    if user_id in marked_tags:
+        del marked_tags[user_id]
     
     await show_unsubscribed_tags(message, state)
 
@@ -1137,7 +1124,7 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
     
     # Инициализируем marked_tags для пользователя если нет
     if user_id not in marked_tags:
-        marked_tags[user_id] = {}
+        marked_tags[user_id] = set()
     
     # Отправляем каждый тег отдельным сообщением
     for i, tag in enumerate(tags, 1):
@@ -1147,20 +1134,20 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
         created_str = created_date.astimezone(TIMEZONE).strftime("%d.%m %H:%M")
         
         # Проверяем, отмечен ли уже этот тег
-        is_marked = tag_id in marked_tags.get(user_id, {})
+        is_marked = tag_id in marked_tags.get(user_id, set())
         
         text = f"{i}. {tag_name} (@{username}) {deadline}\n"
-        text += f"   изменено {created_str}\n"
+        text += f"   изменено {created_str}"
+        
+        if is_marked:
+            text += f"\n   ✅ Отмечен"
         
         # Создаем клавиатуру
         keyboard = InlineKeyboardMarkup(row_width=1)
         
         if is_marked:
-            # Если уже отмечен, показываем только кнопку "Отменить"
             keyboard.add(InlineKeyboardButton(f"❌ Отменить #{i}", callback_data=f"cancel_unsub_{i}"))
-            text += f"   ✅ Отмечен"
         else:
-            # Если не отмечен, показываем кнопку "Отметить"
             keyboard.add(InlineKeyboardButton(f"✅ Отметить #{i}", callback_data=f"mark_unsub_{i}"))
         
         if isinstance(message_or_callback, types.Message):
@@ -1199,14 +1186,14 @@ async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state:
     tag_name = tags_list[index][1]
     
     # Проверяем, не отмечен ли уже тег
-    if tag_id in marked_tags.get(user_id, {}):
+    if tag_id in marked_tags.get(user_id, set()):
         await callback_query.answer("❌ Этот тег уже отмечен!")
         return
     
     # Добавляем в отмеченные
     if user_id not in marked_tags:
-        marked_tags[user_id] = {}
-    marked_tags[user_id][tag_id] = True
+        marked_tags[user_id] = set()
+    marked_tags[user_id].add(tag_id)
     
     # Отмечаем отписку в БД
     add_unsubscribed(tag_id)
@@ -1234,12 +1221,12 @@ async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, stat
     tag_name = tags_list[index][1]
     
     # Проверяем, отмечен ли тег
-    if tag_id not in marked_tags.get(user_id, {}):
+    if tag_id not in marked_tags.get(user_id, set()):
         await callback_query.answer("❌ Этот тег не был отмечен!")
         return
     
     # Удаляем из отмеченных
-    del marked_tags[user_id][tag_id]
+    marked_tags[user_id].remove(tag_id)
     
     # Удаляем из БД
     remove_from_unsubscribed(tag_id)
