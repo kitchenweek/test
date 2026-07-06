@@ -264,6 +264,26 @@ def remove_from_unsubscribed(tag_id):
     conn.commit()
     conn.close()
 
+def is_tag_unsubscribed_by_name(tag_name):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT t.id FROM tags t 
+    JOIN unsubscribed u ON t.id = u.tag_id
+    WHERE t.tag = ? AND t.is_active = 1
+    ''', (tag_name,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+def get_tag_id_by_name(tag_name):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM tags WHERE tag = ? AND is_active = 1", (tag_name,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
 def get_unsubscribed_tags():
     today = get_current_time().strftime("%d.%m")
     conn = sqlite3.connect('bot_database.db')
@@ -776,6 +796,45 @@ async def check_command(message: types.Message):
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
+@dp.message_handler(commands=["cancel"])
+async def cancel_command(message: types.Message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if not user or not user[3]:
+        await message.answer("❌ У вас нет прав для этого действия!")
+        return
+    
+    args = message.get_args()
+    if not args:
+        await message.answer("❌ Использование: /cancel @user")
+        return
+    
+    tag_name = args.strip()
+    
+    # Проверяем, существует ли тег
+    tag_info = get_tag_info(tag_name)
+    if not tag_info:
+        await message.answer(f"❌ Тег {tag_name} не найден в базе данных!")
+        return
+    
+    # Проверяем, отмечен ли тег как отписавшийся
+    if not is_tag_unsubscribed_by_name(tag_name):
+        await message.answer(f"❌ Тег {tag_name} не отмечен как отписавшийся!")
+        return
+    
+    # Получаем tag_id и удаляем из отписавшихся
+    tag_id = get_tag_id_by_name(tag_name)
+    if tag_id:
+        remove_from_unsubscribed(tag_id)
+        await message.answer(
+            f"✅ Тег {tag_name} удален из списка отписавшихся!\n"
+            f"📅 Срок: {tag_info[1]}\n"
+            f"👤 Воркер: @{tag_info[2]}"
+        )
+    else:
+        await message.answer("❌ Ошибка при удалении тега!")
+
 @dp.message_handler(commands=["checkmsg"])
 async def checkmsg_command(message: types.Message):
     user_id = message.from_user.id
@@ -809,7 +868,7 @@ async def time_command(message: types.Message):
     except ValueError:
         await message.answer("❌ Введите корректное число часов")
 
-@dp.message_handler(state='*', commands=["start", "stats", "top", "add", "check", "checkmsg", "time"])
+@dp.message_handler(state='*', commands=["start", "stats", "top", "add", "check", "cancel", "checkmsg", "time"])
 async def command_state_handler(message: types.Message, state: FSMContext):
     await state.finish()
     command = message.get_command()
@@ -823,6 +882,8 @@ async def command_state_handler(message: types.Message, state: FSMContext):
         await add_command(message)
     elif command == "/check":
         await check_command(message)
+    elif command == "/cancel":
+        await cancel_command(message)
     elif command == "/checkmsg":
         await checkmsg_command(message)
     elif command == "/time":
