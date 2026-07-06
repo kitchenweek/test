@@ -26,7 +26,6 @@ dp = Dispatcher(bot, storage=storage)
 
 # Состояния для FSM
 class AddTagStates(StatesGroup):
-    waiting_for_tag_and_deadline = State()
     waiting_for_bulk_tags = State()
 
 class AdminAddProfit(StatesGroup):
@@ -731,29 +730,10 @@ async def top_command(message: types.Message):
 
 @dp.message_handler(commands=["add"])
 async def add_command(message: types.Message):
-    await AddTagStates.waiting_for_tag_and_deadline.set()
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(InlineKeyboardButton("📤 Отправить группой", callback_data="bulk_add"))
-    await message.answer(
-        "Введите тег мамонта и срок одним сообщением:\n"
-        "Формат: @user ДД.ММ\n"
-        "Пример: @username 31.12\n\n"
-        "Или нажмите кнопку ниже для массового добавления:",
-        reply_markup=keyboard
-    )
-
-@dp.callback_query_handler(lambda c: c.data == "bulk_add")
-async def bulk_add_start(callback_query: types.CallbackQuery, state: FSMContext):
-    # Сначала завершаем текущее состояние
-    await state.finish()
-    # Устанавливаем новое состояние
     await AddTagStates.waiting_for_bulk_tags.set()
-    await callback_query.message.delete()
-    await callback_query.answer()
     back_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     back_keyboard.add(KeyboardButton("◀️ Назад"))
-    await bot.send_message(
-        callback_query.from_user.id,
+    await message.answer(
         "Введите теги и сроки через новую строку:\n"
         "Формат: @user ДД.ММ\n"
         "Пример:\n"
@@ -762,55 +742,6 @@ async def bulk_add_start(callback_query: types.CallbackQuery, state: FSMContext)
         "@user3 20.02",
         reply_markup=back_keyboard
     )
-
-@dp.message_handler(state=AddTagStates.waiting_for_bulk_tags)
-async def process_bulk_tags(message: types.Message, state: FSMContext):
-    if message.text == "◀️ Назад":
-        await back_to_menu(message, state)
-        return
-    
-    lines = message.text.strip().split('\n')
-    added = 0
-    errors = []
-    user_id = message.from_user.id
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-        parts = line.split()
-        if len(parts) < 2:
-            errors.append(f"❌ {line} - неверный формат")
-            continue
-        
-        tag = parts[0]
-        if not tag.startswith('@'):
-            errors.append(f"❌ {line} - тег должен начинаться с @")
-            continue
-        
-        deadline = ' '.join(parts[1:])
-        try:
-            datetime.strptime(deadline, "%d.%m")
-        except ValueError:
-            errors.append(f"❌ {line} - неверный формат даты")
-            continue
-        
-        existing_tag = get_tag_by_name(tag)
-        if existing_tag:
-            errors.append(f"❌ {line} - такой тег уже существует")
-            continue
-        
-        add_tag(user_id, tag, deadline)
-        added += 1
-    
-    await state.finish()
-    
-    result_text = f"✅ Добавлено мамонтов: {added}\n\n"
-    if errors:
-        result_text += "Ошибки:\n" + "\n".join(errors)
-    
-    await message.answer(result_text, reply_markup=get_main_keyboard(user_id))
 
 @dp.message_handler(commands=["check"])
 async def check_command(message: types.Message):
@@ -899,69 +830,67 @@ async def command_state_handler(message: types.Message, state: FSMContext):
 
 @dp.message_handler(lambda message: message.text == "📝 Добавить мамонта")
 async def add_tag_start(message: types.Message):
-    await AddTagStates.waiting_for_tag_and_deadline.set()
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(InlineKeyboardButton("📤 Отправить группой", callback_data="bulk_add"))
+    await AddTagStates.waiting_for_bulk_tags.set()
+    back_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    back_keyboard.add(KeyboardButton("◀️ Назад"))
     await message.answer(
-        "Введите тег мамонта и срок одним сообщением:\n"
+        "Введите теги и сроки через новую строку:\n"
         "Формат: @user ДД.ММ\n"
-        "Пример: @username 31.12\n\n"
-        "Или нажмите кнопку ниже для массового добавления:",
-        reply_markup=keyboard
+        "Пример:\n"
+        "@user1 31.12\n"
+        "@user2 15.01\n"
+        "@user3 20.02",
+        reply_markup=back_keyboard
     )
 
-@dp.message_handler(state=AddTagStates.waiting_for_tag_and_deadline)
-async def process_tag_and_deadline(message: types.Message, state: FSMContext):
+@dp.message_handler(state=AddTagStates.waiting_for_bulk_tags)
+async def process_bulk_tags(message: types.Message, state: FSMContext):
     if message.text == "◀️ Назад":
         await back_to_menu(message, state)
         return
     
-    text = message.text.strip()
-    parts = text.split()
-    
-    if len(parts) < 2:
-        await message.answer(
-            "❌ Неверный формат!\n"
-            "Введите: @user ДД.ММ\n"
-            "Пример: @username 31.12"
-        )
-        return
-    
-    tag = parts[0]
-    if not tag.startswith('@'):
-        await message.answer(
-            "❌ Тег должен начинаться с @\n"
-            "Введите: @user ДД.ММ\n"
-            "Пример: @username 31.12"
-        )
-        return
-    
-    deadline = ' '.join(parts[1:])
-    
-    try:
-        datetime.strptime(deadline, "%d.%m")
-    except ValueError:
-        await message.answer(
-            "❌ Неверный формат даты!\n"
-            "Используйте ДД.ММ\n"
-            "Пример: 31.12"
-        )
-        return
-    
-    existing_tag = get_tag_by_name(tag)
-    if existing_tag:
-        await message.answer("❌ Такой тег уже существует! Введите другой тег:")
-        return
-    
+    lines = message.text.strip().split('\n')
+    added = 0
+    errors = []
     user_id = message.from_user.id
-    add_tag(user_id, tag, deadline)
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        parts = line.split()
+        if len(parts) < 2:
+            errors.append(f"❌ {line} - неверный формат")
+            continue
+        
+        tag = parts[0]
+        if not tag.startswith('@'):
+            errors.append(f"❌ {line} - тег должен начинаться с @")
+            continue
+        
+        deadline = ' '.join(parts[1:])
+        try:
+            datetime.strptime(deadline, "%d.%m")
+        except ValueError:
+            errors.append(f"❌ {line} - неверный формат даты")
+            continue
+        
+        existing_tag = get_tag_by_name(tag)
+        if existing_tag:
+            errors.append(f"❌ {line} - такой тег уже существует")
+            continue
+        
+        add_tag(user_id, tag, deadline)
+        added += 1
     
     await state.finish()
-    await message.answer(
-        f"✅ Мамонт {tag} успешно добавлен!\n"
-        f"📅 Срок: {deadline}",
-        reply_markup=get_main_keyboard(user_id)
-    )
+    
+    result_text = f"✅ Добавлено мамонтов: {added}\n\n"
+    if errors:
+        result_text += "Ошибки:\n" + "\n".join(errors)
+    
+    await message.answer(result_text, reply_markup=get_main_keyboard(user_id))
 
 @dp.message_handler(lambda message: message.text == "💰 Добавить профит")
 async def admin_add_profit_start(message: types.Message):
