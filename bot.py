@@ -10,7 +10,6 @@ from aiogram.utils import executor
 import sqlite3
 import math
 import pytz
-import json
 
 # Конфигурация
 TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
@@ -28,6 +27,7 @@ dp = Dispatcher(bot, storage=storage)
 # Состояния для FSM
 class AddTagStates(StatesGroup):
     waiting_for_tag_and_deadline = State()
+    waiting_for_bulk_tags = State()
 
 class AdminAddProfit(StatesGroup):
     waiting_for_tag = State()
@@ -54,6 +54,7 @@ class EditDeadlineState(StatesGroup):
 
 # Глобальная переменная для времени (для тестов)
 TEST_TIME = None
+marked_tags = {}
 last_check_time = {}
 
 def get_current_time():
@@ -130,6 +131,7 @@ def init_db():
     )
     ''')
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_update', '')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_check', '')")
     
     cursor.execute("INSERT OR IGNORE INTO users (user_id, username, is_admin) VALUES (?, ?, ?)", 
                   (ADMIN_ID, "admin", 1))
@@ -149,6 +151,21 @@ def set_last_update_time(time_str):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("UPDATE settings SET value = ? WHERE key = 'last_update'", (time_str,))
+    conn.commit()
+    conn.close()
+
+def get_last_check_time():
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = 'last_check'")
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else ''
+
+def set_last_check_time(time_str):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE settings SET value = ? WHERE key = 'last_check'", (time_str,))
     conn.commit()
     conn.close()
 
@@ -256,16 +273,6 @@ def is_tag_unsubscribed(tag_id):
     result = cursor.fetchone()
     conn.close()
     return result is not None
-
-def update_skipped_count(tag_id, increment=True):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    if increment:
-        cursor.execute("UPDATE tags SET skipped_count = skipped_count + 1 WHERE id = ?", (tag_id,))
-    else:
-        cursor.execute("UPDATE tags SET skipped_count = 0 WHERE id = ?", (tag_id,))
-    conn.commit()
-    conn.close()
 
 def get_unsubscribed_tags():
     today = get_current_time().strftime("%d.%m")
@@ -736,44 +743,84 @@ async def top_command(message: types.Message):
 
 @dp.message_handler(commands=["add"])
 async def add_command(message: types.Message):
-    args = message.get_args()
-    if not args:
-        await message.answer(
-            "❌ Использование: /add @user ДД.ММ\n"
-            "Пример: /add @username 31.12"
-        )
-        return
-    
-    parts = args.split()
-    if len(parts) < 2:
-        await message.answer("❌ Неверный формат! Используйте: /add @user ДД.ММ")
-        return
-    
-    tag = parts[0]
-    if not tag.startswith('@'):
-        await message.answer("❌ Тег должен начинаться с @")
-        return
-    
-    deadline = ' '.join(parts[1:])
-    try:
-        datetime.strptime(deadline, "%d.%m")
-    except ValueError:
-        await message.answer("❌ Неверный формат даты! Используйте ДД.ММ")
-        return
-    
-    existing_tag = get_tag_by_name(tag)
-    if existing_tag:
-        await message.answer("❌ Такой тег уже существует!")
-        return
-    
-    user_id = message.from_user.id
-    add_tag(user_id, tag, deadline)
-    
+    await AddTagStates.waiting_for_tag_and_deadline.set()
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("📤 Отправить группой", callback_data="bulk_add"))
     await message.answer(
-        f"✅ Мамонт {tag} успешно добавлен!\n"
-        f"📅 Срок: {deadline}",
-        reply_markup=get_main_keyboard(user_id)
+        "Введите тег мамонта и срок одним сообщением:\n"
+        "Формат: @user ДД.ММ\n"
+        "Пример: @username 31.12\n\n"
+        "Или нажмите кнопку ниже для массового добавления:",
+        reply_markup=keyboard
     )
+
+@dp.callback_query_handler(lambda c: c.data == "bulk_add")
+async def bulk_add_start(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.finish()
+    await AddTagStates.waiting_for_bulk_tags.set()
+    await callback_query.message.delete()
+    await callback_query.answer()
+    back_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    back_keyboard.add(KeyboardButton("◀️ Назад"))
+    await bot.send_message(
+        callback_query.from_user.id,
+        "Введите теги и сроки через новую строку:\n"
+        "Формат: @user ДД.ММ\n"
+        "Пример:\n"
+        "@user1 31.12\n"
+        "@user2 15.01\n"
+        "@user3 20.02",
+        reply_markup=back_keyboard
+    )
+
+@dp.message_handler(state=AddTagStates.waiting_for_bulk_tags)
+async def process_bulk_tags(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await back_to_menu(message, state)
+        return
+    
+    lines = message.text.strip().split('\n')
+    added = 0
+    errors = []
+    user_id = message.from_user.id
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        parts = line.split()
+        if len(parts) < 2:
+            errors.append(f"❌ {line} - неверный формат")
+            continue
+        
+        tag = parts[0]
+        if not tag.startswith('@'):
+            errors.append(f"❌ {line} - тег должен начинаться с @")
+            continue
+        
+        deadline = ' '.join(parts[1:])
+        try:
+            datetime.strptime(deadline, "%d.%m")
+        except ValueError:
+            errors.append(f"❌ {line} - неверный формат даты")
+            continue
+        
+        existing_tag = get_tag_by_name(tag)
+        if existing_tag:
+            errors.append(f"❌ {line} - такой тег уже существует")
+            continue
+        
+        add_tag(user_id, tag, deadline)
+        added += 1
+    
+    await state.finish()
+    
+    result_text = f"✅ Добавлено мамонтов: {added}\n\n"
+    if errors:
+        result_text += "Ошибки:\n" + "\n".join(errors)
+    
+    await message.answer(result_text, reply_markup=get_main_keyboard(user_id))
 
 @dp.message_handler(commands=["check"])
 async def check_command(message: types.Message):
@@ -863,13 +910,16 @@ async def command_state_handler(message: types.Message, state: FSMContext):
 @dp.message_handler(lambda message: message.text == "📝 Добавить мамонта")
 async def add_tag_start(message: types.Message):
     await AddTagStates.waiting_for_tag_and_deadline.set()
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("📤 Отправить группой", callback_data="bulk_add"))
     back_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     back_keyboard.add(KeyboardButton("◀️ Назад"))
     await message.answer(
         "Введите тег мамонта и срок одним сообщением:\n"
         "Формат: @user ДД.ММ\n"
-        "Пример: @username 31.12",
-        reply_markup=back_keyboard
+        "Пример: @username 31.12\n\n"
+        "Или нажмите кнопку ниже для массового добавления:",
+        reply_markup=keyboard
     )
 
 @dp.message_handler(state=AddTagStates.waiting_for_tag_and_deadline)
@@ -1034,9 +1084,6 @@ async def admin_process_message(message: types.Message, state: FSMContext):
         reply_markup=get_main_keyboard(ADMIN_ID)
     )
 
-# Хранилище для отслеживания отметок в текущей сессии
-marked_tags = {}
-
 @dp.message_handler(lambda message: message.text == "📌 Отметить отписку")
 async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -1067,7 +1114,7 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
     await state.finish()
     
     # Очищаем marked_tags для текущего пользователя
-    marked_tags[user_id] = set()
+    marked_tags[user_id] = {}
     
     await show_unsubscribed_tags(message, state)
 
@@ -1088,6 +1135,10 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
     
     user_id = message_or_callback.from_user.id if hasattr(message_or_callback, 'from_user') else message_or_callback.message.from_user.id
     
+    # Инициализируем marked_tags для пользователя если нет
+    if user_id not in marked_tags:
+        marked_tags[user_id] = {}
+    
     # Отправляем каждый тег отдельным сообщением
     for i, tag in enumerate(tags, 1):
         tag_id, tag_name, username, user_id, deadline, created_at = tag
@@ -1096,13 +1147,10 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
         created_str = created_date.astimezone(TIMEZONE).strftime("%d.%m %H:%M")
         
         # Проверяем, отмечен ли уже этот тег
-        is_marked = tag_id in marked_tags.get(user_id, set())
+        is_marked = tag_id in marked_tags.get(user_id, {})
         
         text = f"{i}. {tag_name} (@{username}) {deadline}\n"
         text += f"   изменено {created_str}\n"
-        
-        if is_marked:
-            text += f"   ✅ Отмечен"
         
         # Создаем клавиатуру
         keyboard = InlineKeyboardMarkup(row_width=1)
@@ -1110,6 +1158,7 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
         if is_marked:
             # Если уже отмечен, показываем только кнопку "Отменить"
             keyboard.add(InlineKeyboardButton(f"❌ Отменить #{i}", callback_data=f"cancel_unsub_{i}"))
+            text += f"   ✅ Отмечен"
         else:
             # Если не отмечен, показываем кнопку "Отметить"
             keyboard.add(InlineKeyboardButton(f"✅ Отметить #{i}", callback_data=f"mark_unsub_{i}"))
@@ -1150,14 +1199,14 @@ async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state:
     tag_name = tags_list[index][1]
     
     # Проверяем, не отмечен ли уже тег
-    if tag_id in marked_tags.get(user_id, set()):
+    if tag_id in marked_tags.get(user_id, {}):
         await callback_query.answer("❌ Этот тег уже отмечен!")
         return
     
     # Добавляем в отмеченные
     if user_id not in marked_tags:
-        marked_tags[user_id] = set()
-    marked_tags[user_id].add(tag_id)
+        marked_tags[user_id] = {}
+    marked_tags[user_id][tag_id] = True
     
     # Отмечаем отписку в БД
     add_unsubscribed(tag_id)
@@ -1185,12 +1234,12 @@ async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, stat
     tag_name = tags_list[index][1]
     
     # Проверяем, отмечен ли тег
-    if tag_id not in marked_tags.get(user_id, set()):
+    if tag_id not in marked_tags.get(user_id, {}):
         await callback_query.answer("❌ Этот тег не был отмечен!")
         return
     
     # Удаляем из отмеченных
-    marked_tags[user_id].remove(tag_id)
+    del marked_tags[user_id][tag_id]
     
     # Удаляем из БД
     remove_from_unsubscribed(tag_id)
