@@ -744,7 +744,9 @@ async def add_command(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data == "bulk_add")
 async def bulk_add_start(callback_query: types.CallbackQuery, state: FSMContext):
+    # Сначала завершаем текущее состояние
     await state.finish()
+    # Устанавливаем новое состояние
     await AddTagStates.waiting_for_bulk_tags.set()
     await callback_query.message.delete()
     await callback_query.answer()
