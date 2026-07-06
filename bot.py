@@ -500,9 +500,11 @@ def get_team_weekly_stats():
     }
     
     cursor.execute('''
-    SELECT DATE(payment_date), SUM(profit), SUM(amount_usd)
+    SELECT DATE(payment_date), 
+           SUM(amount_usd * profit / amount_rub) as profit_usd,
+           SUM(amount_usd) as payments_usd
     FROM payments 
-    WHERE payment_date > ?
+    WHERE payment_date > ? AND amount_rub > 0
     GROUP BY DATE(payment_date)
     ORDER BY DATE(payment_date) DESC
     ''', (week_ago,))
@@ -515,10 +517,13 @@ def get_team_weekly_stats():
             'payments': day[2] if day[2] else 0
         })
     
-    cursor.execute("SELECT SUM(profit), SUM(amount_usd) FROM payments WHERE payment_date > ?", (week_ago,))
-    result = cursor.fetchone()
-    stats['total_profit'] = result[0] if result[0] else 0
-    stats['total_payments'] = result[1] if result[1] else 0
+    cursor.execute("SELECT SUM(amount_usd * profit / amount_rub) FROM payments WHERE payment_date > ? AND amount_rub > 0", (week_ago,))
+    result = cursor.fetchone()[0]
+    stats['total_profit'] = result if result else 0
+    
+    cursor.execute("SELECT SUM(amount_usd) FROM payments WHERE payment_date > ?", (week_ago,))
+    result = cursor.fetchone()[0]
+    stats['total_payments'] = result if result else 0
     
     cursor.execute("SELECT COUNT(*) FROM tags WHERE created_at > ? AND show_in_profit = 1", (week_ago,))
     stats['new_clients'] = cursor.fetchone()[0]
@@ -812,18 +817,15 @@ async def cancel_command(message: types.Message):
     
     tag_name = args.strip()
     
-    # Проверяем, существует ли тег
     tag_info = get_tag_info(tag_name)
     if not tag_info:
         await message.answer(f"❌ Тег {tag_name} не найден в базе данных!")
         return
     
-    # Проверяем, отмечен ли тег как отписавшийся
     if not is_tag_unsubscribed_by_name(tag_name):
         await message.answer(f"❌ Тег {tag_name} не отмечен как отписавшийся!")
         return
     
-    # Получаем tag_id и удаляем из отписавшихся
     tag_id = get_tag_id_by_name(tag_name)
     if tag_id:
         remove_from_unsubscribed(tag_id)
@@ -1071,7 +1073,6 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
         await message.answer("❌ У вас нет прав для этого действия!")
         return
     
-    # Проверяем КД (30 минут)
     last_check = get_last_check_time()
     if last_check:
         try:
@@ -1091,7 +1092,6 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
     set_last_check_time(get_current_time().strftime("%Y-%m-%d %H:%M:%S"))
     await state.finish()
     
-    # Очищаем marked_tags для текущего пользователя
     if user_id in marked_tags:
         del marked_tags[user_id]
     
@@ -1107,25 +1107,21 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
             await message_or_callback.message.edit_text("✅ Нет активных тегов для отметки!")
         return
     
-    # Сохраняем теги в состояние
     if state:
         await state.update_data(tags_list=tags)
         await MarkUnsubscribed.waiting_for_selection.set()
     
     user_id = message_or_callback.from_user.id if hasattr(message_or_callback, 'from_user') else message_or_callback.message.from_user.id
     
-    # Инициализируем marked_tags для пользователя если нет
     if user_id not in marked_tags:
         marked_tags[user_id] = set()
     
-    # Отправляем каждый тег отдельным сообщением
     for i, tag in enumerate(tags, 1):
         tag_id, tag_name, username, user_id, deadline, created_at = tag
         
         created_date = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
         created_str = created_date.astimezone(TIMEZONE).strftime("%d.%m %H:%M")
         
-        # Проверяем, отмечен ли уже этот тег
         is_marked = tag_id in marked_tags.get(user_id, set())
         
         text = f"{i}. {tag_name} (@{username}) {deadline}\n"
@@ -1134,7 +1130,6 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
         if is_marked:
             text += f"\n   ✅ Отмечен"
         
-        # Создаем клавиатуру
         keyboard = InlineKeyboardMarkup(row_width=1)
         
         if is_marked:
@@ -1147,7 +1142,6 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
         else:
             await message_or_callback.message.answer(text, reply_markup=keyboard)
     
-    # Отправляем сообщение с инструкцией и кнопкой "Завершить"
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(InlineKeyboardButton("✅ Завершить", callback_data="finish_unsub"))
     
@@ -1177,20 +1171,16 @@ async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state:
     tag_id = tags_list[index][0]
     tag_name = tags_list[index][1]
     
-    # Проверяем, не отмечен ли уже тег
     if tag_id in marked_tags.get(user_id, set()):
         await callback_query.answer("❌ Этот тег уже отмечен!")
         return
     
-    # Добавляем в отмеченные
     if user_id not in marked_tags:
         marked_tags[user_id] = set()
     marked_tags[user_id].add(tag_id)
     
-    # Отмечаем отписку в БД
     add_unsubscribed(tag_id)
     
-    # Обновляем сообщение
     await callback_query.message.edit_text(
         f"✅ Отмечен: {tag_name}",
         reply_markup=None
@@ -1212,18 +1202,13 @@ async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, stat
     tag_id = tags_list[index][0]
     tag_name = tags_list[index][1]
     
-    # Проверяем, отмечен ли тег
     if tag_id not in marked_tags.get(user_id, set()):
         await callback_query.answer("❌ Этот тег не был отмечен!")
         return
     
-    # Удаляем из отмеченных
     marked_tags[user_id].remove(tag_id)
-    
-    # Удаляем из БД
     remove_from_unsubscribed(tag_id)
     
-    # Обновляем сообщение
     await callback_query.message.edit_text(
         f"❌ Отменено: {tag_name}",
         reply_markup=None
@@ -1234,7 +1219,6 @@ async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, stat
 async def finish_unsub_callback(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
     
-    # Очищаем marked_tags для пользователя
     if user_id in marked_tags:
         del marked_tags[user_id]
     
@@ -1660,7 +1644,7 @@ async def team_weekly_stats(message: types.Message):
             payments = day['payments']
             bars = int(profit / 5) if profit > 0 else 0
             bar_str = "█" * min(bars, 40)
-            text += f"📅 {date}: {profit:.2f}$ {bar_str}\n"
+            text += f"📅 {date}: {profit:.2f}$ ({payments:.2f}$) {bar_str}\n"
     else:
         text += "За неделю нет данных.\n"
     
