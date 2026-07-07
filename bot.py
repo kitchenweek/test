@@ -1283,13 +1283,20 @@ async def hide_tag_callback(callback_query: types.CallbackQuery, state: FSMConte
     tag_id = all_tags[index][0]
     tag_name = all_tags[index][1]
     
+    # Удаляем сообщение с тегом
+    try:
+        await callback_query.message.delete()
+    except:
+        pass
+    
     await state.update_data(hide_tag_id=tag_id, hide_tag_name=tag_name)
     await HideTagState.waiting_for_hours.set()
     
-    await callback_query.message.edit_text(
+    # Отправляем запрос на ввод часов
+    await bot.send_message(
+        user_id,
         f"🙈 Скрыть тег {tag_name}\n\n"
-        f"Введите количество часов, на которое нужно скрыть тег:",
-        reply_markup=None
+        f"Введите количество часов, на которое нужно скрыть тег:"
     )
     await callback_query.answer()
 
@@ -1321,14 +1328,26 @@ async def process_hide_hours(message: types.Message, state: FSMContext):
             marked_tags[user_id].remove(tag_id)
         
         await state.finish()
+        
         await message.answer(
             f"✅ Тег {tag_name} скрыт на {hours} часов!\n"
             f"Он не будет показываться в проверке отписок до { (get_current_time() + timedelta(hours=hours)).strftime('%d.%m.%Y %H:%M') }"
         )
         
-        # Возвращаемся к списку отписок
-        user_id = message.from_user.id
-        await show_unsubscribed_page(message, state, user_id, current_unsub_page.get(user_id, 1))
+        # Перезапускаем процесс с обновленным списком
+        if user_id in marked_tags:
+            del marked_tags[user_id]
+        
+        tags = get_all_unsubscribed_tags()
+        
+        if not tags:
+            await message.answer("✅ Нет активных тегов для отметки!")
+            return
+        
+        await state.update_data(all_tags=tags)
+        await MarkUnsubscribed.waiting_for_selection.set()
+        current_unsub_page[user_id] = 1
+        await show_unsubscribed_page(message, state, user_id, 1)
         
     except ValueError:
         await message.answer("❌ Введите корректное число часов!")
