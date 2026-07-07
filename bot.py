@@ -1088,23 +1088,7 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
         await message.answer("❌ У вас нет прав для этого действия!")
         return
     
-    last_check = get_last_check_time()
-    if last_check:
-        try:
-            last_time = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
-            time_diff = (get_current_time() - last_time.replace(tzinfo=TIMEZONE)).total_seconds()
-            if time_diff < 1800:
-                remaining = int(1800 - time_diff)
-                minutes = remaining // 60
-                seconds = remaining % 60
-                await message.answer(
-                    f"⏳ Подождите {minutes} минут {seconds} секунд до следующей проверки."
-                )
-                return
-        except:
-            pass
-    
-    set_last_check_time(get_current_time().strftime("%Y-%m-%d %H:%M:%S"))
+    # Убираем проверку КД
     await state.finish()
     
     if user_id in marked_tags:
