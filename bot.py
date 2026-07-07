@@ -12,8 +12,8 @@ import math
 import pytz
 
 # Конфигурация
-TOKEN = "8574655444:AAGlqVwKq1R_t0JcW9frVeo1ZEmnJirBwSI"
-ADMIN_ID = 7517164478
+TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
+ADMIN_ID = 2010296191
 TIMEZONE = pytz.timezone('Europe/Moscow')
 
 # Настройка логирования
@@ -51,6 +51,9 @@ class EditDeadlineState(StatesGroup):
     waiting_for_tag = State()
     waiting_for_new_deadline = State()
 
+class HideTagState(StatesGroup):
+    waiting_for_hours = State()
+
 # Глобальная переменная для времени (для тестов)
 TEST_TIME = None
 marked_tags = {}
@@ -82,9 +85,7 @@ def init_db():
         deadline TEXT,
         is_active BOOLEAN DEFAULT 1,
         created_at TEXT,
-        skipped_count INTEGER DEFAULT 0,
-        last_shown TEXT,
-        is_archived BOOLEAN DEFAULT 0,
+        hidden_until TEXT,
         show_in_profit BOOLEAN DEFAULT 1,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
@@ -195,8 +196,8 @@ def add_user(user_id, username, full_name):
 def add_tag(user_id, tag, deadline):
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO tags (user_id, tag, deadline, created_at, skipped_count, last_shown, show_in_profit) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                  (user_id, tag, deadline, get_current_time().strftime("%Y-%m-%d %H:%M:%S"), 0, '', 1))
+    cursor.execute("INSERT INTO tags (user_id, tag, deadline, created_at, hidden_until, show_in_profit) VALUES (?, ?, ?, ?, ?, ?)", 
+                  (user_id, tag, deadline, get_current_time().strftime("%Y-%m-%d %H:%M:%S"), '', 1))
     conn.commit()
     conn.close()
 
@@ -284,6 +285,26 @@ def get_tag_id_by_name(tag_name):
     conn.close()
     return result[0] if result else None
 
+def hide_tag(tag_id, hours):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    hidden_until = (get_current_time() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("UPDATE tags SET hidden_until = ? WHERE id = ?", (hidden_until, tag_id))
+    conn.commit()
+    conn.close()
+
+def is_tag_hidden(tag_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT hidden_until FROM tags WHERE id = ?", (tag_id,))
+    result = cursor.fetchone()
+    conn.close()
+    if result and result[0]:
+        hidden_until = datetime.strptime(result[0], "%Y-%m-%d %H:%M:%S")
+        if get_current_time() < hidden_until:
+            return True
+    return False
+
 def get_unsubscribed_tags():
     today = get_current_time().strftime("%d.%m")
     conn = sqlite3.connect('bot_database.db')
@@ -291,58 +312,23 @@ def get_unsubscribed_tags():
     
     cursor.execute('''
     UPDATE tags 
-    SET is_archived = 1 
-    WHERE deadline < ? AND is_active = 1 AND is_archived = 0
+    SET is_active = 0 
+    WHERE deadline < ? AND is_active = 1
     ''', (today,))
     conn.commit()
     
     cursor.execute('''
-    SELECT t.id, t.tag, u.username, u.user_id, t.skipped_count, t.last_shown, t.deadline
+    SELECT t.id, t.tag, u.username, u.user_id, t.deadline
     FROM tags t 
     JOIN users u ON t.user_id = u.user_id 
-    WHERE t.is_active = 1 AND t.is_archived = 0
+    WHERE t.is_active = 1 
     AND t.id NOT IN (SELECT tag_id FROM unsubscribed)
+    AND (t.hidden_until IS NULL OR t.hidden_until <= ?)
     ORDER BY t.created_at DESC
-    ''')
-    all_tags = cursor.fetchall()
+    ''', (get_current_time().strftime("%Y-%m-%d %H:%M:%S"),))
+    tags = cursor.fetchall()
     conn.close()
-    
-    result = []
-    for tag in all_tags:
-        tag_id, tag_name, username, user_id, skipped_count, last_shown, deadline = tag
-        if not last_shown:
-            result.append(tag)
-            update_tag_shown(tag_id)
-        else:
-            if skipped_count == 0:
-                result.append(tag)
-                reset_tag_skipped(tag_id)
-            else:
-                decrement_tag_skipped(tag_id)
-    
-    return result
-
-def update_tag_shown(tag_id):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE tags SET last_shown = ? WHERE id = ?", 
-                  (get_current_time().strftime("%Y-%m-%d %H:%M:%S"), tag_id))
-    conn.commit()
-    conn.close()
-
-def reset_tag_skipped(tag_id):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE tags SET skipped_count = 0 WHERE id = ?", (tag_id,))
-    conn.commit()
-    conn.close()
-
-def decrement_tag_skipped(tag_id):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE tags SET skipped_count = skipped_count - 1 WHERE id = ? AND skipped_count > 0", (tag_id,))
-    conn.commit()
-    conn.close()
+    return tags
 
 def update_deadline(tag_name, new_deadline):
     conn = sqlite3.connect('bot_database.db')
@@ -558,22 +544,31 @@ def get_all_unsubscribed_tags():
     
     cursor.execute('''
     UPDATE tags 
-    SET is_archived = 1 
-    WHERE deadline < ? AND is_active = 1 AND is_archived = 0
+    SET is_active = 0 
+    WHERE deadline < ? AND is_active = 1
     ''', (today,))
     conn.commit()
     
     cursor.execute('''
-    SELECT t.id, t.tag, u.username, u.user_id, t.deadline, t.created_at
+    SELECT t.id, t.tag, u.username, u.user_id, t.deadline
     FROM tags t 
     JOIN users u ON t.user_id = u.user_id 
-    WHERE t.is_active = 1 AND t.is_archived = 0
+    WHERE t.is_active = 1
     AND t.id NOT IN (SELECT tag_id FROM unsubscribed)
+    AND (t.hidden_until IS NULL OR t.hidden_until <= ?)
     ORDER BY t.created_at DESC
-    ''')
+    ''', (get_current_time().strftime("%Y-%m-%d %H:%M:%S"),))
     tags = cursor.fetchall()
     conn.close()
     return tags
+
+def get_tag_by_id(tag_id):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM tags WHERE id = ? AND is_active = 1", (tag_id,))
+    tag = cursor.fetchone()
+    conn.close()
+    return tag
 
 def paginate_items(items, page, per_page=20):
     total_pages = math.ceil(len(items) / per_page)
@@ -939,17 +934,35 @@ async def process_bulk_tags(message: types.Message, state: FSMContext):
             errors.append(f"❌ {line} - неверный формат даты")
             continue
         
-        existing_tag = get_tag_by_name(tag)
-        if existing_tag:
-            errors.append(f"❌ {line} - такой тег уже существует")
-            continue
+        # Проверяем существование тега (даже если неактивный)
+        conn = sqlite3.connect('bot_database.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, is_active FROM tags WHERE tag = ?", (tag,))
+        existing = cursor.fetchone()
+        conn.close()
+        
+        if existing:
+            tag_id, is_active = existing
+            if is_active == 0:
+                # Восстанавливаем тег
+                conn = sqlite3.connect('bot_database.db')
+                cursor = conn.cursor()
+                cursor.execute("UPDATE tags SET is_active = 1, show_in_profit = 1, deadline = ?, hidden_until = '' WHERE id = ?", 
+                              (deadline, tag_id))
+                conn.commit()
+                conn.close()
+                added += 1
+                continue
+            else:
+                errors.append(f"❌ {line} - такой тег уже существует")
+                continue
         
         add_tag(user_id, tag, deadline)
         added += 1
     
     await state.finish()
     
-    result_text = f"✅ Добавлено мамонтов: {added}\n\n"
+    result_text = f"✅ Добавлено/восстановлено мамонтов: {added}\n\n"
     if errors:
         result_text += "Ошибки:\n" + "\n".join(errors)
     
@@ -1117,25 +1130,22 @@ async def show_unsubscribed_tags(message_or_callback, state, force=False):
         marked_tags[user_id] = set()
     
     for i, tag in enumerate(tags, 1):
-        tag_id, tag_name, username, user_id, deadline, created_at = tag
-        
-        created_date = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
-        created_str = created_date.astimezone(TIMEZONE).strftime("%d.%m %H:%M")
+        tag_id, tag_name, username, user_id, deadline = tag
         
         is_marked = tag_id in marked_tags.get(user_id, set())
         
-        text = f"{i}. {tag_name} (@{username}) {deadline}\n"
-        text += f"   изменено {created_str}"
+        text = f"{i}. {tag_name} (@{username}) {deadline}"
+        
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        buttons = []
         
         if is_marked:
-            text += f"\n   ✅ Отмечен"
-        
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        
-        if is_marked:
-            keyboard.add(InlineKeyboardButton(f"❌ Отменить #{i}", callback_data=f"cancel_unsub_{i}"))
+            buttons.append(InlineKeyboardButton(f"❌ Отменить #{i}", callback_data=f"cancel_unsub_{i}"))
         else:
-            keyboard.add(InlineKeyboardButton(f"✅ Отметить #{i}", callback_data=f"mark_unsub_{i}"))
+            buttons.append(InlineKeyboardButton(f"✅ Отметить #{i}", callback_data=f"mark_unsub_{i}"))
+            buttons.append(InlineKeyboardButton(f"🙈 Скрыть #{i}", callback_data=f"hide_tag_{i}"))
+        
+        keyboard.add(*buttons)
         
         if isinstance(message_or_callback, types.Message):
             await message_or_callback.answer(text, reply_markup=keyboard)
@@ -1214,6 +1224,72 @@ async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, stat
         reply_markup=None
     )
     await callback_query.answer(f"❌ Отписка для {tag_name} отменена!")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("hide_tag_"), state=MarkUnsubscribed.waiting_for_selection)
+async def hide_tag_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    index = int(callback_query.data.split('_')[2]) - 1
+    
+    data = await state.get_data()
+    tags_list = data.get('tags_list', [])
+    
+    if not tags_list or index >= len(tags_list):
+        await callback_query.answer("❌ Ошибка! Тег не найден.")
+        return
+    
+    tag_id = tags_list[index][0]
+    tag_name = tags_list[index][1]
+    
+    # Сохраняем tag_id в состояние для последующего использования
+    await state.update_data(hide_tag_id=tag_id, hide_tag_name=tag_name)
+    await HideTagState.waiting_for_hours.set()
+    
+    await callback_query.message.edit_text(
+        f"🙈 Скрыть тег {tag_name}\n\n"
+        f"Введите количество часов, на которое нужно скрыть тег:",
+        reply_markup=None
+    )
+    await callback_query.answer()
+
+@dp.message_handler(state=HideTagState.waiting_for_hours)
+async def process_hide_hours(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await back_to_menu(message, state)
+        return
+    
+    try:
+        hours = int(message.text.strip())
+        if hours <= 0:
+            await message.answer("❌ Введите положительное число часов!")
+            return
+        
+        data = await state.get_data()
+        tag_id = data.get('hide_tag_id')
+        tag_name = data.get('hide_tag_name')
+        
+        if not tag_id:
+            await message.answer("❌ Ошибка! Тег не найден.")
+            await state.finish()
+            return
+        
+        hide_tag(tag_id, hours)
+        
+        # Удаляем тег из marked_tags если он там есть
+        user_id = message.from_user.id
+        if user_id in marked_tags and tag_id in marked_tags[user_id]:
+            marked_tags[user_id].remove(tag_id)
+        
+        await state.finish()
+        await message.answer(
+            f"✅ Тег {tag_name} скрыт на {hours} часов!\n"
+            f"Он не будет показываться в проверке отписок до { (get_current_time() + timedelta(hours=hours)).strftime('%d.%m.%Y %H:%M') }"
+        )
+        
+        # Возвращаемся к списку отписок
+        await show_unsubscribed_tags(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число часов!")
 
 @dp.callback_query_handler(lambda c: c.data == "finish_unsub", state=MarkUnsubscribed.waiting_for_selection)
 async def finish_unsub_callback(callback_query: types.CallbackQuery, state: FSMContext):
