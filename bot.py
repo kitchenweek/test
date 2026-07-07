@@ -846,7 +846,8 @@ async def checkmsg_command(message: types.Message):
         await message.answer("❌ У вас нет прав для этого действия!")
         return
     
-    await show_unsubscribed_tags(message, None, force=True)
+    # Вызываем полный цикл отметки отписок
+    await mark_unsubscribed_start(message, None)
 
 @dp.message_handler(commands=["time"])
 async def time_command(message: types.Message):
@@ -1325,7 +1326,9 @@ async def process_hide_hours(message: types.Message, state: FSMContext):
             f"Он не будет показываться в проверке отписок до { (get_current_time() + timedelta(hours=hours)).strftime('%d.%m.%Y %H:%M') }"
         )
         
-        await show_unsubscribed_tags(message, state)
+        # Возвращаемся к списку отписок
+        user_id = message.from_user.id
+        await show_unsubscribed_page(message, state, user_id, current_unsub_page.get(user_id, 1))
         
     except ValueError:
         await message.answer("❌ Введите корректное число часов!")
