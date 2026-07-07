@@ -562,6 +562,19 @@ def get_tag_by_id(tag_id):
     conn.close()
     return tag
 
+def paginate_items(items, page, per_page=20):
+    total_pages = math.ceil(len(items) / per_page)
+    if page < 1:
+        page = 1
+    if page > total_pages and total_pages > 0:
+        page = total_pages
+    
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_items = items[start:end]
+    
+    return page_items, page, total_pages
+
 def paginate_list(items, page, per_page=10):
     total_pages = math.ceil(len(items) / per_page)
     if page < 1:
@@ -1078,21 +1091,17 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
     if user_id in marked_tags:
         del marked_tags[user_id]
     
-    # Получаем все теги
     tags = get_all_unsubscribed_tags()
     
     if not tags:
         await message.answer("✅ Нет активных тегов для отметки!")
         return
     
-    # Сохраняем все теги в состояние
     await state.update_data(all_tags=tags)
     await MarkUnsubscribed.waiting_for_selection.set()
     
-    # Сохраняем текущую страницу
     current_unsub_page[user_id] = 1
     
-    # Показываем первую страницу
     await show_unsubscribed_page(message, state, user_id, 1)
 
 async def show_unsubscribed_page(message_or_callback, state, user_id, page):
@@ -1106,29 +1115,29 @@ async def show_unsubscribed_page(message_or_callback, state, user_id, page):
             await message_or_callback.message.edit_text("❌ Список тегов пуст!")
         return
     
-    # Пагинация по 10
     items, page, total_pages = paginate_list(all_tags, page, per_page=10)
     current_unsub_page[user_id] = page
     
-    # Сохраняем текущие теги в состояние для кнопок
     await state.update_data(current_tags=items, current_page=page, total_pages=total_pages)
     
-    # Отправляем теги отдельными сообщениями
     sent_messages = []
     for i, tag in enumerate(items, 1):
         tag_id, tag_name, username, user_id, deadline = tag
         
-        # Проверяем, отмечен ли уже этот тег
         is_marked = tag_id in marked_tags.get(user_id, set())
         
         text = f"{i + (page-1)*10}. {tag_name} {deadline}"
         
-        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        buttons = []
         
         if is_marked:
-            keyboard.add(InlineKeyboardButton(f"❌ Отменить #{i + (page-1)*10}", callback_data=f"cancel_unsub_{i + (page-1)*10}"))
+            buttons.append(InlineKeyboardButton(f"❌ Отменить #{i + (page-1)*10}", callback_data=f"cancel_unsub_{i + (page-1)*10}"))
         else:
-            keyboard.add(InlineKeyboardButton(f"✅ Отметить #{i + (page-1)*10}", callback_data=f"mark_unsub_{i + (page-1)*10}"))
+            buttons.append(InlineKeyboardButton(f"✅ Отметить #{i + (page-1)*10}", callback_data=f"mark_unsub_{i + (page-1)*10}"))
+            buttons.append(InlineKeyboardButton(f"🙈 Скрыть #{i + (page-1)*10}", callback_data=f"hide_tag_{i + (page-1)*10}"))
+        
+        keyboard.add(*buttons)
         
         if isinstance(message_or_callback, types.Message):
             msg = await message_or_callback.answer(text, reply_markup=keyboard)
@@ -1136,10 +1145,8 @@ async def show_unsubscribed_page(message_or_callback, state, user_id, page):
             msg = await message_or_callback.message.answer(text, reply_markup=keyboard)
         sent_messages.append(msg.message_id)
     
-    # Сохраняем ID сообщений для удаления
     await state.update_data(sent_messages=sent_messages)
     
-    # Создаем клавиатуру для пагинации
     nav_keyboard = InlineKeyboardMarkup(row_width=3)
     buttons = []
     
@@ -1173,7 +1180,6 @@ async def unsub_prev_callback(callback_query: types.CallbackQuery, state: FSMCon
     current_page = current_unsub_page.get(user_id, 1)
     new_page = current_page - 1
     
-    # Удаляем предыдущие сообщения
     data = await state.get_data()
     sent_messages = data.get('sent_messages', [])
     for msg_id in sent_messages:
@@ -1182,7 +1188,6 @@ async def unsub_prev_callback(callback_query: types.CallbackQuery, state: FSMCon
         except:
             pass
     
-    # Показываем новую страницу
     await show_unsubscribed_page(callback_query, state, user_id, new_page)
     await callback_query.answer()
 
@@ -1192,7 +1197,6 @@ async def unsub_next_callback(callback_query: types.CallbackQuery, state: FSMCon
     current_page = current_unsub_page.get(user_id, 1)
     new_page = current_page + 1
     
-    # Удаляем предыдущие сообщения
     data = await state.get_data()
     sent_messages = data.get('sent_messages', [])
     for msg_id in sent_messages:
@@ -1201,7 +1205,6 @@ async def unsub_next_callback(callback_query: types.CallbackQuery, state: FSMCon
         except:
             pass
     
-    # Показываем новую страницу
     await show_unsubscribed_page(callback_query, state, user_id, new_page)
     await callback_query.answer()
 
@@ -1230,7 +1233,6 @@ async def mark_unsubscribed_callback(callback_query: types.CallbackQuery, state:
     
     add_unsubscribed(tag_id)
     
-    # Обновляем сообщение
     await callback_query.message.edit_text(
         f"✅ Отмечен: {tag_name}",
         reply_markup=None
@@ -1259,18 +1261,79 @@ async def cancel_unsubscribed_callback(callback_query: types.CallbackQuery, stat
     marked_tags[user_id].remove(tag_id)
     remove_from_unsubscribed(tag_id)
     
-    # Обновляем сообщение
     await callback_query.message.edit_text(
         f"❌ Отменено: {tag_name}",
         reply_markup=None
     )
     await callback_query.answer(f"❌ Отписка для {tag_name} отменена!")
 
+@dp.callback_query_handler(lambda c: c.data.startswith("hide_tag_"), state=MarkUnsubscribed.waiting_for_selection)
+async def hide_tag_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    index = int(callback_query.data.split('_')[2]) - 1
+    
+    data = await state.get_data()
+    all_tags = data.get('all_tags', [])
+    
+    if not all_tags or index >= len(all_tags):
+        await callback_query.answer("❌ Ошибка! Тег не найден.")
+        return
+    
+    tag_id = all_tags[index][0]
+    tag_name = all_tags[index][1]
+    
+    await state.update_data(hide_tag_id=tag_id, hide_tag_name=tag_name)
+    await HideTagState.waiting_for_hours.set()
+    
+    await callback_query.message.edit_text(
+        f"🙈 Скрыть тег {tag_name}\n\n"
+        f"Введите количество часов, на которое нужно скрыть тег:",
+        reply_markup=None
+    )
+    await callback_query.answer()
+
+@dp.message_handler(state=HideTagState.waiting_for_hours)
+async def process_hide_hours(message: types.Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await back_to_menu(message, state)
+        return
+    
+    try:
+        hours = int(message.text.strip())
+        if hours <= 0:
+            await message.answer("❌ Введите положительное число часов!")
+            return
+        
+        data = await state.get_data()
+        tag_id = data.get('hide_tag_id')
+        tag_name = data.get('hide_tag_name')
+        
+        if not tag_id:
+            await message.answer("❌ Ошибка! Тег не найден.")
+            await state.finish()
+            return
+        
+        hide_tag(tag_id, hours)
+        
+        user_id = message.from_user.id
+        if user_id in marked_tags and tag_id in marked_tags[user_id]:
+            marked_tags[user_id].remove(tag_id)
+        
+        await state.finish()
+        await message.answer(
+            f"✅ Тег {tag_name} скрыт на {hours} часов!\n"
+            f"Он не будет показываться в проверке отписок до { (get_current_time() + timedelta(hours=hours)).strftime('%d.%m.%Y %H:%M') }"
+        )
+        
+        await show_unsubscribed_tags(message, state)
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число часов!")
+
 @dp.callback_query_handler(lambda c: c.data == "finish_unsub", state=MarkUnsubscribed.waiting_for_selection)
 async def finish_unsub_callback(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
     
-    # Удаляем все сообщения с тегами
     data = await state.get_data()
     sent_messages = data.get('sent_messages', [])
     for msg_id in sent_messages:
