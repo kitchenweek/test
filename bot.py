@@ -63,32 +63,6 @@ def get_current_time():
         return TEST_TIME
     return datetime.now(TIMEZONE)
 
-def is_deadline_valid(deadline_str):
-    """Проверяет, что срок не прошедший и не больше 1 месяца"""
-    try:
-        # Парсим дату
-        deadline_date = datetime.strptime(deadline_str, "%d.%m")
-        
-        # Получаем текущую дату
-        now = get_current_time()
-        current_year = now.year
-        
-        # Пробуем с текущим годом
-        test_date = deadline_date.replace(year=current_year)
-        
-        # Если дата в прошлом относительно сегодня, пробуем со следующим годом
-        if test_date < now:
-            test_date = deadline_date.replace(year=current_year + 1)
-        
-        # Проверяем, что срок не больше 1 месяца от сегодня
-        max_date = now + timedelta(days=31)
-        if test_date > max_date:
-            return False, "❌ Срок не может быть больше 1 месяца!"
-        
-        return True, ""
-    except ValueError:
-        return False, "❌ Неверный формат даты! Используйте ДД.ММ"
-
 # Инициализация БД
 def init_db():
     conn = sqlite3.connect('bot_database.db')
@@ -792,10 +766,7 @@ async def add_command(message: types.Message):
         "Пример:\n"
         "@user1 31.12\n"
         "@user2 15.01\n"
-        "@user3 20.02\n\n"
-        "⚠️ Срок должен быть:\n"
-        "• Не прошедшим\n"
-        "• Не больше 1 месяца",
+        "@user3 20.02",
         reply_markup=back_keyboard
     )
 
@@ -933,10 +904,7 @@ async def add_tag_start(message: types.Message):
         "Пример:\n"
         "@user1 31.12\n"
         "@user2 15.01\n"
-        "@user3 20.02\n\n"
-        "⚠️ Срок должен быть:\n"
-        "• Не прошедшим\n"
-        "• Не больше 1 месяца",
+        "@user3 20.02",
         reply_markup=back_keyboard
     )
 
@@ -967,12 +935,6 @@ async def process_bulk_tags(message: types.Message, state: FSMContext):
             continue
         
         deadline = ' '.join(parts[1:])
-        
-        # Проверяем валидность срока
-        valid, error_msg = is_deadline_valid(deadline)
-        if not valid:
-            errors.append(f"❌ {line} - {error_msg}")
-            continue
         
         # Проверяем существование тега
         conn = sqlite3.connect('bot_database.db')
@@ -1130,7 +1092,7 @@ async def mark_unsubscribed_start(message: types.Message, state: FSMContext):
     if last_check:
         try:
             last_time = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
-            time_diff = (get_current_time() - last_time).total_seconds()
+            time_diff = (get_current_time() - last_time.replace(tzinfo=TIMEZONE)).total_seconds()
             if time_diff < 1800:
                 remaining = int(1800 - time_diff)
                 minutes = remaining // 60
@@ -1467,7 +1429,7 @@ async def edit_deadline_process_tag(message: types.Message, state: FSMContext):
     
     await state.update_data(tag_name=tag_name)
     await EditDeadlineState.waiting_for_new_deadline.set()
-    await message.answer(f"Введите новый срок для {tag_name} (в формате ДД.ММ):\n⚠️ Срок должен быть не прошедшим и не больше 1 месяца")
+    await message.answer(f"Введите новый срок для {tag_name} (в формате ДД.ММ):")
 
 @dp.message_handler(state=EditDeadlineState.waiting_for_new_deadline)
 async def edit_deadline_process_new(message: types.Message, state: FSMContext):
@@ -1476,11 +1438,6 @@ async def edit_deadline_process_new(message: types.Message, state: FSMContext):
         return
     
     new_deadline = message.text.strip()
-    
-    valid, error_msg = is_deadline_valid(new_deadline)
-    if not valid:
-        await message.answer(error_msg)
-        return
     
     data = await state.get_data()
     tag_name = data['tag_name']
