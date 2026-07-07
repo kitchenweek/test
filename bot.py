@@ -759,7 +759,7 @@ async def add_command(message: types.Message):
     back_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     back_keyboard.add(KeyboardButton("◀️ Назад"))
     await message.answer(
-        "Введите теги и сроки через новую строку:\n"
+        "Введите теги и сроки через новую строку. Если Вы на ПК, то вписывайте не более одного тега за раз\n"
         "Формат: @user ДД.ММ\n"
         "Пример:\n"
         "@user1 31.12\n"
