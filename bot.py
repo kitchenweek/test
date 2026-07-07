@@ -768,6 +768,54 @@ async def add_command(message: types.Message):
         reply_markup=back_keyboard
     )
 
+@dp.message_handler(commands=["addone"])
+async def add_one_command(message: types.Message):
+    """Команда для добавления одного тега (для ПК пользователей)"""
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if not user or not user[3]:
+        await message.answer("❌ У вас нет прав для этого действия!")
+        return
+    
+    args = message.get_args()
+    if not args:
+        await message.answer(
+            "❌ Использование: /addone @user ДД.ММ\n"
+            "Пример: /addone @username 31.12"
+        )
+        return
+    
+    parts = args.split()
+    if len(parts) < 2:
+        await message.answer("❌ Неверный формат! Используйте: /addone @user ДД.ММ")
+        return
+    
+    tag = parts[0].strip()
+    if not tag.startswith('@'):
+        await message.answer("❌ Тег должен начинаться с @")
+        return
+    
+    deadline = ' '.join(parts[1:])
+    try:
+        datetime.strptime(deadline, "%d.%m")
+    except ValueError:
+        await message.answer("❌ Неверный формат даты! Используйте ДД.ММ")
+        return
+    
+    existing_tag = get_tag_by_name(tag)
+    if existing_tag:
+        await message.answer("❌ Такой тег уже существует!")
+        return
+    
+    add_tag(user_id, tag, deadline)
+    
+    await message.answer(
+        f"✅ Мамонт {tag} успешно добавлен!\n"
+        f"📅 Срок: {deadline}",
+        reply_markup=get_main_keyboard(user_id)
+    )
+
 @dp.message_handler(commands=["check"])
 async def check_command(message: types.Message):
     user_id = message.from_user.id
@@ -871,7 +919,7 @@ async def time_command(message: types.Message):
     except ValueError:
         await message.answer("❌ Введите корректное число часов")
 
-@dp.message_handler(state='*', commands=["start", "stats", "top", "add", "check", "cancel", "checkmsg", "time"])
+@dp.message_handler(state='*', commands=["start", "stats", "top", "add", "addone", "check", "cancel", "checkmsg", "time"])
 async def command_state_handler(message: types.Message, state: FSMContext):
     await state.finish()
     command = message.get_command()
@@ -883,6 +931,8 @@ async def command_state_handler(message: types.Message, state: FSMContext):
         await top_command(message)
     elif command == "/add":
         await add_command(message)
+    elif command == "/addone":
+        await add_one_command(message)
     elif command == "/check":
         await check_command(message)
     elif command == "/cancel":
@@ -913,27 +963,64 @@ async def process_bulk_tags(message: types.Message, state: FSMContext):
         await back_to_menu(message, state)
         return
     
-    lines = message.text.strip().split('\n')
+    # Логируем для отладки
+    logging.info(f"Получено сообщение: {repr(message.text)}")
+    
+    # Обработка переносов строк для разных платформ
+    text = message.text.strip()
+    # Разделяем по переносам строк (поддерживает \n, \r\n, \r)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    
+    logging.info(f"Разбито на строки: {lines}")
+    
     added = 0
     errors = []
     user_id = message.from_user.id
     
     for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
+        # Разделяем по пробелам
         parts = line.split()
         if len(parts) < 2:
             errors.append(f"❌ {line} - неверный формат")
             continue
         
         tag = parts[0]
+        
+        # Удаляем лишние символы из тега
+        tag = tag.strip()
+        
+        # Если тег не начинается с @, но содержит @ внутри - берем первую часть с @
+        if not tag.startswith('@') and '@' in tag:
+            for part in parts:
+                if part.startswith('@'):
+                    tag = part
+                    break
+        
         if not tag.startswith('@'):
             errors.append(f"❌ {line} - тег должен начинаться с @")
             continue
         
-        deadline = ' '.join(parts[1:])
+        # Собираем дату из оставшихся частей
+        line_parts = line.split()
+        tag_index = 0
+        for i, part in enumerate(line_parts):
+            if part == tag or (part.startswith('@') and tag in part):
+                tag_index = i
+                break
+        
+        deadline_parts = line_parts[tag_index + 1:]
+        if not deadline_parts:
+            errors.append(f"❌ {line} - не указана дата")
+            continue
+        
+        deadline = ' '.join(deadline_parts)
+        
+        # Проверяем формат даты
+        try:
+            datetime.strptime(deadline, "%d.%m")
+        except ValueError:
+            errors.append(f"❌ {line} - неверный формат даты (нужно ДД.ММ)")
+            continue
         
         # Проверяем существование тега
         conn = sqlite3.connect('bot_database.db')
