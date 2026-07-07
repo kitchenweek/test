@@ -10,6 +10,7 @@ from aiogram.utils import executor
 import sqlite3
 import math
 import pytz
+import re
 
 # Конфигурация
 TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
@@ -62,6 +63,27 @@ def get_current_time():
     if TEST_TIME:
         return TEST_TIME
     return datetime.now(TIMEZONE)
+
+def is_deadline_valid(deadline_str):
+    """Проверяет, что срок не прошедший и не больше 1 месяца"""
+    try:
+        deadline_date = datetime.strptime(deadline_str, "%d.%m")
+        # Добавляем год к дате
+        current_year = get_current_time().year
+        deadline_date = deadline_date.replace(year=current_year)
+        
+        # Если дата в прошлом, добавляем год
+        if deadline_date < get_current_time():
+            deadline_date = deadline_date.replace(year=current_year + 1)
+        
+        # Проверяем, что срок не больше 1 месяца
+        max_date = get_current_time() + timedelta(days=31)
+        if deadline_date > max_date:
+            return False, "❌ Срок не может быть больше 1 месяца!"
+        
+        return True, ""
+    except ValueError:
+        return False, "❌ Неверный формат даты!"
 
 # Инициализация БД
 def init_db():
@@ -293,23 +315,21 @@ def hide_tag(tag_id, hours):
     conn.commit()
     conn.close()
 
-def is_tag_hidden(tag_id):
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT hidden_until FROM tags WHERE id = ?", (tag_id,))
-    result = cursor.fetchone()
-    conn.close()
-    if result and result[0]:
-        hidden_until = datetime.strptime(result[0], "%Y-%m-%d %H:%M:%S")
-        if get_current_time() < hidden_until:
-            return True
-    return False
-
 def get_unsubscribed_tags():
     today = get_current_time().strftime("%d.%m")
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     
+    # Автоудаление тегов сроком 2 месяца
+    two_months_ago = (get_current_time() - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute('''
+    UPDATE tags 
+    SET is_active = 0 
+    WHERE created_at < ? AND is_active = 1
+    ''', (two_months_ago,))
+    conn.commit()
+    
+    # Удаление тегов с истекшим сроком
     cursor.execute('''
     UPDATE tags 
     SET is_active = 0 
@@ -541,6 +561,15 @@ def get_all_unsubscribed_tags():
     cursor = conn.cursor()
     
     today = get_current_time().strftime("%d.%m")
+    
+    # Автоудаление тегов сроком 2 месяца
+    two_months_ago = (get_current_time() - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute('''
+    UPDATE tags 
+    SET is_active = 0 
+    WHERE created_at < ? AND is_active = 1
+    ''', (two_months_ago,))
+    conn.commit()
     
     cursor.execute('''
     UPDATE tags 
@@ -897,7 +926,10 @@ async def add_tag_start(message: types.Message):
         "Пример:\n"
         "@user1 31.12\n"
         "@user2 15.01\n"
-        "@user3 20.02",
+        "@user3 20.02\n\n"
+        "⚠️ Срок должен быть:\n"
+        "• Не прошедшим\n"
+        "• Не больше 1 месяца",
         reply_markup=back_keyboard
     )
 
@@ -928,13 +960,14 @@ async def process_bulk_tags(message: types.Message, state: FSMContext):
             continue
         
         deadline = ' '.join(parts[1:])
-        try:
-            datetime.strptime(deadline, "%d.%m")
-        except ValueError:
-            errors.append(f"❌ {line} - неверный формат даты")
+        
+        # Проверяем валидность срока
+        valid, error_msg = is_deadline_valid(deadline)
+        if not valid:
+            errors.append(f"❌ {line} - {error_msg}")
             continue
         
-        # Проверяем существование тега (даже если неактивный)
+        # Проверяем существование тега
         conn = sqlite3.connect('bot_database.db')
         cursor = conn.cursor()
         cursor.execute("SELECT id, is_active FROM tags WHERE tag = ?", (tag,))
@@ -1240,7 +1273,6 @@ async def hide_tag_callback(callback_query: types.CallbackQuery, state: FSMConte
     tag_id = tags_list[index][0]
     tag_name = tags_list[index][1]
     
-    # Сохраняем tag_id в состояние для последующего использования
     await state.update_data(hide_tag_id=tag_id, hide_tag_name=tag_name)
     await HideTagState.waiting_for_hours.set()
     
@@ -1274,7 +1306,6 @@ async def process_hide_hours(message: types.Message, state: FSMContext):
         
         hide_tag(tag_id, hours)
         
-        # Удаляем тег из marked_tags если он там есть
         user_id = message.from_user.id
         if user_id in marked_tags and tag_id in marked_tags[user_id]:
             marked_tags[user_id].remove(tag_id)
@@ -1285,7 +1316,6 @@ async def process_hide_hours(message: types.Message, state: FSMContext):
             f"Он не будет показываться в проверке отписок до { (get_current_time() + timedelta(hours=hours)).strftime('%d.%m.%Y %H:%M') }"
         )
         
-        # Возвращаемся к списку отписок
         await show_unsubscribed_tags(message, state)
         
     except ValueError:
@@ -1371,10 +1401,9 @@ async def send_clients_page(message_or_callback, user_id, tags, page, update_tim
         keyboard.row(*buttons)
     
     keyboard.row(
-        InlineKeyboardButton("🔄 Обновить", callback_data="refresh_clients"),
-        InlineKeyboardButton("✏️ Изменить срок", callback_data="edit_deadline")
+        InlineKeyboardButton("✏️ Изменить срок", callback_data="edit_deadline"),
+        InlineKeyboardButton("❌ Закрыть", callback_data="close_clients")
     )
-    keyboard.row(InlineKeyboardButton("❌ Закрыть", callback_data="close_clients"))
     
     if isinstance(message_or_callback, types.Message):
         await message_or_callback.answer(text, reply_markup=keyboard)
@@ -1401,27 +1430,6 @@ async def clients_pagination_callback(callback_query: types.CallbackQuery, state
     
     await send_clients_page(callback_query, user_id, tags, page, last_update)
     await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "refresh_clients", state=ClientListState.viewing)
-async def refresh_clients_callback(callback_query: types.CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-    tags = get_all_user_tags_with_status(user_id)
-    
-    if not tags:
-        await callback_query.message.edit_text("У вас нет мамонтов.")
-        await callback_query.answer()
-        await state.finish()
-        return
-    
-    await state.update_data(clients_list=tags)
-    
-    last_update = get_last_update_time()
-    if not last_update:
-        last_update = "еще не обновлялось"
-    
-    page = 1
-    await send_clients_page(callback_query, user_id, tags, page, last_update)
-    await callback_query.answer("🔄 Список обновлен!")
 
 @dp.callback_query_handler(lambda c: c.data == "edit_deadline", state=ClientListState.viewing)
 async def edit_deadline_start(callback_query: types.CallbackQuery, state: FSMContext):
@@ -1452,7 +1460,7 @@ async def edit_deadline_process_tag(message: types.Message, state: FSMContext):
     
     await state.update_data(tag_name=tag_name)
     await EditDeadlineState.waiting_for_new_deadline.set()
-    await message.answer(f"Введите новый срок для {tag_name} (в формате ДД.ММ):")
+    await message.answer(f"Введите новый срок для {tag_name} (в формате ДД.ММ):\n⚠️ Срок должен быть не прошедшим и не больше 1 месяца")
 
 @dp.message_handler(state=EditDeadlineState.waiting_for_new_deadline)
 async def edit_deadline_process_new(message: types.Message, state: FSMContext):
@@ -1462,10 +1470,9 @@ async def edit_deadline_process_new(message: types.Message, state: FSMContext):
     
     new_deadline = message.text.strip()
     
-    try:
-        datetime.strptime(new_deadline, "%d.%m")
-    except ValueError:
-        await message.answer("❌ Неверный формат! Используйте ДД.ММ (например, 31.12):")
+    valid, error_msg = is_deadline_valid(new_deadline)
+    if not valid:
+        await message.answer(error_msg)
         return
     
     data = await state.get_data()
