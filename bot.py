@@ -10,7 +10,6 @@ from aiogram.utils import executor
 import sqlite3
 import math
 import pytz
-import re
 
 # Конфигурация
 TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
@@ -67,23 +66,28 @@ def get_current_time():
 def is_deadline_valid(deadline_str):
     """Проверяет, что срок не прошедший и не больше 1 месяца"""
     try:
+        # Парсим дату
         deadline_date = datetime.strptime(deadline_str, "%d.%m")
-        # Добавляем год к дате
-        current_year = get_current_time().year
-        deadline_date = deadline_date.replace(year=current_year)
         
-        # Если дата в прошлом, добавляем год
-        if deadline_date < get_current_time():
-            deadline_date = deadline_date.replace(year=current_year + 1)
+        # Получаем текущую дату
+        now = get_current_time()
+        current_year = now.year
         
-        # Проверяем, что срок не больше 1 месяца
-        max_date = get_current_time() + timedelta(days=31)
-        if deadline_date > max_date:
+        # Пробуем с текущим годом
+        test_date = deadline_date.replace(year=current_year)
+        
+        # Если дата в прошлом относительно сегодня, пробуем со следующим годом
+        if test_date < now:
+            test_date = deadline_date.replace(year=current_year + 1)
+        
+        # Проверяем, что срок не больше 1 месяца от сегодня
+        max_date = now + timedelta(days=31)
+        if test_date > max_date:
             return False, "❌ Срок не может быть больше 1 месяца!"
         
         return True, ""
     except ValueError:
-        return False, "❌ Неверный формат даты!"
+        return False, "❌ Неверный формат даты! Используйте ДД.ММ"
 
 # Инициализация БД
 def init_db():
@@ -788,7 +792,10 @@ async def add_command(message: types.Message):
         "Пример:\n"
         "@user1 31.12\n"
         "@user2 15.01\n"
-        "@user3 20.02",
+        "@user3 20.02\n\n"
+        "⚠️ Срок должен быть:\n"
+        "• Не прошедшим\n"
+        "• Не больше 1 месяца",
         reply_markup=back_keyboard
     )
 
