@@ -187,7 +187,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Обработчик нажатий на кнопки"""
     query = update.callback_query
     user_id = update.effective_user.id
-    data = query.data
+    callback_data = query.data
     
     if user_id not in user_data:
         await query.answer("❌ Сессия истекла. Используйте /start")
@@ -195,27 +195,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     user_info = user_data[user_id]
     
-    if data.startswith('prev_'):
+    # Проверяем тип callback_data
+    if callback_data.startswith('prev_'):
         # Навигация назад
-        current = int(data.split('_')[1])
-        new_index = current - 1
-        if new_index >= 0:
-            user_info['current_group_index'] = new_index
-            await show_stage1_group(update, context, user_id, new_index)
+        try:
+            current = int(callback_data.split('_')[1])
+            new_index = current - 1
+            if new_index >= 0:
+                user_info['current_group_index'] = new_index
+                await show_stage1_group(update, context, user_id, new_index)
+        except (IndexError, ValueError) as e:
+            logger.error(f"Error parsing prev_ callback: {e}")
+            await query.answer("❌ Ошибка навигации")
     
-    elif data.startswith('next_'):
-        # Навигация вперед
-        current = int(data.split('_')[1])
-        new_index = current + 1
-        if new_index < len(user_info['groups_stage1']):
-            user_info['current_group_index'] = new_index
-            await show_stage1_group(update, context, user_id, new_index)
+    elif callback_data.startswith('next_'):
+        # Проверяем, что это не 'next_stage2'
+        if callback_data == 'next_stage2':
+            # Переход к следующей итерации этапа 2
+            await next_stage2_iteration(update, context, user_id)
+        else:
+            # Навигация вперед (next_0, next_1, etc.)
+            try:
+                current = int(callback_data.split('_')[1])
+                new_index = current + 1
+                if new_index < len(user_info['groups_stage1']):
+                    user_info['current_group_index'] = new_index
+                    await show_stage1_group(update, context, user_id, new_index)
+            except (IndexError, ValueError) as e:
+                logger.error(f"Error parsing next_ callback: {e}")
+                await query.answer("❌ Ошибка навигации")
     
-    elif data == 'finish_stage1':
+    elif callback_data == 'finish_stage1':
         # Завершение этапа 1 и переход к этапу 2
         await start_stage2(update, context, user_id)
     
-    elif data == 'load_numbers':
+    elif callback_data == 'load_numbers':
         # Загрузка номеров
         await query.edit_message_text(
             "📥 Отправьте новый список номеров\n"
@@ -224,13 +238,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         user_info['stage'] = 0  # Ожидание новой загрузки
     
-    elif data == 'next_stage2':
-        # Переход к следующей итерации этапа 2
-        await next_stage2_iteration(update, context, user_id)
-    
-    elif data == 'back_to_stage1':
+    elif callback_data == 'back_to_stage1':
         # Возврат к этапу 1
         await back_to_stage1(update, context, user_id)
+    
+    elif callback_data == 'restart':
+        # Перезапуск
+        await restart_command(update, context)
+    
+    else:
+        logger.warning(f"Unknown callback data: {callback_data}")
+        await query.answer("❌ Неизвестная команда")
     
     await query.answer()
 
@@ -382,7 +400,6 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_numbers))
     application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(CallbackQueryHandler(restart_command, pattern="^restart$"))
     
     # Запуск бота
     application.run_polling(allowed_updates=Update.ALL_TYPES)
