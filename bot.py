@@ -37,7 +37,7 @@ class NumberBot:
     
     @staticmethod
     def format_group_message(groups: List[List[int]], views: List[int], stage: int, group_index: int = None) -> str:
-        """Форматирует сообщение с группами"""
+        """Форматирует сообщение с группами (моноширный шрифт для цифр)"""
         message = f"📊 Этап {stage}\n\n"
         
         if group_index is not None:
@@ -46,14 +46,18 @@ class NumberBot:
                 group = groups[group_index]
                 view_count = views[group_index] if group_index < len(views) else views[-1]
                 message += f"📌 Группа {group_index + 1} - {view_count} просмотров\n"
-                message += f"📝 Цифры: {', '.join(map(str, group))}\n"
+                # Моноширный шрифт для цифр
+                digits_str = ' '.join(map(str, group))
+                message += f"📝 Цифры: <code>{digits_str}</code>\n"
                 message += f"📊 Количество: {len(group)} цифр"
         else:
             # Для всех групп (этап 2)
             for i, group in enumerate(groups):
                 view_count = views[i] if i < len(views) else views[-1]
                 message += f"📌 Группа {i + 1} - {view_count} просмотров\n"
-                message += f"📝 Цифры: {', '.join(map(str, group))}\n"
+                # Моноширный шрифт для цифр
+                digits_str = ' '.join(map(str, group))
+                message += f"📝 Цифры: <code>{digits_str}</code>\n"
                 message += f"📊 Количество: {len(group)} цифр\n\n"
         
         return message
@@ -107,7 +111,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я бот для обработки номеров.\n\n"
         "📤 Отправьте мне список цифр (от 115 до 125 цифр) любым способом.\n"
-        "Цифры могут быть в любом формате (в ряд, с пробелами, с переносами строк и т.д.)"
+        "Цифры могут быть в любом формате (в ряд, с пробелами, с переносами строк и т.д.)",
+        parse_mode='HTML'
     )
 
 async def handle_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -132,7 +137,8 @@ async def handle_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             f"❌ Ошибка! Вы отправили {len(numbers)} цифр.\n"
             "Необходимо отправить от 115 до 125 цифр.\n\n"
-            "Пожалуйста, отправьте корректное количество цифр."
+            "Пожалуйста, отправьте корректное количество цифр.",
+            parse_mode='HTML'
         )
         return
     
@@ -161,10 +167,18 @@ async def show_stage1_group(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     keyboard = NumberBot.get_keyboard_stage1(len(groups), index)
     
     if update.callback_query:
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard)
+        await update.callback_query.edit_message_text(
+            message, 
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
         await update.callback_query.answer()
     else:
-        await update.message.reply_text(message, reply_markup=keyboard)
+        await update.message.reply_text(
+            message, 
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик нажатий на кнопки"""
@@ -202,7 +216,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Загрузка номеров
         await query.edit_message_text(
             "📥 Отправьте новый список номеров\n"
-            "Требования: от 115 до 125 цифр"
+            "Требования: от 115 до 125 цифр",
+            parse_mode='HTML'
         )
         user_info['stage'] = 0  # Ожидание новой загрузки
     
@@ -244,9 +259,17 @@ async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     keyboard = NumberBot.get_keyboard_stage2()
     
     if update.callback_query:
-        await update.callback_query.edit_message_text(message, reply_markup=keyboard)
+        await update.callback_query.edit_message_text(
+            message, 
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
     else:
-        await update.message.reply_text(message, reply_markup=keyboard)
+        await update.message.reply_text(
+            message, 
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
 
 async def next_stage2_iteration(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     """Переходит к следующей итерации этапа 2"""
@@ -256,10 +279,12 @@ async def next_stage2_iteration(update: Update, context: ContextTypes.DEFAULT_TY
         await update.callback_query.edit_message_text(
             "✅ Все повторения завершены!\n"
             f"Было выполнено {MAX_REPEATS} повторений этапа 2.\n\n"
-            "Для начала заново используйте /start"
+            "Для начала заново используйте /start",
+            parse_mode='HTML'
         )
         return
     
+    # Запускаем следующую итерацию
     await start_stage2(update, context, user_id)
 
 async def back_to_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
@@ -289,11 +314,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /start - Начать работу
 /help - Показать эту справку
     """
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(help_text, parse_mode='HTML')
 
 def main() -> None:
     """Запуск бота"""
-    # Токен бота (выдуманный для примера)
+    # Токен бота
     application = Application.builder().token("8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is").build()
     
     # Регистрация обработчиков
