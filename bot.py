@@ -53,18 +53,18 @@ class NumberBot:
             if group_index < len(groups):
                 group = groups[group_index]
                 view_count = views[group_index] if group_index < len(views) else views[-1]
-                message += f"📌 Группа {group_index + 1} - {view_count} просмотров\n"
-                # Моноширный шрифт для цифр
-                digits_str = ' '.join(map(str, group))
+                message += f"📌 Группа {group_index + 1} - <b>{view_count}</b> просмотров\n"
+                # Моноширный шрифт для цифр через запятую
+                digits_str = ', '.join(map(str, group))
                 message += f"📝 Цифры: <code>{digits_str}</code>\n"
                 message += f"📊 Количество: {len(group)} цифр"
         else:
             # Для всех групп (этап 2)
             for i, group in enumerate(groups):
                 view_count = views[i] if i < len(views) else views[-1]
-                message += f"📌 Группа {i + 1} - {view_count} просмотров\n"
-                # Моноширный шрифт для цифр
-                digits_str = ' '.join(map(str, group))
+                message += f"📌 Группа {i + 1} - <b>{view_count}</b> просмотров\n"
+                # Моноширный шрифт для цифр через запятую
+                digits_str = ', '.join(map(str, group))
                 message += f"📝 Цифры: <code>{digits_str}</code>\n"
                 message += f"📊 Количество: {len(group)} цифр\n\n"
         
@@ -74,10 +74,10 @@ class NumberBot:
     def format_stage3_message(numbers: List[int], count: int) -> str:
         """Форматирует сообщение для этапа 3"""
         views = VIEWS_STAGE3.get(count, 0)
-        digits_str = ' '.join(map(str, numbers))
+        digits_str = ', '.join(map(str, numbers))
         
         message = f"📊 Этап 3\n\n"
-        message += f"📌 Последние {count} номеров - {views} просмотров\n"
+        message += f"📌 Последние {count} номеров - <b>{views}</b> просмотров\n"
         message += f"📝 Цифры: <code>{digits_str}</code>\n"
         message += f"📊 Количество: {count} цифр"
         
@@ -298,20 +298,20 @@ async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     """Запускает этап 2"""
     data = user_data[user_id]
     
-    # Берем текущий список (уже измененный на предыдущих итерациях)
+    # Берем текущий список
     current_numbers = data['current_numbers'].copy()
     
-    # Убираем 5-8 цифр случайным образом
+    # Убираем 5-8 цифр из конца списка (последние цифры)
     remove_count = random.randint(5, 8)
     
     # Проверяем, что можно удалить столько цифр
     if len(current_numbers) <= remove_count:
         remove_count = max(1, len(current_numbers) - 1)  # Оставляем хотя бы 1 цифру
     
+    # Удаляем последние remove_count цифр
     if len(current_numbers) > remove_count:
-        indices_to_remove = sorted(random.sample(range(len(current_numbers)), remove_count), reverse=True)
-        for idx in indices_to_remove:
-            current_numbers.pop(idx)
+        # Просто обрезаем список
+        current_numbers = current_numbers[:-remove_count]
     
     # Сохраняем новый список
     data['current_numbers'] = current_numbers
@@ -325,8 +325,8 @@ async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     # Показываем все группы
     message = NumberBot.format_group_message(groups, VIEWS_STAGE2, 2)
     message += f"\n🔄 Повторение {data['repeat_count']} из {MAX_REPEATS}"
-    message += f"\n📊 Удалено цифр: {remove_count}"
-    message += f"\n📊 Осталось цифр: {len(current_numbers)}"
+    message += f"\n📊 Удалено последних цифр: <b>{remove_count}</b>"
+    message += f"\n📊 Осталось цифр: <b>{len(current_numbers)}</b>"
     
     # Добавляем историю удалений
     if data['removed_counts']:
@@ -437,16 +437,16 @@ async def finish_stage3(update: Update, context: ContextTypes.DEFAULT_TYPE, user
     
     message = "✅ Все этапы завершены!\n\n"
     message += "📊 Итоговая статистика:\n"
-    message += f"📌 Исходное количество цифр: {len(data['original_numbers'])}\n"
-    message += f"📌 Повторений этапа 2: {data['repeat_count']}\n"
+    message += f"📌 Исходное количество цифр: <b>{len(data['original_numbers'])}</b>\n"
+    message += f"📌 Повторений этапа 2: <b>{data['repeat_count']}</b>\n"
     
     if data['removed_counts']:
         message += "📌 История удалений:\n"
         for i, cnt in enumerate(data['removed_counts'], 1):
-            message += f"  - Повторение {i}: удалено {cnt} цифр\n"
+            message += f"  - Повторение {i}: удалено <b>{cnt}</b> последних цифр\n"
     
-    message += f"📌 Итоговое количество цифр после этапа 2: {len(data['current_numbers'])}\n"
-    message += f"📌 Всего просмотрено комбинаций: {len(data['stage3_counts'])}\n\n"
+    message += f"📌 Итоговое количество цифр после этапа 2: <b>{len(data['current_numbers'])}</b>\n"
+    message += f"📌 Всего просмотрено комбинаций: <b>{len(data['stage3_counts'])}</b>\n\n"
     message += "🔄 Для начала заново используйте /start"
     
     keyboard = InlineKeyboardMarkup([[
@@ -492,7 +492,7 @@ async def back_to_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     
     message = NumberBot.format_group_message(groups, VIEWS_STAGE2, 2)
     message += f"\n🔄 Повторение {data['repeat_count']} из {MAX_REPEATS}"
-    message += f"\n📊 Осталось цифр: {len(current_numbers)}"
+    message += f"\n📊 Осталось цифр: <b>{len(current_numbers)}</b>"
     
     if data['removed_counts']:
         history = ' | '.join([f"#{i+1}: {cnt}" for i, cnt in enumerate(data['removed_counts'])])
@@ -539,14 +539,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 1️⃣ Отправьте список из 115-125 цифр
 2️⃣ Этап 1: Разбивка на группы по 40 цифр с пагинацией
-3️⃣ Этап 2: 4 повторения удаления 5-8 цифр и разбивка на группы
+3️⃣ Этап 2: 4 повторения удаления последних 5-8 цифр и разбивка на группы
 4️⃣ Этап 3: Показ последних N цифр с разными просмотрами:
-   • 9 цифр - 200 просмотров
-   • 8 цифр - 400 просмотров
-   • 6 цифр - 500 просмотров
-   • 4 цифры - 700 просмотров
-   • 3 цифры - 900 просмотров
-   • 2 цифры - 1300 просмотров
+   • 9 цифр - <b>200</b> просмотров
+   • 8 цифр - <b>400</b> просмотров
+   • 6 цифр - <b>500</b> просмотров
+   • 4 цифры - <b>700</b> просмотров
+   • 3 цифры - <b>900</b> просмотров
+   • 2 цифры - <b>1300</b> просмотров
 
 Команды:
 /start - Начать работу
