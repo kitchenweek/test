@@ -17,6 +17,14 @@ user_data: Dict[int, Dict[str, Any]] = {}
 # Константы
 VIEWS_STAGE1 = [1300, 1400, 1500, 1600]
 VIEWS_STAGE2 = [100, 200, 300]
+VIEWS_STAGE3 = {
+    9: 200,
+    8: 400,
+    6: 500,
+    4: 700,
+    3: 900,
+    2: 1300
+}
 MAX_REPEATS = 4  # Максимальное количество повторений этапа 2
 
 class NumberBot:
@@ -63,6 +71,19 @@ class NumberBot:
         return message
     
     @staticmethod
+    def format_stage3_message(numbers: List[int], count: int) -> str:
+        """Форматирует сообщение для этапа 3"""
+        views = VIEWS_STAGE3.get(count, 0)
+        digits_str = ' '.join(map(str, numbers))
+        
+        message = f"📊 Этап 3\n\n"
+        message += f"📌 Последние {count} номеров - {views} просмотров\n"
+        message += f"📝 Цифры: <code>{digits_str}</code>\n"
+        message += f"📊 Количество: {count} цифр"
+        
+        return message
+    
+    @staticmethod
     def get_keyboard_stage1(total_groups: int, current_index: int) -> InlineKeyboardMarkup:
         """Создает клавиатуру для этапа 1 с пагинацией"""
         keyboard = []
@@ -94,19 +115,30 @@ class NumberBot:
             [InlineKeyboardButton("◀️ Назад", callback_data="back_to_stage1")]
         ]
         return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def get_keyboard_stage3() -> InlineKeyboardMarkup:
+        """Создает клавиатуру для этапа 3"""
+        keyboard = [
+            [InlineKeyboardButton("▶️ Далее", callback_data="next_stage3")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_stage2")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start"""
     user_id = update.effective_user.id
     user_data[user_id] = {
-        'stage': 0,  # 0 - ожидание загрузки, 1 - этап 1, 2 - этап 2
+        'stage': 0,  # 0 - ожидание загрузки, 1 - этап 1, 2 - этап 2, 3 - этап 3
         'original_numbers': [],  # Исходный список (никогда не меняется)
         'current_numbers': [],   # Текущий список (меняется на каждом этапе 2)
         'current_group_index': 0,
         'repeat_count': 0,
         'groups_stage1': [],
         'groups_stage2': [],
-        'removed_counts': []  # История удаленных цифр
+        'removed_counts': [],  # История удаленных цифр
+        'stage3_index': 0,  # Индекс для этапа 3 (0-5)
+        'stage3_counts': [9, 8, 6, 4, 3, 2]  # Последовательность количества цифр
     }
     
     await update.message.reply_text(
@@ -129,7 +161,9 @@ async def handle_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             'repeat_count': 0,
             'groups_stage1': [],
             'groups_stage2': [],
-            'removed_counts': []
+            'removed_counts': [],
+            'stage3_index': 0,
+            'stage3_counts': [9, 8, 6, 4, 3, 2]
         }
     
     # Парсим числа из сообщения
@@ -150,6 +184,7 @@ async def handle_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_data[user_id]['stage'] = 1
     user_data[user_id]['repeat_count'] = 0
     user_data[user_id]['removed_counts'] = []
+    user_data[user_id]['stage3_index'] = 0
     
     # Создаем группы для этапа 1
     groups = NumberBot.create_groups(numbers, 40)
@@ -209,10 +244,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("❌ Ошибка навигации")
     
     elif callback_data.startswith('next_'):
-        # Проверяем, что это не 'next_stage2'
+        # Проверяем, что это не 'next_stage2' или 'next_stage3'
         if callback_data == 'next_stage2':
             # Переход к следующей итерации этапа 2
             await next_stage2_iteration(update, context, user_id)
+        elif callback_data == 'next_stage3':
+            # Переход к следующему шагу этапа 3
+            await next_stage3_step(update, context, user_id)
         else:
             # Навигация вперед (next_0, next_1, etc.)
             try:
@@ -241,6 +279,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif callback_data == 'back_to_stage1':
         # Возврат к этапу 1
         await back_to_stage1(update, context, user_id)
+    
+    elif callback_data == 'back_to_stage2':
+        # Возврат к этапу 2
+        await back_to_stage2(update, context, user_id)
     
     elif callback_data == 'restart':
         # Перезапуск
@@ -291,7 +333,83 @@ async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         history = ' | '.join([f"#{i+1}: {cnt}" for i, cnt in enumerate(data['removed_counts'])])
         message += f"\n📋 История удалений: {history}"
     
-    keyboard = NumberBot.get_keyboard_stage2()
+    # Проверяем, закончились ли повторения
+    if data['repeat_count'] >= MAX_REPEATS:
+        # Переходим к этапу 3
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Перейти к этапу 3", callback_data="next_stage3")
+        ]])
+        message += "\n\n✅ Все повторения этапа 2 завершены!"
+        message += "\nНажмите 'Перейти к этапу 3' для продолжения"
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message, 
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text(
+                message, 
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+    else:
+        keyboard = NumberBot.get_keyboard_stage2()
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message, 
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text(
+                message, 
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+
+async def next_stage2_iteration(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Переходит к следующей итерации этапа 2"""
+    data = user_data[user_id]
+    
+    if data['repeat_count'] >= MAX_REPEATS:
+        # Переходим к этапу 3
+        await start_stage3(update, context, user_id)
+        return
+    
+    # Запускаем следующую итерацию
+    await start_stage2(update, context, user_id)
+
+async def start_stage3(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Запускает этап 3"""
+    data = user_data[user_id]
+    data['stage'] = 3
+    data['stage3_index'] = 0
+    
+    await show_stage3_step(update, context, user_id)
+
+async def show_stage3_step(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Показывает текущий шаг этапа 3"""
+    data = user_data[user_id]
+    index = data['stage3_index']
+    counts = data['stage3_counts']
+    
+    if index >= len(counts):
+        # Все шаги этапа 3 завершены
+        await finish_stage3(update, context, user_id)
+        return
+    
+    count = counts[index]
+    original_numbers = data['original_numbers']
+    
+    # Берем последние count цифр из исходного списка
+    last_numbers = original_numbers[-count:] if count <= len(original_numbers) else original_numbers
+    
+    message = NumberBot.format_stage3_message(last_numbers, count)
+    
+    keyboard = NumberBot.get_keyboard_stage3()
     
     if update.callback_query:
         await update.callback_query.edit_message_text(
@@ -306,34 +424,47 @@ async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
             parse_mode='HTML'
         )
 
-async def next_stage2_iteration(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Переходит к следующей итерации этапа 2"""
+async def next_stage3_step(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Переходит к следующему шагу этапа 3"""
+    data = user_data[user_id]
+    data['stage3_index'] += 1
+    
+    await show_stage3_step(update, context, user_id)
+
+async def finish_stage3(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Завершает этап 3"""
     data = user_data[user_id]
     
-    if data['repeat_count'] >= MAX_REPEATS:
-        # Показываем финальное сообщение с историей
-        message = "✅ Все повторения завершены!\n\n"
-        message += f"📊 Было выполнено {MAX_REPEATS} повторений этапа 2.\n"
-        message += f"📋 История удалений:\n"
+    message = "✅ Все этапы завершены!\n\n"
+    message += "📊 Итоговая статистика:\n"
+    message += f"📌 Исходное количество цифр: {len(data['original_numbers'])}\n"
+    message += f"📌 Повторений этапа 2: {data['repeat_count']}\n"
+    
+    if data['removed_counts']:
+        message += "📌 История удалений:\n"
         for i, cnt in enumerate(data['removed_counts'], 1):
-            message += f"  Повторение {i}: удалено {cnt} цифр\n"
-        message += f"\n📊 Итоговое количество цифр: {len(data['current_numbers'])}"
-        message += "\n\nДля начала заново используйте /start"
-        
-        # Удаляем клавиатуру
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Начать заново", callback_data="restart")
-        ]])
-        
+            message += f"  - Повторение {i}: удалено {cnt} цифр\n"
+    
+    message += f"📌 Итоговое количество цифр после этапа 2: {len(data['current_numbers'])}\n"
+    message += f"📌 Всего просмотрено комбинаций: {len(data['stage3_counts'])}\n\n"
+    message += "🔄 Для начала заново используйте /start"
+    
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Начать заново", callback_data="restart")
+    ]])
+    
+    if update.callback_query:
         await update.callback_query.edit_message_text(
             message,
             reply_markup=keyboard,
             parse_mode='HTML'
         )
-        return
-    
-    # Запускаем следующую итерацию
-    await start_stage2(update, context, user_id)
+    else:
+        await update.message.reply_text(
+            message,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
 
 async def back_to_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     """Возвращает к этапу 1"""
@@ -343,11 +474,37 @@ async def back_to_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     data['repeat_count'] = 0
     data['stage'] = 1
     data['removed_counts'] = []
+    data['stage3_index'] = 0
     
     groups = NumberBot.create_groups(data['original_numbers'], 40)
     data['groups_stage1'] = groups
     
     await show_stage1_group(update, context, user_id, 0)
+
+async def back_to_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Возвращает к этапу 2"""
+    data = user_data[user_id]
+    data['stage'] = 2
+    
+    # Показываем последний результат этапа 2
+    groups = data['groups_stage2']
+    current_numbers = data['current_numbers']
+    
+    message = NumberBot.format_group_message(groups, VIEWS_STAGE2, 2)
+    message += f"\n🔄 Повторение {data['repeat_count']} из {MAX_REPEATS}"
+    message += f"\n📊 Осталось цифр: {len(current_numbers)}"
+    
+    if data['removed_counts']:
+        history = ' | '.join([f"#{i+1}: {cnt}" for i, cnt in enumerate(data['removed_counts'])])
+        message += f"\n📋 История удалений: {history}"
+    
+    keyboard = NumberBot.get_keyboard_stage2()
+    
+    await update.callback_query.edit_message_text(
+        message,
+        reply_markup=keyboard,
+        parse_mode='HTML'
+    )
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик кнопки рестарта"""
@@ -363,7 +520,9 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         'repeat_count': 0,
         'groups_stage1': [],
         'groups_stage2': [],
-        'removed_counts': []
+        'removed_counts': [],
+        'stage3_index': 0,
+        'stage3_counts': [9, 8, 6, 4, 3, 2]
     }
     
     await query.edit_message_text(
@@ -379,10 +538,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 🤖 Помощь по боту:
 
 1️⃣ Отправьте список из 115-125 цифр
-2️⃣ Бот разобьет их на группы по 40 цифр
-3️⃣ На этапе 1 вы можете просматривать группы с пагинацией
-4️⃣ На этапе 2 случайно удаляются 5-8 цифр и создаются новые группы
-5️⃣ Процесс повторяется до 4 раз
+2️⃣ Этап 1: Разбивка на группы по 40 цифр с пагинацией
+3️⃣ Этап 2: 4 повторения удаления 5-8 цифр и разбивка на группы
+4️⃣ Этап 3: Показ последних N цифр с разными просмотрами:
+   • 9 цифр - 200 просмотров
+   • 8 цифр - 400 просмотров
+   • 6 цифр - 500 просмотров
+   • 4 цифры - 700 просмотров
+   • 3 цифры - 900 просмотров
+   • 2 цифры - 1300 просмотров
 
 Команды:
 /start - Начать работу
