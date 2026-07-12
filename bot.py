@@ -301,17 +301,16 @@ async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     # Берем текущий список
     current_numbers = data['current_numbers'].copy()
     
-    # Убираем 5-8 цифр из конца списка (последние цифры)
+    # Убираем 5-8 цифр из начала списка (первые цифры)
     remove_count = random.randint(5, 8)
     
     # Проверяем, что можно удалить столько цифр
     if len(current_numbers) <= remove_count:
         remove_count = max(1, len(current_numbers) - 1)  # Оставляем хотя бы 1 цифру
     
-    # Удаляем последние remove_count цифр
+    # Удаляем первые remove_count цифр
     if len(current_numbers) > remove_count:
-        # Просто обрезаем список
-        current_numbers = current_numbers[:-remove_count]
+        current_numbers = current_numbers[remove_count:]
     
     # Сохраняем новый список
     data['current_numbers'] = current_numbers
@@ -325,7 +324,7 @@ async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     # Показываем все группы
     message = NumberBot.format_group_message(groups, VIEWS_STAGE2, 2)
     message += f"\n🔄 Повторение {data['repeat_count']} из {MAX_REPEATS}"
-    message += f"\n📊 Удалено последних цифр: <b>{remove_count}</b>"
+    message += f"\n📊 Удалено первых цифр: <b>{remove_count}</b>"
     message += f"\n📊 Осталось цифр: <b>{len(current_numbers)}</b>"
     
     # Добавляем историю удалений
@@ -443,7 +442,7 @@ async def finish_stage3(update: Update, context: ContextTypes.DEFAULT_TYPE, user
     if data['removed_counts']:
         message += "📌 История удалений:\n"
         for i, cnt in enumerate(data['removed_counts'], 1):
-            message += f"  - Повторение {i}: удалено <b>{cnt}</b> последних цифр\n"
+            message += f"  - Повторение {i}: удалено <b>{cnt}</b> первых цифр\n"
     
     message += f"📌 Итоговое количество цифр после этапа 2: <b>{len(data['current_numbers'])}</b>\n"
     message += f"📌 Всего просмотрено комбинаций: <b>{len(data['stage3_counts'])}</b>\n\n"
@@ -539,7 +538,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 1️⃣ Отправьте список из 115-125 цифр
 2️⃣ Этап 1: Разбивка на группы по 40 цифр с пагинацией
-3️⃣ Этап 2: 4 повторения удаления последних 5-8 цифр и разбивка на группы
+3️⃣ Этап 2: 4 повторения удаления первых 5-8 цифр и разбивка на группы
 4️⃣ Этап 3: Показ последних N цифр с разными просмотрами:
    • 9 цифр - <b>200</b> просмотров
    • 8 цифр - <b>400</b> просмотров
