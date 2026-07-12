@@ -100,12 +100,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_data[user_id] = {
         'stage': 0,  # 0 - ожидание загрузки, 1 - этап 1, 2 - этап 2
-        'original_numbers': [],
-        'current_numbers': [],
+        'original_numbers': [],  # Исходный список (никогда не меняется)
+        'current_numbers': [],   # Текущий список (меняется на каждом этапе 2)
         'current_group_index': 0,
         'repeat_count': 0,
         'groups_stage1': [],
-        'groups_stage2': []
+        'groups_stage2': [],
+        'removed_counts': []  # История удаленных цифр
     }
     
     await update.message.reply_text(
@@ -127,7 +128,8 @@ async def handle_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             'current_group_index': 0,
             'repeat_count': 0,
             'groups_stage1': [],
-            'groups_stage2': []
+            'groups_stage2': [],
+            'removed_counts': []
         }
     
     # Парсим числа из сообщения
@@ -144,9 +146,10 @@ async def handle_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     # Сохраняем данные
     user_data[user_id]['original_numbers'] = numbers.copy()
-    user_data[user_id]['current_numbers'] = numbers.copy()
+    user_data[user_id]['current_numbers'] = numbers.copy()  # Текущий список = исходный
     user_data[user_id]['stage'] = 1
     user_data[user_id]['repeat_count'] = 0
+    user_data[user_id]['removed_counts'] = []
     
     # Создаем группы для этапа 1
     groups = NumberBot.create_groups(numbers, 40)
@@ -234,17 +237,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     """Запускает этап 2"""
     data = user_data[user_id]
-    current_numbers = data['current_numbers']
+    
+    # Берем текущий список (уже измененный на предыдущих итерациях)
+    current_numbers = data['current_numbers'].copy()
     
     # Убираем 5-8 цифр случайным образом
     remove_count = random.randint(5, 8)
+    
+    # Проверяем, что можно удалить столько цифр
+    if len(current_numbers) <= remove_count:
+        remove_count = max(1, len(current_numbers) - 1)  # Оставляем хотя бы 1 цифру
+    
     if len(current_numbers) > remove_count:
         indices_to_remove = sorted(random.sample(range(len(current_numbers)), remove_count), reverse=True)
         for idx in indices_to_remove:
             current_numbers.pop(idx)
     
+    # Сохраняем новый список
     data['current_numbers'] = current_numbers
     data['repeat_count'] += 1
+    data['removed_counts'].append(remove_count)
     
     # Создаем группы для этапа 2
     groups = NumberBot.create_groups(current_numbers, 40)
@@ -255,6 +267,11 @@ async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     message += f"\n🔄 Повторение {data['repeat_count']} из {MAX_REPEATS}"
     message += f"\n📊 Удалено цифр: {remove_count}"
     message += f"\n📊 Осталось цифр: {len(current_numbers)}"
+    
+    # Добавляем историю удалений
+    if data['removed_counts']:
+        history = ' | '.join([f"#{i+1}: {cnt}" for i, cnt in enumerate(data['removed_counts'])])
+        message += f"\n📋 История удалений: {history}"
     
     keyboard = NumberBot.get_keyboard_stage2()
     
@@ -276,10 +293,23 @@ async def next_stage2_iteration(update: Update, context: ContextTypes.DEFAULT_TY
     data = user_data[user_id]
     
     if data['repeat_count'] >= MAX_REPEATS:
+        # Показываем финальное сообщение с историей
+        message = "✅ Все повторения завершены!\n\n"
+        message += f"📊 Было выполнено {MAX_REPEATS} повторений этапа 2.\n"
+        message += f"📋 История удалений:\n"
+        for i, cnt in enumerate(data['removed_counts'], 1):
+            message += f"  Повторение {i}: удалено {cnt} цифр\n"
+        message += f"\n📊 Итоговое количество цифр: {len(data['current_numbers'])}"
+        message += "\n\nДля начала заново используйте /start"
+        
+        # Удаляем клавиатуру
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Начать заново", callback_data="restart")
+        ]])
+        
         await update.callback_query.edit_message_text(
-            "✅ Все повторения завершены!\n"
-            f"Было выполнено {MAX_REPEATS} повторений этапа 2.\n\n"
-            "Для начала заново используйте /start",
+            message,
+            reply_markup=keyboard,
             parse_mode='HTML'
         )
         return
@@ -290,14 +320,40 @@ async def next_stage2_iteration(update: Update, context: ContextTypes.DEFAULT_TY
 async def back_to_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     """Возвращает к этапу 1"""
     data = user_data[user_id]
+    # Восстанавливаем исходный список
     data['current_numbers'] = data['original_numbers'].copy()
     data['repeat_count'] = 0
     data['stage'] = 1
+    data['removed_counts'] = []
     
     groups = NumberBot.create_groups(data['original_numbers'], 40)
     data['groups_stage1'] = groups
     
     await show_stage1_group(update, context, user_id, 0)
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик кнопки рестарта"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    # Сбрасываем все данные
+    user_data[user_id] = {
+        'stage': 0,
+        'original_numbers': [],
+        'current_numbers': [],
+        'current_group_index': 0,
+        'repeat_count': 0,
+        'groups_stage1': [],
+        'groups_stage2': [],
+        'removed_counts': []
+    }
+    
+    await query.edit_message_text(
+        "🔄 Начинаем заново!\n\n"
+        "📤 Отправьте мне список цифр (от 115 до 125 цифр) любым способом.",
+        parse_mode='HTML'
+    )
+    await query.answer()
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /help"""
@@ -326,6 +382,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_numbers))
     application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(CallbackQueryHandler(restart_command, pattern="^restart$"))
     
     # Запуск бота
     application.run_polling(allowed_updates=Update.ALL_TYPES)
