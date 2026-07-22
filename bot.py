@@ -1,571 +1,409 @@
 import logging
-import random
-from typing import List, Dict, Any
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime, timedelta
+from typing import Dict, List
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import asyncio
+import re
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ================== КОНФИГУРАЦИЯ ==================
+BOT_TOKEN = "8615323356:AAFb_jZCUbOymsg4IAs0beKVOOUko7SEab0"
+OWNER_ID = 2010296191  # Ваш Telegram ID
 
-# Глобальные переменные для хранения состояния пользователей
-user_data: Dict[int, Dict[str, Any]] = {}
+# Хранилище: {user_id: {"stage": int, "status": "active"/"inactive", "last_active": datetime, "hidden_at": datetime}}
+user_data: Dict[int, Dict] = {}
 
-# Константы
-VIEWS_STAGE1 = [1300, 1400, 1500, 1600]
-VIEWS_STAGE2 = [100, 200, 300]
-VIEWS_STAGE3 = {
-    9: 200,
-    8: 400,
-    6: 500,
-    4: 700,
-    3: 900,
-    2: 1300
+# Настройки автоочистки
+HIDE_AFTER_HOURS = 6    # Скрывать через 6 часов без новых фраз
+DELETE_AFTER_DAYS = 14  # Удалять через 14 дней неактивности
+
+# ЭТАПЫ (строго по порядку)
+STAGES: List[str] = [
+    "Доставка",
+    "СВ",
+    "Залог",
+    "Перерасчет СВ",
+    "Перерасчет залога",
+    "Лот по СВ",
+    "Лот по залогу"
+]
+
+# КЛЮЧЕВЫЕ ФРАЗЫ ДЛЯ КАЖДОГО ЭТАПА (ваши точные формулировки)
+STAGE_PHRASES: Dict[int, List[str]] = {
+    0: [  # Доставка
+        "Добрый день, Ваш заказ прибыл к нам на склад в мск"
+    ],
+    1: [  # СВ
+        "Сумма полностью возвратная т.е при уведомлении СДЭКа/Почты о получении товара клиентом сумма будет возвращена в полном объеме на номер карты (имя получателя и банк должен быть тот же, с которого была отправлена сумма)",
+        "на разных складах товары, сумма за СВ та же"
+    ],
+    2: [  # Залог
+        "18-19МСК, также не получили реквизиты на возврат СВ (имя отправителя как в чеке и тот же банк)",
+        "18-19МСК, возврат по реквизитам"
+    ],
+    3: [  # Перерасчет СВ
+        "перерасчет по СВ (отмена категории заказов до 100тыс₽), СВ на все заказы теперь"
+    ],
+    4: [  # Перерасчет залога
+        "Перерасчет по залогу (отмена категории заказов до 100тыс₽), залог на все заказы теперь"
+    ],
+    5: [  # Лот СВ
+        "клиент оплатил залоги и СВ на одну отправку, лот по которой уже закрыт, сейчас ТК ждет"
+    ],
+    6: [  # Лот залога
+        "сумма к оплате на новый лот по залогу"
+    ]
 }
-MAX_REPEATS = 4  # Максимальное количество повторений этапа 2
 
-class NumberBot:
-    @staticmethod
-    def parse_numbers(text: str) -> List[int]:
-        """Извлекает все числа из текста"""
-        import re
-        numbers = re.findall(r'\d+', text)
-        return [int(num) for num in numbers]
-    
-    @staticmethod
-    def create_groups(numbers: List[int], group_size: int = 40) -> List[List[int]]:
-        """Разбивает список чисел на группы по указанному размеру"""
-        groups = []
-        for i in range(0, len(numbers), group_size):
-            groups.append(numbers[i:i+group_size])
-        return groups
-    
-    @staticmethod
-    def format_group_message(groups: List[List[int]], views: List[int], stage: int, group_index: int = None) -> str:
-        """Форматирует сообщение с группами (моноширный шрифт для цифр)"""
-        message = f"📊 Этап {stage}\n\n"
-        
-        if group_index is not None:
-            # Для пагинации (этап 1)
-            if group_index < len(groups):
-                group = groups[group_index]
-                view_count = views[group_index] if group_index < len(views) else views[-1]
-                message += f"📌 Группа {group_index + 1} - <b>{view_count}</b> просмотров\n"
-                # Моноширный шрифт для цифр через запятую
-                digits_str = ', '.join(map(str, group))
-                message += f"📝 Цифры: <code>{digits_str}</code>\n"
-                message += f"📊 Количество: {len(group)} цифр"
-        else:
-            # Для всех групп (этап 2)
-            for i, group in enumerate(groups):
-                view_count = views[i] if i < len(views) else views[-1]
-                message += f"📌 Группа {i + 1} - <b>{view_count}</b> просмотров\n"
-                # Моноширный шрифт для цифр через запятую
-                digits_str = ', '.join(map(str, group))
-                message += f"📝 Цифры: <code>{digits_str}</code>\n"
-                message += f"📊 Количество: {len(group)} цифр\n\n"
-        
-        return message
-    
-    @staticmethod
-    def format_stage3_message(numbers: List[int], count: int) -> str:
-        """Форматирует сообщение для этапа 3"""
-        views = VIEWS_STAGE3.get(count, 0)
-        digits_str = ', '.join(map(str, numbers))
-        
-        message = f"📊 Этап 3\n\n"
-        message += f"📌 Последние {count} номеров - <b>{views}</b> просмотров\n"
-        message += f"📝 Цифры: <code>{digits_str}</code>\n"
-        message += f"📊 Количество: {count} цифр"
-        
-        return message
-    
-    @staticmethod
-    def get_keyboard_stage1(total_groups: int, current_index: int) -> InlineKeyboardMarkup:
-        """Создает клавиатуру для этапа 1 с пагинацией"""
-        keyboard = []
-        
-        # Навигационные кнопки
-        nav_row = []
-        if current_index > 0:
-            nav_row.append(InlineKeyboardButton("◀️ Назад", callback_data=f"prev_{current_index}"))
-        if current_index < total_groups - 1:
-            nav_row.append(InlineKeyboardButton("Вперед ▶️", callback_data=f"next_{current_index}"))
-        
-        if nav_row:
-            keyboard.append(nav_row)
-        
-        # Кнопка завершения этапа (только на последней группе)
-        if current_index == total_groups - 1:
-            keyboard.append([InlineKeyboardButton("✅ Завершить этап", callback_data="finish_stage1")])
-        
-        # Кнопка загрузки номеров
-        keyboard.append([InlineKeyboardButton("📥 Загрузить номера", callback_data="load_numbers")])
-        
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def get_keyboard_stage2() -> InlineKeyboardMarkup:
-        """Создает клавиатуру для этапа 2"""
-        keyboard = [
-            [InlineKeyboardButton("▶️ Далее", callback_data="next_stage2")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_stage1")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def get_keyboard_stage3() -> InlineKeyboardMarkup:
-        """Создает клавиатуру для этапа 3"""
-        keyboard = [
-            [InlineKeyboardButton("▶️ Далее", callback_data="next_stage3")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_stage2")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
+logging.basicConfig(level=logging.INFO)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /start"""
-    user_id = update.effective_user.id
-    user_data[user_id] = {
-        'stage': 0,  # 0 - ожидание загрузки, 1 - этап 1, 2 - этап 2, 3 - этап 3
-        'original_numbers': [],  # Исходный список (никогда не меняется)
-        'current_numbers': [],   # Текущий список (меняется на каждом этапе 2)
-        'current_group_index': 0,
-        'repeat_count': 0,
-        'groups_stage1': [],
-        'groups_stage2': [],
-        'removed_counts': [],  # История удаленных цифр
-        'stage3_index': 0,  # Индекс для этапа 3 (0-5)
-        'stage3_counts': [9, 8, 6, 4, 3, 2]  # Последовательность количества цифр
-    }
+# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+def check_stage_phrase(text: str) -> tuple:
+    """
+    Проверяет, какой этап соответствует тексту
+    Возвращает (индекс_этапа, найденная_фраза) или (None, None)
+    """
+    text_lower = text.lower()
+    for stage_idx, phrases in STAGE_PHRASES.items():
+        for phrase in phrases:
+            if phrase.lower() in text_lower:
+                return stage_idx, phrase
+    return None, None
+
+def get_active_clients() -> Dict[int, Dict]:
+    """Возвращает только актуальных клиентов"""
+    active = {}
+    for user_id, data in user_data.items():
+        if data.get("status") != "inactive":
+            active[user_id] = data
+    return active
+
+def get_inactive_clients() -> Dict[int, Dict]:
+    """Возвращает неактуальных клиентов"""
+    inactive = {}
+    for user_id, data in user_data.items():
+        if data.get("status") == "inactive":
+            inactive[user_id] = data
+    return inactive
+
+async def check_inactive_clients(app):
+    """Проверяет, кто из клиентов стал неактуальным"""
+    while True:
+        await asyncio.sleep(3600)  # Проверка каждый час
+        now = datetime.now()
+        for user_id, data in list(user_data.items()):
+            if data.get("status") != "inactive":
+                if now - data["last_active"] > timedelta(hours=HIDE_AFTER_HOURS):
+                    data["status"] = "inactive"
+                    data["hidden_at"] = now
+                    # Лог владельцу
+                    try:
+                        user = await app.bot.get_chat(user_id)
+                        name = user.username or user.first_name or str(user_id)
+                        await app.bot.send_message(
+                            chat_id=OWNER_ID,
+                            text=f"⏰ Клиент @{name} стал неактуальным (6 часов без новых фраз)\n"
+                                 f"Текущий этап: {STAGES[data['stage']]}"
+                        )
+                    except:
+                        pass
+        
+        # Удаление старых неактуальных
+        to_delete = []
+        for user_id, data in user_data.items():
+            if data.get("status") == "inactive":
+                hidden_at = data.get("hidden_at", data["last_active"])
+                if now - hidden_at > timedelta(days=DELETE_AFTER_DAYS):
+                    to_delete.append(user_id)
+        for user_id in to_delete:
+            stage = user_data[user_id].get("stage", 0)
+            try:
+                user = await app.bot.get_chat(user_id)
+                name = user.username or user.first_name or str(user_id)
+                await app.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=f"🗑 Клиент @{name} удалён (14 дней неактивности)\n"
+                         f"Последний этап: {STAGES[stage]}"
+                )
+            except:
+                pass
+            del user_data[user_id]
+
+# ================== КОМАНДЫ ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ У вас нет доступа к этому боту")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 Актуальные клиенты", callback_data="show_active")],
+        [InlineKeyboardButton("📂 Неактуальные клиенты", callback_data="show_inactive")],
+        [InlineKeyboardButton("🔄 Обновить список", callback_data="refresh")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "👋 Привет! Я бот для обработки номеров.\n\n"
-        "📤 Отправьте мне список цифр (от 115 до 125 цифр) любым способом.\n"
-        "Цифры могут быть в любом формате (в ряд, с пробелами, с переносами строк и т.д.)",
-        parse_mode='HTML'
+        "🤖 Бот для отслеживания этапов клиентов\n\n"
+        "✅ Актуальные - клиенты, которым вы отправляли фразы в последние 6 часов\n"
+        "❌ Неактуальные - скрываются автоматически через 6 часов\n"
+        "🗑 Удаляются через 14 дней неактивности\n\n"
+        "📌 Клиент переходит на следующий этап, когда вы отправляете ему соответствующую фразу\n\n"
+        "Выберите действие:",
+        reply_markup=reply_markup
     )
 
-async def handle_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик получения чисел"""
-    user_id = update.effective_user.id
-    
-    if user_id not in user_data:
-        user_data[user_id] = {
-            'stage': 0,
-            'original_numbers': [],
-            'current_numbers': [],
-            'current_group_index': 0,
-            'repeat_count': 0,
-            'groups_stage1': [],
-            'groups_stage2': [],
-            'removed_counts': [],
-            'stage3_index': 0,
-            'stage3_counts': [9, 8, 6, 4, 3, 2]
-        }
-    
-    # Парсим числа из сообщения
-    numbers = NumberBot.parse_numbers(update.message.text)
-    
-    if len(numbers) < 115 or len(numbers) > 125:
-        await update.message.reply_text(
-            f"❌ Ошибка! Вы отправили {len(numbers)} цифр.\n"
-            "Необходимо отправить от 115 до 125 цифр.\n\n"
-            "Пожалуйста, отправьте корректное количество цифр.",
-            parse_mode='HTML'
-        )
-        return
-    
-    # Сохраняем данные
-    user_data[user_id]['original_numbers'] = numbers.copy()
-    user_data[user_id]['current_numbers'] = numbers.copy()  # Текущий список = исходный
-    user_data[user_id]['stage'] = 1
-    user_data[user_id]['repeat_count'] = 0
-    user_data[user_id]['removed_counts'] = []
-    user_data[user_id]['stage3_index'] = 0
-    
-    # Создаем группы для этапа 1
-    groups = NumberBot.create_groups(numbers, 40)
-    user_data[user_id]['groups_stage1'] = groups
-    
-    # Показываем первую группу
-    await show_stage1_group(update, context, user_id, 0)
-
-async def show_stage1_group(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, index: int) -> None:
-    """Показывает группу на этапе 1"""
-    data = user_data[user_id]
-    groups = data['groups_stage1']
-    
-    if index < 0 or index >= len(groups):
-        return
-    
-    message = NumberBot.format_group_message(groups, VIEWS_STAGE1, 1, index)
-    keyboard = NumberBot.get_keyboard_stage1(len(groups), index)
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            message, 
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-        await update.callback_query.answer()
-    else:
-        await update.message.reply_text(
-            message, 
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик нажатий на кнопки"""
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка инлайн-кнопок"""
     query = update.callback_query
-    user_id = update.effective_user.id
-    callback_data = query.data
+    await query.answer()
     
-    if user_id not in user_data:
-        await query.answer("❌ Сессия истекла. Используйте /start")
+    if update.effective_user.id != OWNER_ID:
+        await query.edit_message_text("❌ У вас нет доступа")
         return
     
-    user_info = user_data[user_id]
+    if query.data == "show_active":
+        await show_active_clients(query.message, context)
     
-    # Проверяем тип callback_data
-    if callback_data.startswith('prev_'):
-        # Навигация назад
+    elif query.data == "show_inactive":
+        await show_inactive_clients(query.message, context)
+    
+    elif query.data == "refresh":
+        await query.message.delete()
+        await start(update, context)
+    
+    elif query.data.startswith("hide_"):
+        user_id = int(query.data.split("_")[1])
+        if user_id in user_data:
+            user_data[user_id]["status"] = "inactive"
+            user_data[user_id]["hidden_at"] = datetime.now()
+            await query.edit_message_text(
+                f"✅ Клиент перемещён в неактуальные\n"
+                f"Он будет удалён через {DELETE_AFTER_DAYS} дней"
+            )
+        else:
+            await query.edit_message_text("❌ Клиент не найден")
+    
+    elif query.data.startswith("show_"):
+        user_id = int(query.data.split("_")[1])
+        if user_id in user_data:
+            user_data[user_id]["status"] = "active"
+            user_data[user_id]["last_active"] = datetime.now()
+            user_data[user_id]["hidden_at"] = None
+            await query.edit_message_text(
+                f"✅ Клиент возвращён в актуальные\n"
+                f"Текущий этап: {STAGES[user_data[user_id]['stage']]}"
+            )
+        else:
+            await query.edit_message_text("❌ Клиент не найден")
+
+async def show_active_clients(message, context: ContextTypes.DEFAULT_TYPE):
+    """Показать актуальных клиентов"""
+    active = get_active_clients()
+    
+    if not active:
+        await message.edit_text(
+            "📭 Нет актуальных клиентов\n\n"
+            "Отправьте клиенту ключевую фразу, чтобы он появился здесь"
+        )
+        return
+    
+    # Сортируем по времени последней активности
+    sorted_clients = sorted(active.items(), key=lambda x: x[1]["last_active"], reverse=True)
+    
+    text = "📋 Актуальные клиенты:\n\n"
+    keyboard = []
+    
+    for user_id, data in sorted_clients:
+        # Получаем имя пользователя
         try:
-            current = int(callback_data.split('_')[1])
-            new_index = current - 1
-            if new_index >= 0:
-                user_info['current_group_index'] = new_index
-                await show_stage1_group(update, context, user_id, new_index)
-        except (IndexError, ValueError) as e:
-            logger.error(f"Error parsing prev_ callback: {e}")
-            await query.answer("❌ Ошибка навигации")
+            user = await context.bot.get_chat(user_id)
+            name = user.username or user.first_name or str(user_id)
+        except:
+            name = str(user_id)
+        
+        stage_idx = data.get("stage", 0)
+        stage_name = STAGES[stage_idx] if stage_idx < len(STAGES) else "✅ Завершён"
+        
+        # Время последней активности
+        last_active = data["last_active"].strftime("%d.%m %H:%M")
+        text += f"• @{name} — {stage_name} (обновлён: {last_active})\n"
+        
+        # Добавляем кнопку "В неактуальные"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"⬇️ В неактуальные @{name}", 
+                callback_data=f"hide_{user_id}"
+            )
+        ])
     
-    elif callback_data.startswith('next_'):
-        # Проверяем, что это не 'next_stage2' или 'next_stage3'
-        if callback_data == 'next_stage2':
-            # Переход к следующей итерации этапа 2
-            await next_stage2_iteration(update, context, user_id)
-        elif callback_data == 'next_stage3':
-            # Переход к следующему шагу этапа 3
-            await next_stage3_step(update, context, user_id)
+    if keyboard:
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await message.edit_text(text, reply_markup=reply_markup)
+    else:
+        await message.edit_text(text)
+
+async def show_inactive_clients(message, context: ContextTypes.DEFAULT_TYPE):
+    """Показать неактуальных клиентов"""
+    inactive = get_inactive_clients()
+    
+    if not inactive:
+        await message.edit_text(
+            "📭 Нет неактуальных клиентов\n\n"
+            "Все клиенты либо актуальны, либо уже удалены"
+        )
+        return
+    
+    text = "📂 Неактуальные клиенты:\n\n"
+    keyboard = []
+    
+    for user_id, data in inactive.items():
+        # Получаем имя пользователя
+        try:
+            user = await context.bot.get_chat(user_id)
+            name = user.username or user.first_name or str(user_id)
+        except:
+            name = str(user_id)
+        
+        stage_idx = data.get("stage", 0)
+        stage_name = STAGES[stage_idx] if stage_idx < len(STAGES) else "✅ Завершён"
+        
+        # Время скрытия
+        hidden_at = data.get("hidden_at", data["last_active"]).strftime("%d.%m %H:%M")
+        text += f"• @{name} — {stage_name} (скрыт: {hidden_at})\n"
+        
+        # Добавляем кнопку "Вернуть в актуальные"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"⬆️ Вернуть @{name}", 
+                callback_data=f"show_{user_id}"
+            )
+        ])
+    
+    if keyboard:
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await message.edit_text(text, reply_markup=reply_markup)
+    else:
+        await message.edit_text(text)
+
+# ================== ОБРАБОТКА ИСХОДЯЩИХ СООБЩЕНИЙ ==================
+async def handle_outgoing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ЛЮБЫЕ исходящие сообщения от владельца"""
+    # Проверяем, что сообщение от владельца
+    if update.effective_user.id != OWNER_ID:
+        return
+    
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    
+    text = msg.text
+    
+    # Проверяем, есть ли в сообщении ключевая фраза
+    stage_idx, found_phrase = check_stage_phrase(text)
+    
+    if stage_idx is not None:
+        # Определяем ID клиента (если есть реплай - берём оттуда, иначе ищем в тексте)
+        client_id = None
+        
+        # Если есть реплай - берём ID из реплая
+        if msg.reply_to_message:
+            client_id = msg.reply_to_message.from_user.id
         else:
-            # Навигация вперед (next_0, next_1, etc.)
+            # Пытаемся найти @username или ID в тексте
+            # Проверяем, есть ли упоминание через @
+            if msg.entities:
+                for entity in msg.entities:
+                    if entity.type == "mention":
+                        username = text[entity.offset:entity.offset + entity.length]
+                        try:
+                            # Пытаемся получить пользователя по username
+                            user = await context.bot.get_chat(username)
+                            client_id = user.id
+                            break
+                        except:
+                            pass
+                    elif entity.type == "text_mention":
+                        client_id = entity.user.id
+                        break
+        
+        # Если клиент не найден - игнорируем
+        if client_id is None:
+            return
+        
+        now = datetime.now()
+        
+        # Если клиент новый - добавляем
+        if client_id not in user_data:
+            user_data[client_id] = {
+                "stage": stage_idx,
+                "status": "active",
+                "last_active": now,
+                "hidden_at": None
+            }
+            
             try:
-                current = int(callback_data.split('_')[1])
-                new_index = current + 1
-                if new_index < len(user_info['groups_stage1']):
-                    user_info['current_group_index'] = new_index
-                    await show_stage1_group(update, context, user_id, new_index)
-            except (IndexError, ValueError) as e:
-                logger.error(f"Error parsing next_ callback: {e}")
-                await query.answer("❌ Ошибка навигации")
-    
-    elif callback_data == 'finish_stage1':
-        # Завершение этапа 1 и переход к этапу 2
-        await start_stage2(update, context, user_id)
-    
-    elif callback_data == 'load_numbers':
-        # Загрузка номеров
-        await query.edit_message_text(
-            "📥 Отправьте новый список номеров\n"
-            "Требования: от 115 до 125 цифр",
-            parse_mode='HTML'
-        )
-        user_info['stage'] = 0  # Ожидание новой загрузки
-    
-    elif callback_data == 'back_to_stage1':
-        # Возврат к этапу 1
-        await back_to_stage1(update, context, user_id)
-    
-    elif callback_data == 'back_to_stage2':
-        # Возврат к этапу 2
-        await back_to_stage2(update, context, user_id)
-    
-    elif callback_data == 'restart':
-        # Перезапуск
-        await restart_command(update, context)
-    
-    else:
-        logger.warning(f"Unknown callback data: {callback_data}")
-        await query.answer("❌ Неизвестная команда")
-    
-    await query.answer()
-
-async def start_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Запускает этап 2"""
-    data = user_data[user_id]
-    
-    # Берем текущий список
-    current_numbers = data['current_numbers'].copy()
-    
-    # Убираем 5-8 цифр из начала списка (первые цифры)
-    remove_count = random.randint(5, 8)
-    
-    # Проверяем, что можно удалить столько цифр
-    if len(current_numbers) <= remove_count:
-        remove_count = max(1, len(current_numbers) - 1)  # Оставляем хотя бы 1 цифру
-    
-    # Удаляем первые remove_count цифр
-    if len(current_numbers) > remove_count:
-        current_numbers = current_numbers[remove_count:]
-    
-    # Сохраняем новый список
-    data['current_numbers'] = current_numbers
-    data['repeat_count'] += 1
-    data['removed_counts'].append(remove_count)
-    
-    # Создаем группы для этапа 2
-    groups = NumberBot.create_groups(current_numbers, 40)
-    data['groups_stage2'] = groups
-    
-    # Показываем все группы
-    message = NumberBot.format_group_message(groups, VIEWS_STAGE2, 2)
-    message += f"\n🔄 Повторение {data['repeat_count']} из {MAX_REPEATS}"
-    message += f"\n📊 Удалено первых цифр: <b>{remove_count}</b>"
-    message += f"\n📊 Осталось цифр: <b>{len(current_numbers)}</b>"
-    
-    # Добавляем историю удалений
-    if data['removed_counts']:
-        history = ' | '.join([f"#{i+1}: {cnt}" for i, cnt in enumerate(data['removed_counts'])])
-        message += f"\n📋 История удалений: {history}"
-    
-    # Проверяем, закончились ли повторения
-    if data['repeat_count'] >= MAX_REPEATS:
-        # Переходим к этапу 3
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶️ Перейти к этапу 3", callback_data="next_stage3")
-        ]])
-        message += "\n\n✅ Все повторения этапа 2 завершены!"
-        message += "\nНажмите 'Перейти к этапу 3' для продолжения"
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                message, 
-                reply_markup=keyboard,
-                parse_mode='HTML'
-            )
+                user = await context.bot.get_chat(client_id)
+                name = user.username or user.first_name or str(client_id)
+                await context.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=f"🆕 Новый клиент @{name}\n"
+                         f"Этап: {STAGES[stage_idx]}"
+                )
+            except:
+                pass
+            
         else:
-            await update.message.reply_text(
-                message, 
-                reply_markup=keyboard,
-                parse_mode='HTML'
-            )
-    else:
-        keyboard = NumberBot.get_keyboard_stage2()
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                message, 
-                reply_markup=keyboard,
-                parse_mode='HTML'
-            )
-        else:
-            await update.message.reply_text(
-                message, 
-                reply_markup=keyboard,
-                parse_mode='HTML'
-            )
+            # Обновляем этап только если он выше текущего
+            current_stage = user_data[client_id].get("stage", 0)
+            if stage_idx > current_stage:
+                user_data[client_id]["stage"] = stage_idx
+                
+                try:
+                    user = await context.bot.get_chat(client_id)
+                    name = user.username or user.first_name or str(client_id)
+                    await context.bot.send_message(
+                        chat_id=OWNER_ID,
+                        text=f"⬆️ Клиент @{name} перешёл на этап: {STAGES[stage_idx]}"
+                    )
+                except:
+                    pass
+            
+            # Обновляем время активности и статус
+            user_data[client_id]["last_active"] = now
+            user_data[client_id]["status"] = "active"
+            user_data[client_id]["hidden_at"] = None
 
-async def next_stage2_iteration(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Переходит к следующей итерации этапа 2"""
-    data = user_data[user_id]
-    
-    if data['repeat_count'] >= MAX_REPEATS:
-        # Переходим к этапу 3
-        await start_stage3(update, context, user_id)
-        return
-    
-    # Запускаем следующую итерацию
-    await start_stage2(update, context, user_id)
+# ================== ЗАПУСК ==================
+async def post_init(app):
+    """Запуск фоновой проверки"""
+    asyncio.create_task(check_inactive_clients(app))
 
-async def start_stage3(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Запускает этап 3"""
-    data = user_data[user_id]
-    data['stage'] = 3
-    data['stage3_index'] = 0
+def main():
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
-    await show_stage3_step(update, context, user_id)
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    
+    # Callback-запросы от кнопок
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Обработчик ВСЕХ исходящих сообщений от владельца
+    app.add_handler(MessageHandler(filters.TEXT & filters.User(OWNER_ID), handle_outgoing_message))
+    
+    # Устанавливаем команды
+    app.bot.set_my_commands([
+        BotCommand("start", "Главное меню"),
+    ])
+    
+    print("🚀 Бот запущен...")
+    print(f"📌 Отслеживаются {len(STAGES)} этапов:")
+    for i, stage in enumerate(STAGES):
+        print(f"   {i+1}. {stage}")
+    print(f"\n👤 Владелец: {OWNER_ID}")
+    print(f"🔑 Токен: {BOT_TOKEN[:15]}...")
+    
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
-async def show_stage3_step(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Показывает текущий шаг этапа 3"""
-    data = user_data[user_id]
-    index = data['stage3_index']
-    counts = data['stage3_counts']
-    
-    if index >= len(counts):
-        # Все шаги этапа 3 завершены
-        await finish_stage3(update, context, user_id)
-        return
-    
-    count = counts[index]
-    original_numbers = data['original_numbers']
-    
-    # Берем последние count цифр из исходного списка
-    last_numbers = original_numbers[-count:] if count <= len(original_numbers) else original_numbers
-    
-    message = NumberBot.format_stage3_message(last_numbers, count)
-    
-    keyboard = NumberBot.get_keyboard_stage3()
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            message, 
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-    else:
-        await update.message.reply_text(
-            message, 
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-
-async def next_stage3_step(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Переходит к следующему шагу этапа 3"""
-    data = user_data[user_id]
-    data['stage3_index'] += 1
-    
-    await show_stage3_step(update, context, user_id)
-
-async def finish_stage3(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Завершает этап 3"""
-    data = user_data[user_id]
-    
-    message = "✅ Все этапы завершены!\n\n"
-    message += "📊 Итоговая статистика:\n"
-    message += f"📌 Исходное количество цифр: <b>{len(data['original_numbers'])}</b>\n"
-    message += f"📌 Повторений этапа 2: <b>{data['repeat_count']}</b>\n"
-    
-    if data['removed_counts']:
-        message += "📌 История удалений:\n"
-        for i, cnt in enumerate(data['removed_counts'], 1):
-            message += f"  - Повторение {i}: удалено <b>{cnt}</b> первых цифр\n"
-    
-    message += f"📌 Итоговое количество цифр после этапа 2: <b>{len(data['current_numbers'])}</b>\n"
-    message += f"📌 Всего просмотрено комбинаций: <b>{len(data['stage3_counts'])}</b>\n\n"
-    message += "🔄 Для начала заново используйте /start"
-    
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Начать заново", callback_data="restart")
-    ]])
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            message,
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-    else:
-        await update.message.reply_text(
-            message,
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-
-async def back_to_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Возвращает к этапу 1"""
-    data = user_data[user_id]
-    # Восстанавливаем исходный список
-    data['current_numbers'] = data['original_numbers'].copy()
-    data['repeat_count'] = 0
-    data['stage'] = 1
-    data['removed_counts'] = []
-    data['stage3_index'] = 0
-    
-    groups = NumberBot.create_groups(data['original_numbers'], 40)
-    data['groups_stage1'] = groups
-    
-    await show_stage1_group(update, context, user_id, 0)
-
-async def back_to_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    """Возвращает к этапу 2"""
-    data = user_data[user_id]
-    data['stage'] = 2
-    
-    # Показываем последний результат этапа 2
-    groups = data['groups_stage2']
-    current_numbers = data['current_numbers']
-    
-    message = NumberBot.format_group_message(groups, VIEWS_STAGE2, 2)
-    message += f"\n🔄 Повторение {data['repeat_count']} из {MAX_REPEATS}"
-    message += f"\n📊 Осталось цифр: <b>{len(current_numbers)}</b>"
-    
-    if data['removed_counts']:
-        history = ' | '.join([f"#{i+1}: {cnt}" for i, cnt in enumerate(data['removed_counts'])])
-        message += f"\n📋 История удалений: {history}"
-    
-    keyboard = NumberBot.get_keyboard_stage2()
-    
-    await update.callback_query.edit_message_text(
-        message,
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-
-async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик кнопки рестарта"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    # Сбрасываем все данные
-    user_data[user_id] = {
-        'stage': 0,
-        'original_numbers': [],
-        'current_numbers': [],
-        'current_group_index': 0,
-        'repeat_count': 0,
-        'groups_stage1': [],
-        'groups_stage2': [],
-        'removed_counts': [],
-        'stage3_index': 0,
-        'stage3_counts': [9, 8, 6, 4, 3, 2]
-    }
-    
-    await query.edit_message_text(
-        "🔄 Начинаем заново!\n\n"
-        "📤 Отправьте мне список цифр (от 115 до 125 цифр) любым способом.",
-        parse_mode='HTML'
-    )
-    await query.answer()
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /help"""
-    help_text = """
-🤖 Помощь по боту:
-
-1️⃣ Отправьте список из 115-125 цифр
-2️⃣ Этап 1: Разбивка на группы по 40 цифр с пагинацией
-3️⃣ Этап 2: 4 повторения удаления первых 5-8 цифр и разбивка на группы
-4️⃣ Этап 3: Показ последних N цифр с разными просмотрами:
-   • 9 цифр - <b>200</b> просмотров
-   • 8 цифр - <b>400</b> просмотров
-   • 6 цифр - <b>500</b> просмотров
-   • 4 цифры - <b>700</b> просмотров
-   • 3 цифры - <b>900</b> просмотров
-   • 2 цифры - <b>1300</b> просмотров
-
-Команды:
-/start - Начать работу
-/help - Показать эту справку
-    """
-    await update.message.reply_text(help_text, parse_mode='HTML')
-
-def main() -> None:
-    """Запуск бота"""
-    # Токен бота
-    application = Application.builder().token("8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is").build()
-    
-    # Регистрация обработчиков
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_numbers))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Запуск бота
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
