@@ -4,11 +4,12 @@ from typing import Dict, List
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import asyncio
-import json
+import re
 
 # ================== КОНФИГУРАЦИЯ ==================
 BOT_TOKEN = "8911152200:AAF75Xn8M-9XoCBEOYRuq8azBknQxrnkLZ4"
 OWNER_ID = 2010296191  # Ваш Telegram ID
+BOT_ID = 8911152200  # ID вашего бота (не менять!)
 
 # Хранилище
 user_data: Dict[int, Dict] = {}
@@ -31,8 +32,14 @@ STAGES: List[str] = [
 # КЛЮЧЕВЫЕ ФРАЗЫ
 STAGE_PHRASES: Dict[int, List[str]] = {
     0: ["Добрый день, Ваш заказ прибыл к нам на склад в мск"],
-    1: ["Сумма полностью возвратная т.е при уведомлении СДЭКа/Почты о получении товара клиентом сумма будет возвращена в полном объеме на номер карты (имя получателя и банк должен быть тот же, с которого была отправлена сумма)", "на разных складах товары, сумма за СВ та же"],
-    2: ["18-19МСК, также не получили реквизиты на возврат СВ (имя отправителя как в чеке и тот же банк)", "18-19МСК, возврат по реквизитам"],
+    1: [
+        "Сумма полностью возвратная т.е при уведомлении СДЭКа/Почты о получении товара клиентом сумма будет возвращена в полном объеме на номер карты (имя получателя и банк должен быть тот же, с которого была отправлена сумма)",
+        "на разных складах товары, сумма за СВ та же"
+    ],
+    2: [
+        "18-19МСК, также не получили реквизиты на возврат СВ (имя отправителя как в чеке и тот же банк)",
+        "18-19МСК, возврат по реквизитам"
+    ],
     3: ["перерасчет по СВ (отмена категории заказов до 100тыс₽), СВ на все заказы теперь"],
     4: ["Перерасчет по залогу (отмена категории заказов до 100тыс₽), залог на все заказы теперь"],
     5: ["клиент оплатил залоги и СВ на одну отправку, лот по которой уже закрыт, сейчас ТК ждет"],
@@ -69,15 +76,6 @@ async def check_inactive_clients(app):
                 if now - data["last_active"] > timedelta(hours=HIDE_AFTER_HOURS):
                     data["status"] = "inactive"
                     data["hidden_at"] = now
-                    try:
-                        user = await app.bot.get_chat(user_id)
-                        name = user.username or user.first_name or str(user_id)
-                        await app.bot.send_message(
-                            chat_id=OWNER_ID,
-                            text=f"⏰ Клиент @{name} стал неактуальным"
-                        )
-                    except:
-                        pass
         
         to_delete = []
         for user_id, data in user_data.items():
@@ -101,7 +99,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "🤖 Бот для отслеживания клиентов\n\n"
-        "Отправьте клиенту ключевую фразу",
+        "Отправьте клиенту ключевую фразу в личном чате",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -119,7 +117,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📭 Нет актуальных клиентов")
             return
         
-        text = "📋 Актуальные:\n\n"
+        text = "📋 Актуальные клиенты:\n\n"
         for user_id, data in active.items():
             try:
                 user = await context.bot.get_chat(user_id)
@@ -142,7 +140,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📭 Нет неактуальных клиентов")
             return
         
-        text = "📂 Неактуальные:\n\n"
+        text = "📂 Неактуальные клиенты:\n\n"
         for user_id, data in inactive.items():
             try:
                 user = await context.bot.get_chat(user_id)
@@ -155,54 +153,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(text)
 
-# ================== ОБРАБОТЧИК ВСЕХ СООБЩЕНИЙ ==================
-async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ВСЕ сообщения и выводит отладку"""
-    
-    # Получаем сообщение
+# ================== ОСНОВНОЙ ОБРАБОТЧИК ==================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает сообщения из бизнес-чатов (личные чаты с клиентами)
+    """
     msg = None
-    msg_type = "unknown"
     
-    if update.message:
-        msg = update.message
-        msg_type = "message"
-    elif update.business_message:
+    # Проверяем, что это бизнес-сообщение (пришло из бизнес-чата)
+    if update.business_message:
         msg = update.business_message
-        msg_type = "business_message"
-    elif update.edited_message:
-        msg = update.edited_message
-        msg_type = "edited_message"
-    elif update.channel_post:
-        msg = update.channel_post
-        msg_type = "channel_post"
-    
-    if not msg:
-        logger.info(f"⚠️ Получено обновление без сообщения: {update}")
+        logger.info("📩 Получено BUSINESS_MESSAGE")
+    elif update.message:
+        # Обычное сообщение - игнорируем, если это не чат с ботом
+        if update.message.chat.type == "private" and update.message.from_user.id == OWNER_ID:
+            # Это сообщение в чате с ботом - игнорируем
+            logger.info("📩 Сообщение в чате с ботом - игнорируем")
+            return
+        msg = update.message
+        logger.info("📩 Получено MESSAGE (не бизнес)")
+    else:
         return
     
-    # Логируем ВСЁ
-    logger.info("="*50)
-    logger.info(f"📩 Тип: {msg_type}")
-    logger.info(f"   ID чата: {msg.chat_id}")
-    logger.info(f"   ID отправителя: {msg.from_user.id if msg.from_user else 'None'}")
-    logger.info(f"   Текст: {msg.text[:100] if msg.text else 'None'}...")
-    logger.info(f"   Есть реплай: {bool(msg.reply_to_message)}")
-    if msg.reply_to_message:
-        logger.info(f"   Реплай к: {msg.reply_to_message.from_user.id if msg.reply_to_message.from_user else 'None'}")
-    logger.info(f"   Update ID: {update.update_id}")
-    logger.info("="*50)
+    if not msg:
+        return
     
     # Проверяем, что сообщение от владельца
     if not msg.from_user or msg.from_user.id != OWNER_ID:
-        logger.info("❌ Сообщение не от владельца, игнорируем")
+        logger.info(f"❌ Сообщение не от владельца (от {msg.from_user.id}), игнорируем")
         return
     
     if not msg.text:
-        logger.info("❌ Нет текста, игнорируем")
+        logger.info("❌ Нет текста")
         return
     
     text = msg.text
-    logger.info(f"🔍 Проверяем текст: {text[:50]}...")
+    
+    logger.info(f"🔍 Текст: {text[:50]}...")
     
     # Проверяем ключевую фразу
     stage_idx, found_phrase = check_stage_phrase(text)
@@ -211,39 +198,68 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info("❌ Ключевая фраза НЕ найдена")
         return
     
-    logger.info(f"✅ НАЙДЕНА ФРАЗА для этапа {stage_idx}: {STAGES[stage_idx]}")
+    logger.info(f"✅ Найдена фраза для этапа {stage_idx}: {STAGES[stage_idx]}")
     
     # Определяем клиента
     client_id = None
     
+    # 1. Если есть реплай - берём ID из реплая
     if msg.reply_to_message and msg.reply_to_message.from_user:
         client_id = msg.reply_to_message.from_user.id
         logger.info(f"   Клиент по реплаю: {client_id}")
-    else:
-        # Проверяем упоминания
-        if msg.entities:
-            for entity in msg.entities:
-                if entity.type == "mention":
-                    username = text[entity.offset:entity.offset + entity.length]
-                    logger.info(f"   Найдено упоминание: {username}")
-                    try:
-                        user = await context.bot.get_chat(username)
-                        client_id = user.id
-                        logger.info(f"   Клиент по username: {client_id}")
-                        break
-                    except Exception as e:
-                        logger.info(f"   Ошибка: {e}")
-                elif entity.type == "text_mention":
-                    client_id = entity.user.id
-                    logger.info(f"   Клиент по text_mention: {client_id}")
+    
+    # 2. Если нет реплая, ищем @username в тексте
+    if client_id is None and msg.entities:
+        for entity in msg.entities:
+            if entity.type == "mention":
+                username = text[entity.offset:entity.offset + entity.length]
+                logger.info(f"   Найдено упоминание: {username}")
+                try:
+                    user = await context.bot.get_chat(username)
+                    client_id = user.id
+                    logger.info(f"   Клиент по username: {client_id}")
                     break
+                except Exception as e:
+                    logger.error(f"   Ошибка: {e}")
+            elif entity.type == "text_mention":
+                client_id = entity.user.id
+                logger.info(f"   Клиент по text_mention: {client_id}")
+                break
+    
+    # 3. В бизнес-чате получатель - это другой участник
+    if client_id is None and update.business_message:
+        # В бизнес-чате мы можем получить получателя через chat
+        chat = msg.chat
+        if chat.type == "private":
+            # В личном чате получатель - это другой пользователь
+            # Но мы не можем его определить напрямую
+            # Поэтому используем chat.id (это ID клиента в личном чате)
+            if chat.id != OWNER_ID and chat.id != BOT_ID:
+                client_id = chat.id
+                logger.info(f"   Клиент по chat.id: {client_id}")
+    
+    # 4. Если всё ещё None - пробуем получить из контекста
+    if client_id is None:
+        # В бизнес-чате это может быть личный чат
+        if msg.chat.type == "private" and msg.chat.id != OWNER_ID:
+            client_id = msg.chat.id
+            logger.info(f"   Клиент по chat.id (private): {client_id}")
     
     if client_id is None:
-        logger.info("❌ НЕ УДАЛОСЬ ОПРЕДЕЛИТЬ КЛИЕНТА")
+        logger.error("❌ НЕ УДАЛОСЬ ОПРЕДЕЛИТЬ КЛИЕНТА")
         await context.bot.send_message(
             chat_id=OWNER_ID,
             text="⚠️ Не удалось определить клиента. Используйте реплай на сообщение клиента или @username"
         )
+        return
+    
+    # Пропускаем, если клиент - это бот или сам владелец
+    if client_id == BOT_ID:
+        logger.warning("⚠️ Клиент определён как БОТ, игнорируем")
+        return
+    
+    if client_id == OWNER_ID:
+        logger.warning("⚠️ Клиент определён как ВЛАДЕЛЕЦ, игнорируем")
         return
     
     logger.info(f"✅ КЛИЕНТ ОПРЕДЕЛЁН: {client_id}")
@@ -279,8 +295,9 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             text=f"✅ Клиент @{name}\n"
                  f"Этап: {STAGES[user_data[client_id]['stage']]}"
         )
+        logger.info(f"📨 Уведомление отправлено владельцу")
     except Exception as e:
-        logger.error(f"Ошибка уведомления: {e}")
+        logger.error(f"❌ Ошибка уведомления: {e}")
 
 # ================== ЗАПУСК ==================
 async def post_init(app):
@@ -294,8 +311,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Обработчик ВСЕХ сообщений (с отладкой)
-    app.add_handler(MessageHandler(filters.ALL, handle_all_messages))
+    # Обработчик ВСЕХ сообщений
+    app.add_handler(MessageHandler(filters.ALL, handle_message))
     
     # Устанавливаем команды
     app.bot.set_my_commands([
@@ -303,17 +320,20 @@ def main():
     ])
     
     print("\n" + "="*60)
-    print("🚀 БОТ ЗАПУЩЕН (РЕЖИМ ОТЛАДКИ)")
+    print("🚀 БОТ ЗАПУЩЕН")
     print("="*60)
     print(f"👤 Владелец: {OWNER_ID}")
+    print(f"🤖 Бот ID: {BOT_ID}")
     print(f"🔑 Токен: {BOT_TOKEN[:15]}...")
     print("="*60)
-    print("\n📌 Теперь бот будет ЛОГИРОВАТЬ ВСЕ сообщения")
-    print("   Смотрите в консоль, что происходит")
-    print("\n" + "="*60 + "\n")
+    print("\n📌 Инструкция:")
+    print("   1. Подключите бота в Telegram Business")
+    print("   2. Включите Secretary Mode у бота")
+    print("   3. Отправьте клиенту сообщение с ключевой фразой")
+    print("   4. Используйте РЕПЛАЙ на сообщение клиента")
+    print("="*60 + "\n")
     
-    # Важно: разрешаем все типы обновлений
-    app.run_polling(allowed_updates=["message", "business_message", "callback_query", "edited_message"])
+    app.run_polling(allowed_updates=["message", "business_message", "callback_query"])
 
 if __name__ == "__main__":
     main()
