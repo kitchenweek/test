@@ -4,7 +4,6 @@ from typing import Dict, List
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import asyncio
-import re
 
 # ================== КОНФИГУРАЦИЯ ==================
 BOT_TOKEN = "8911152200:AAF75Xn8M-9XoCBEOYRuq8azBknQxrnkLZ4"
@@ -141,8 +140,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("📋 Актуальные клиенты", callback_data="show_active")],
-        [InlineKeyboardButton("📂 Неактуальные клиенты", callback_data="show_inactive")],
-        [InlineKeyboardButton("🔄 Обновить список", callback_data="refresh")]
+        [InlineKeyboardButton("📂 Неактуальные клиенты", callback_data="show_inactive")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -166,14 +164,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if query.data == "show_active":
-        await show_active_clients(query.message, context)
+        await show_active_clients(query, context)
     
     elif query.data == "show_inactive":
-        await show_inactive_clients(query.message, context)
-    
-    elif query.data == "refresh":
-        await query.message.delete()
-        await start(update, context)
+        await show_inactive_clients(query, context)
     
     elif query.data.startswith("hide_"):
         user_id = int(query.data.split("_")[1])
@@ -200,12 +194,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("❌ Клиент не найден")
 
-async def show_active_clients(message, context: ContextTypes.DEFAULT_TYPE):
+async def show_active_clients(query, context: ContextTypes.DEFAULT_TYPE):
     """Показать актуальных клиентов"""
     active = get_active_clients()
     
     if not active:
-        await message.edit_text(
+        await query.edit_message_text(
             "📭 Нет актуальных клиентов\n\n"
             "Отправьте клиенту ключевую фразу, чтобы он появился здесь"
         )
@@ -242,16 +236,16 @@ async def show_active_clients(message, context: ContextTypes.DEFAULT_TYPE):
     
     if keyboard:
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await message.edit_text(text, reply_markup=reply_markup)
+        await query.edit_message_text(text, reply_markup=reply_markup)
     else:
-        await message.edit_text(text)
+        await query.edit_message_text(text)
 
-async def show_inactive_clients(message, context: ContextTypes.DEFAULT_TYPE):
+async def show_inactive_clients(query, context: ContextTypes.DEFAULT_TYPE):
     """Показать неактуальных клиентов"""
     inactive = get_inactive_clients()
     
     if not inactive:
-        await message.edit_text(
+        await query.edit_message_text(
             "📭 Нет неактуальных клиентов\n\n"
             "Все клиенты либо актуальны, либо уже удалены"
         )
@@ -285,9 +279,9 @@ async def show_inactive_clients(message, context: ContextTypes.DEFAULT_TYPE):
     
     if keyboard:
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await message.edit_text(text, reply_markup=reply_markup)
+        await query.edit_message_text(text, reply_markup=reply_markup)
     else:
-        await message.edit_text(text)
+        await query.edit_message_text(text)
 
 # ================== ОБРАБОТКА ИСХОДЯЩИХ СООБЩЕНИЙ ==================
 async def handle_outgoing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
