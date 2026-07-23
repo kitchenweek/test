@@ -58,10 +58,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 def check_stage_phrase(text: str) -> tuple:
-    """
-    Проверяет, какой этап соответствует тексту
-    Возвращает (индекс_этапа, найденная_фраза) или (None, None)
-    """
+    """Проверяет, какой этап соответствует тексту"""
     if not text:
         return None, None
     
@@ -91,14 +88,13 @@ def get_inactive_clients() -> Dict[int, Dict]:
 async def check_inactive_clients(app):
     """Проверяет, кто из клиентов стал неактуальным"""
     while True:
-        await asyncio.sleep(3600)  # Проверка каждый час
+        await asyncio.sleep(3600)
         now = datetime.now()
         for user_id, data in list(user_data.items()):
             if data.get("status") != "inactive":
                 if now - data["last_active"] > timedelta(hours=HIDE_AFTER_HOURS):
                     data["status"] = "inactive"
                     data["hidden_at"] = now
-                    # Лог владельцу
                     try:
                         user = await app.bot.get_chat(user_id)
                         name = user.username or user.first_name or str(user_id)
@@ -110,7 +106,6 @@ async def check_inactive_clients(app):
                     except:
                         pass
         
-        # Удаление старых неактуальных
         to_delete = []
         for user_id, data in user_data.items():
             if data.get("status") == "inactive":
@@ -205,14 +200,12 @@ async def show_active_clients(query, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Сортируем по времени последней активности
     sorted_clients = sorted(active.items(), key=lambda x: x[1]["last_active"], reverse=True)
     
     text = "📋 Актуальные клиенты:\n\n"
     keyboard = []
     
     for user_id, data in sorted_clients:
-        # Получаем имя пользователя
         try:
             user = await context.bot.get_chat(user_id)
             name = user.username or user.first_name or str(user_id)
@@ -222,11 +215,9 @@ async def show_active_clients(query, context: ContextTypes.DEFAULT_TYPE):
         stage_idx = data.get("stage", 0)
         stage_name = STAGES[stage_idx] if stage_idx < len(STAGES) else "✅ Завершён"
         
-        # Время последней активности
         last_active = data["last_active"].strftime("%d.%m %H:%M")
         text += f"• @{name} — {stage_name} (обновлён: {last_active})\n"
         
-        # Добавляем кнопку "В неактуальные"
         keyboard.append([
             InlineKeyboardButton(
                 f"⬇️ В неактуальные @{name}", 
@@ -255,7 +246,6 @@ async def show_inactive_clients(query, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     
     for user_id, data in inactive.items():
-        # Получаем имя пользователя
         try:
             user = await context.bot.get_chat(user_id)
             name = user.username or user.first_name or str(user_id)
@@ -265,11 +255,9 @@ async def show_inactive_clients(query, context: ContextTypes.DEFAULT_TYPE):
         stage_idx = data.get("stage", 0)
         stage_name = STAGES[stage_idx] if stage_idx < len(STAGES) else "✅ Завершён"
         
-        # Время скрытия
         hidden_at = data.get("hidden_at", data["last_active"]).strftime("%d.%m %H:%M")
         text += f"• @{name} — {stage_name} (скрыт: {hidden_at})\n"
         
-        # Добавляем кнопку "Вернуть в актуальные"
         keyboard.append([
             InlineKeyboardButton(
                 f"⬆️ Вернуть @{name}", 
@@ -283,113 +271,132 @@ async def show_inactive_clients(query, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.edit_message_text(text)
 
-# ================== ОБРАБОТКА ИСХОДЯЩИХ СООБЩЕНИЙ ==================
-async def handle_outgoing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ЛЮБЫЕ исходящие сообщения от владельца"""
-    # Проверяем, что сообщение от владельца
-    if update.effective_user.id != OWNER_ID:
+# ================== ОБРАБОТКА БИЗНЕС-СООБЩЕНИЙ ==================
+async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает сообщения через Business API.
+    Срабатывает на ЛЮБЫЕ сообщения в бизнес-чатах.
+    """
+    # Проверяем, что это бизнес-сообщение
+    if not update.business_message:
         return
     
-    msg = update.message
-    if not msg or not msg.text:
+    msg = update.business_message
+    
+    # Проверяем, что сообщение от владельца (исходящее)
+    if msg.from_user.id != OWNER_ID:
+        return
+    
+    # Проверяем, что это текст
+    if not msg.text:
         return
     
     text = msg.text
     
-    # ОТЛАДКА: выводим в консоль каждое сообщение
-    print(f"📩 Получено сообщение от вас: {text[:50]}...")
-    print(f"   ID отправителя: {update.effective_user.id}")
+    print(f"📩 Business-сообщение от вас: {text[:50]}...")
+    print(f"   ID отправителя: {msg.from_user.id}")
     
     # Проверяем, есть ли в сообщении ключевая фраза
     stage_idx, found_phrase = check_stage_phrase(text)
     
-    if stage_idx is not None:
-        print(f"✅ Найдена фраза для этапа {stage_idx}: {STAGES[stage_idx]}")
-        
-        # Определяем ID клиента
-        client_id = None
-        
+    if stage_idx is None:
+        print("❌ Ключевая фраза НЕ найдена")
+        return
+    
+    print(f"✅ Найдена фраза для этапа {stage_idx}: {STAGES[stage_idx]}")
+    
+    # Определяем ID клиента (получатель сообщения)
+    # В бизнес-чате получатель - это тот, кому адресовано сообщение
+    # Проверяем, есть ли реплай
+    client_id = None
+    
+    if msg.reply_to_message:
         # Если есть реплай - берём ID из реплая
-        if msg.reply_to_message:
-            client_id = msg.reply_to_message.from_user.id
-            print(f"   Клиент определён через реплай: {client_id}")
-        
-        # Если нет реплая, ищем упоминание
-        else:
-            # Проверяем упоминания в тексте
-            if msg.entities:
-                for entity in msg.entities:
-                    if entity.type == "mention":
-                        username = text[entity.offset:entity.offset + entity.length]
-                        print(f"   Найдено упоминание: {username}")
-                        try:
-                            user = await context.bot.get_chat(username)
-                            client_id = user.id
-                            print(f"   Клиент по username: {client_id}")
-                            break
-                        except Exception as e:
-                            print(f"   Ошибка получения пользователя: {e}")
-                    elif entity.type == "text_mention":
-                        client_id = entity.user.id
-                        print(f"   Клиент через text_mention: {client_id}")
+        client_id = msg.reply_to_message.from_user.id
+        print(f"   Клиент определён через реплай: {client_id}")
+    else:
+        # В бизнес-чате исходящее сообщение обычно адресовано конкретному пользователю
+        # Но мы не можем получить получателя напрямую, поэтому ищем упоминания
+        if msg.entities:
+            for entity in msg.entities:
+                if entity.type == "mention":
+                    username = text[entity.offset:entity.offset + entity.length]
+                    print(f"   Найдено упоминание: {username}")
+                    try:
+                        user = await context.bot.get_chat(username)
+                        client_id = user.id
+                        print(f"   Клиент по username: {client_id}")
                         break
-        
-        # Если клиент не найден - игнорируем
-        if client_id is None:
+                    except Exception as e:
+                        print(f"   Ошибка получения пользователя: {e}")
+                elif entity.type == "text_mention":
+                    client_id = entity.user.id
+                    print(f"   Клиент через text_mention: {client_id}")
+                    break
+    
+    # Если клиент не найден, пробуем найти получателя через чат
+    if client_id is None:
+        # В бизнес-чате это может быть личный чат с клиентом
+        # Тогда получатель - это другой участник чата
+        chat = msg.chat
+        if chat.type == "private":
+            # В личном чате получатель - это другой пользователь
+            # Но мы не можем его определить, поэтому используем chat.id
+            client_id = chat.id
+            print(f"   Клиент определён как чат: {client_id}")
+        else:
             print("❌ Не удалось определить клиента")
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text="⚠️ Не удалось определить клиента. Используйте реплай на сообщение клиента или @username"
             )
             return
+    
+    now = datetime.now()
+    
+    # Если клиент новый - добавляем
+    if client_id not in user_data:
+        user_data[client_id] = {
+            "stage": stage_idx,
+            "status": "active",
+            "last_active": now,
+            "hidden_at": None
+        }
         
-        now = datetime.now()
+        try:
+            user = await context.bot.get_chat(client_id)
+            name = user.username or user.first_name or str(client_id)
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"🆕 Новый клиент @{name}\n"
+                     f"Этап: {STAGES[stage_idx]}"
+            )
+            print(f"✅ Новый клиент добавлен: @{name}, этап {STAGES[stage_idx]}")
+        except Exception as e:
+            print(f"❌ Ошибка при добавлении клиента: {e}")
         
-        # Если клиент новый - добавляем
-        if client_id not in user_data:
-            user_data[client_id] = {
-                "stage": stage_idx,
-                "status": "active",
-                "last_active": now,
-                "hidden_at": None
-            }
+    else:
+        # Обновляем этап только если он выше текущего
+        current_stage = user_data[client_id].get("stage", 0)
+        if stage_idx > current_stage:
+            user_data[client_id]["stage"] = stage_idx
             
             try:
                 user = await context.bot.get_chat(client_id)
                 name = user.username or user.first_name or str(client_id)
                 await context.bot.send_message(
                     chat_id=OWNER_ID,
-                    text=f"🆕 Новый клиент @{name}\n"
-                         f"Этап: {STAGES[stage_idx]}"
+                    text=f"⬆️ Клиент @{name} перешёл на этап: {STAGES[stage_idx]}"
                 )
-                print(f"✅ Новый клиент добавлен: @{name}, этап {STAGES[stage_idx]}")
+                print(f"⬆️ Клиент @{name} перешёл на этап {STAGES[stage_idx]}")
             except Exception as e:
-                print(f"❌ Ошибка при добавлении клиента: {e}")
-            
-        else:
-            # Обновляем этап только если он выше текущего
-            current_stage = user_data[client_id].get("stage", 0)
-            if stage_idx > current_stage:
-                user_data[client_id]["stage"] = stage_idx
-                
-                try:
-                    user = await context.bot.get_chat(client_id)
-                    name = user.username or user.first_name or str(client_id)
-                    await context.bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=f"⬆️ Клиент @{name} перешёл на этап: {STAGES[stage_idx]}"
-                    )
-                    print(f"⬆️ Клиент @{name} перешёл на этап {STAGES[stage_idx]}")
-                except Exception as e:
-                    print(f"❌ Ошибка при обновлении этапа: {e}")
-            
-            # Обновляем время активности и статус
-            user_data[client_id]["last_active"] = now
-            user_data[client_id]["status"] = "active"
-            user_data[client_id]["hidden_at"] = None
-            print(f"✅ Обновлено время активности для клиента")
-    else:
-        print("❌ Ключевая фраза НЕ найдена")
+                print(f"❌ Ошибка при обновлении этапа: {e}")
+        
+        # Обновляем время активности и статус
+        user_data[client_id]["last_active"] = now
+        user_data[client_id]["status"] = "active"
+        user_data[client_id]["hidden_at"] = None
+        print(f"✅ Обновлено время активности для клиента")
 
 # ================== ЗАПУСК ==================
 async def post_init(app):
@@ -406,8 +413,8 @@ def main():
     # Callback-запросы от кнопок
     app.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Обработчик ВСЕХ исходящих сообщений от владельца
-    app.add_handler(MessageHandler(filters.TEXT & filters.User(OWNER_ID), handle_outgoing_message))
+    # Обработчик БИЗНЕС-СООБЩЕНИЙ (важно!)
+    app.add_handler(MessageHandler(filters.ALL, handle_business_message))
     
     # Устанавливаем команды
     app.bot.set_my_commands([
@@ -415,7 +422,7 @@ def main():
     ])
     
     print("\n" + "="*50)
-    print("🚀 БОТ ЗАПУЩЕН")
+    print("🚀 БОТ ЗАПУЩЕН (Business API)")
     print("="*50)
     print(f"👤 Владелец: {OWNER_ID}")
     print(f"🔑 Токен: {BOT_TOKEN[:15]}...")
@@ -428,7 +435,8 @@ def main():
     print("\n💡 Используйте реплай на сообщение клиента или @username")
     print("\n" + "="*50 + "\n")
     
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    # Важно: добавляем allowed_updates для бизнес-сообщений
+    app.run_polling(allowed_updates=["message", "callback_query", "business_message"])
 
 if __name__ == "__main__":
     main()
