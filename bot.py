@@ -7,7 +7,7 @@ import asyncio
 import re
 
 # ================== КОНФИГУРАЦИЯ ==================
-BOT_TOKEN = "8615323356:AAFb_jZCUbOymsg4IAs0beKVOOUko7SEab0"
+BOT_TOKEN = "8911152200:AAF75Xn8M-9XoCBEOYRuq8azBknQxrnkLZ4"
 OWNER_ID = 2010296191  # Ваш Telegram ID
 
 # Хранилище: {user_id: {"stage": int, "status": "active"/"inactive", "last_active": datetime, "hidden_at": datetime}}
