@@ -17,8 +17,8 @@ from telegram.ext import (
 )
 
 # ===================== НАСТРОЙКА =====================
-BOT_TOKEN = "8911152200:AAF75Xn8M-9XoCBEOYRuq8azBknQxrnkLZ4"
-OWNER_ID = 2010296191  # Telegram ID владельца бизнес-аккаунта
+BOT_TOKEN = "8844294021:AAEG8ZpDJ9qp2rMisXONxkYncnmJf04luL0"
+OWNER_ID = 7517164478  # Telegram ID владельца бизнес-аккаунта
 
 DB_PATH = Path("clients.db")
 INACTIVE_AFTER_HOURS = 6
