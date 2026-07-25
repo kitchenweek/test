@@ -3,6 +3,7 @@ import logging
 import random
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,8 @@ CHECK_INTERVAL_SECONDS = 30
 STAGE_REMINDER_DAYS = (3, 6, 13)
 PAYMENT_REMINDER_MIN_SECONDS = 3 * 60
 PAYMENT_REMINDER_MAX_SECONDS = 6 * 60
+PAYMENT_REPEAT_SECONDS = 5 * 60
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 # =====================================================
 
 STAGES = [
@@ -103,15 +106,34 @@ def detect_client_payment_trigger(message: Message) -> Optional[str]:
 
 
 def detect_owner_payment_trigger(message: Message) -> Optional[str]:
-    """Триггеры владельца: «Принято» или 👌 в исходящем сообщении."""
+    """Триггер владельца: только слово «Принято» в исходящем сообщении."""
     text = message.text or message.caption or ""
     normalized = normalize_text(text)
 
-    if "👌" in text:
-        return "👌 от владельца"
     if "принято" in normalized:
         return "Принято от владельца"
     return None
+
+
+def is_two_deposits_marker(text: str) -> bool:
+    return "на разных складах товары, сумма за св та же" in normalize_text(text)
+
+
+def is_same_deposit_amount(text: str) -> bool:
+    return "сумма по залогу та же" in normalize_text(text)
+
+
+def is_deposit_for_shipping(text: str) -> bool:
+    return "залог для отправки" in normalize_text(text)
+
+
+def next_moscow_1432(now_utc: datetime) -> datetime:
+    now_msk = now_utc.astimezone(MOSCOW_TZ)
+    target_date = (now_msk + timedelta(days=1)).date()
+    target_msk = datetime(
+        target_date.year, target_date.month, target_date.day, 14, 32, tzinfo=MOSCOW_TZ
+    )
+    return target_msk.astimezone(timezone.utc)
 
 
 class ClientRepository:
@@ -144,7 +166,8 @@ class ClientRepository:
                     stage_updated_at TEXT,
                     reminder_3_sent INTEGER NOT NULL DEFAULT 0,
                     reminder_6_sent INTEGER NOT NULL DEFAULT 0,
-                    reminder_13_sent INTEGER NOT NULL DEFAULT 0
+                    reminder_13_sent INTEGER NOT NULL DEFAULT 0,
+                    two_deposits INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -156,6 +179,7 @@ class ClientRepository:
                 "reminder_3_sent": "INTEGER NOT NULL DEFAULT 0",
                 "reminder_6_sent": "INTEGER NOT NULL DEFAULT 0",
                 "reminder_13_sent": "INTEGER NOT NULL DEFAULT 0",
+                "two_deposits": "INTEGER NOT NULL DEFAULT 0",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -177,10 +201,20 @@ class ClientRepository:
                     baseline_stage INTEGER,
                     due_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    reminder_mode TEXT NOT NULL DEFAULT 'standard',
+                    repeat_seconds INTEGER NOT NULL DEFAULT 300,
                     FOREIGN KEY(user_id) REFERENCES clients(user_id) ON DELETE CASCADE
                 )
                 """
             )
+            payment_columns = self._columns(db, "payment_reminders")
+            payment_additions = {
+                "reminder_mode": "TEXT NOT NULL DEFAULT 'standard'",
+                "repeat_seconds": "INTEGER NOT NULL DEFAULT 300",
+            }
+            for name, definition in payment_additions.items():
+                if name not in payment_columns:
+                    db.execute(f"ALTER TABLE payment_reminders ADD COLUMN {name} {definition}")
 
     def ensure_client(
         self,
@@ -277,19 +311,62 @@ class ClientRepository:
         trigger_type: str,
         trigger_message_id: int,
         due_at: datetime,
+        reminder_mode: str = "standard",
+        replace_existing: bool = False,
     ) -> bool:
-        client = self.ensure_client(user_id, username, first_name)
+        # Триггер разрешён только для уже существующего клиента,
+        # который был добавлен в базу одной из семи ключевых фраз.
         with self.connect() as db:
+            client = db.execute(
+                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if client is None:
+                logger.info(
+                    "PAYMENT_TRIGGER_IGNORED | client_id=%s | reason=no_stage | trigger=%s",
+                    user_id,
+                    trigger_type,
+                )
+                return False
+
+            # После этапа «Перерасчёт залога» и всех последующих этапов
+            # пятиминутные платёжные напоминания больше не запускаются.
+            if int(client["stage"]) >= 4:
+                logger.info(
+                    "PAYMENT_TRIGGER_IGNORED | client_id=%s | reason=deposit_recalculated | trigger=%s",
+                    user_id,
+                    trigger_type,
+                )
+                return False
+
             existing = db.execute(
                 "SELECT 1 FROM payment_reminders WHERE user_id = ?", (user_id,)
             ).fetchone()
-            if existing:
+            if existing and not replace_existing:
                 return False
+            if existing and replace_existing:
+                db.execute("DELETE FROM payment_reminders WHERE user_id = ?", (user_id,))
+
+            db.execute(
+                """
+                UPDATE clients
+                SET username = ?, first_name = ?, status = 'active',
+                    last_active = ?, hidden_at = NULL, updated_at = ?
+                WHERE user_id = ?
+                """,
+                (
+                    username,
+                    first_name,
+                    dt_to_str(utc_now()),
+                    dt_to_str(utc_now()),
+                    user_id,
+                ),
+            )
             db.execute(
                 """
                 INSERT INTO payment_reminders
-                (user_id, trigger_type, trigger_message_id, baseline_stage, due_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (user_id, trigger_type, trigger_message_id, baseline_stage, due_at, created_at,
+                 reminder_mode, repeat_seconds)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -298,9 +375,33 @@ class ClientRepository:
                     int(client["stage"]),
                     dt_to_str(due_at),
                     dt_to_str(utc_now()),
+                    reminder_mode,
+                    PAYMENT_REPEAT_SECONDS,
                 ),
             )
             return True
+
+    def reschedule_payment_reminder(self, user_id: int, due_at: datetime) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE payment_reminders SET due_at = ? WHERE user_id = ?",
+                (dt_to_str(due_at), user_id),
+            )
+
+    def mark_two_deposits(self, user_id: int) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE clients SET two_deposits = 1, updated_at = ? WHERE user_id = ?",
+                (dt_to_str(utc_now()), user_id),
+            )
+            return cursor.rowcount > 0
+
+    def has_two_deposits(self, user_id: int) -> bool:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT two_deposits FROM clients WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            return bool(row and int(row["two_deposits"]))
 
     def due_payment_reminders(self, now: datetime) -> list[sqlite3.Row]:
         with self.connect() as db:
@@ -584,8 +685,41 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
 
     client_id, username, first_name = message_client_data(message)
 
-    # Триггеры распределены по отправителю:
-    # клиент — только PDF; владелец — только «Принято» или 👌.
+    owner_text = (message.text or message.caption or "") if is_owner_message else ""
+
+    # Запоминаем, что у клиента два залога. Флаг ставится только для уже
+    # существующего клиента, чтобы случайные чаты не попадали в базу.
+    if is_owner_message and owner_text and is_two_deposits_marker(owner_text):
+        if repo.mark_two_deposits(client_id):
+            logger.info("TWO_DEPOSITS_MARKED | client_id=%s", client_id)
+
+    # Специальное правило залога: первое напоминание на следующий день
+    # в 14:32 МСК, затем каждые 5 минут до обновления этапа.
+    if is_owner_message and owner_text:
+        two_deposits = repo.has_two_deposits(client_id)
+        deposit_trigger = None
+        if two_deposits and is_same_deposit_amount(owner_text):
+            deposit_trigger = "Два залога: сумма по залогу та же"
+        elif not two_deposits and is_deposit_for_shipping(owner_text):
+            deposit_trigger = "Залог для отправки"
+
+        if deposit_trigger:
+            due_at = next_moscow_1432(utc_now())
+            created = repo.schedule_payment_reminder(
+                client_id, username, first_name, deposit_trigger,
+                message.message_id, due_at, reminder_mode="deposit",
+                replace_existing=True,
+            )
+            if created:
+                logger.info(
+                    "DEPOSIT_REMINDER_SCHEDULED | client_id=%s | due_at=%s",
+                    client_id, dt_to_str(due_at),
+                )
+
+    # Триггеры распределены по отправителю и срабатывают только для
+    # клиентов, уже добавленных на один из семи этапов:
+    # клиент — только PDF; владелец — только «Принято».
+    # Если клиент был скрыт, любой из этих триггеров возвращает его в активные.
     trigger = (
         detect_owner_payment_trigger(message)
         if is_owner_message
@@ -635,20 +769,6 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         changed,
     )
 
-    status_word = "обновлён" if changed else "уже был установлен"
-    try:
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                f"✅ Клиент {display_name}\n"
-                f"Этап {status_word}: {new_stage + 1}/7 — {STAGES[new_stage]}"
-            ),
-            reply_markup=open_client_keyboard(client_id),
-        )
-    except Exception:
-        logger.exception("Не удалось отправить уведомление владельцу")
-
-
 async def reminder_loop(application: Application) -> None:
     while True:
         try:
@@ -675,7 +795,7 @@ async def reminder_loop(application: Application) -> None:
                         row["user_id"],
                     )
 
-            # Отложенное напоминание: PDF от клиента или «Принято»/👌 от владельца.
+            # Отложенное напоминание: PDF от клиента или «Принято» от владельца.
             for row in repo.due_payment_reminders(now):
                 user_id = int(row["user_id"])
                 baseline_stage = int(row["baseline_stage"])
@@ -695,11 +815,17 @@ async def reminder_loop(application: Application) -> None:
                             f"Клиент: {row_name(row)}\n"
                             f"Триггер: {row['trigger_type']}\n"
                             f"Текущий этап: {current_stage + 1}/7 — {STAGES[current_stage]}\n\n"
-                            f"После триггера этап не обновился. Выдайте клиенту новый платёж."
+                            + (
+                                "После залога этап не обновился. Напоминание будет повторяться каждые 5 минут."
+                                if row["reminder_mode"] == "deposit"
+                                else "После триггера этап не обновился. Напоминание будет повторяться каждые 5 минут."
+                            )
                         ),
                         reply_markup=open_client_keyboard(user_id),
                     )
-                    repo.delete_payment_reminder(user_id)
+                    repo.reschedule_payment_reminder(
+                        user_id, utc_now() + timedelta(seconds=int(row["repeat_seconds"]))
+                    )
                 except Exception:
                     logger.exception(
                         "Не удалось отправить платёжное напоминание client_id=%s",
