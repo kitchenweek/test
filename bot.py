@@ -568,6 +568,15 @@ def open_client_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def payment_reminder_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔇 Заглушить", callback_data=f"mute_payment:{user_id}")],
+            [InlineKeyboardButton("Открыть клиента", callback_data=f"client:{user_id}")],
+        ]
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user is None or update.effective_user.id != OWNER_ID:
         if update.effective_message:
@@ -655,6 +664,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_id = int(data.split(":", 1)[1])
         repo.set_status(user_id, "active")
         await show_client(query, user_id)
+    elif data.startswith("mute_payment:"):
+        user_id = int(data.split(":", 1)[1])
+        repo.delete_payment_reminder(user_id)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Открыть клиента", callback_data=f"client:{user_id}")]]
+                )
+            )
+        except Exception:
+            logger.exception("Не удалось обновить сообщение после заглушения client_id=%s", user_id)
+        await query.answer(
+            "Текущая серия напоминаний заглушена. Новый триггер запустит её снова.",
+            show_alert=True,
+        )
 
 
 async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -821,7 +845,7 @@ async def reminder_loop(application: Application) -> None:
                                 else "После триггера этап не обновился. Напоминание будет повторяться каждые 5 минут."
                             )
                         ),
-                        reply_markup=open_client_keyboard(user_id),
+                        reply_markup=payment_reminder_keyboard(user_id),
                     )
                     repo.reschedule_payment_reminder(
                         user_id, utc_now() + timedelta(seconds=int(row["repeat_seconds"]))
