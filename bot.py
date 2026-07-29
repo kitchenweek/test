@@ -1032,6 +1032,11 @@ async def main() -> None:
     dp.include_router(router)
 
     try:
+        # Polling и webhook нельзя использовать одновременно.
+        # Некоторые хостинги автоматически создают webhook, поэтому
+        # перед запуском polling удаляем его.
+        await bot.delete_webhook(drop_pending_updates=True)
+
         await admin_log(bot, "Бот запущен.")
         await dp.start_polling(bot)
 
