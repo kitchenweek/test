@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telethon import TelegramClient, errors
@@ -1026,7 +1027,7 @@ async def main() -> None:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    bot = Bot(BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
 
