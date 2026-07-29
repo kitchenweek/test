@@ -1,906 +1,1052 @@
 import asyncio
+import json
 import logging
 import random
-import sqlite3
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Optional
+from typing import Any
+from urllib.parse import urlparse
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
-from telegram.constants import ChatType, UpdateType
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telethon import TelegramClient, errors
 
-# ===================== НАСТРОЙКА =====================
-BOT_TOKEN = "8622609872:AAH2rMoJZ-D7xggf1tS217ZxVjOv-RHr8Ks"
-OWNER_ID = 7517164478  # Telegram ID владельца бизнес-аккаунта
 
-DB_PATH = Path("clients.db")
-INACTIVE_AFTER_HOURS = 6
-DELETE_AFTER_DAYS = 14
-CHECK_INTERVAL_SECONDS = 30
-STAGE_REMINDER_DAYS = (3, 6, 13)
-PAYMENT_REMINDER_MIN_SECONDS = 3 * 60
-PAYMENT_REMINDER_MAX_SECONDS = 6 * 60
-PAYMENT_REPEAT_SECONDS = 5 * 60
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-# =====================================================
+# ============================================================
+# НАСТРОЙКИ — ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ
+# ============================================================
 
-STAGES = [
-    "Доставка",
-    "СВ",
-    "Залог",
-    "Перерасчёт СВ",
-    "Перерасчёт залога",
-    "Лот по СВ",
-    "Лот по залогу",
-]
+BOT_TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
 
-STAGE_PHRASES = {
-    0: ["добрый день, ваш заказ прибыл к нам на склад в мск"],
-    1: [
-        "сумма полностью возвратная т.е при уведомлении сдэка/почты о получении товара клиентом сумма будет возвращена в полном объеме на номер карты (имя получателя и банк должен быть тот же, с которого была отправлена сумма)",
-        "на разных складах товары, сумма за св та же",
-    ],
-    2: [
-        "18-19мск, также не получили реквизиты на возврат св (имя отправителя как в чеке и тот же банк)",
-        "18-19мск, возврат по реквизитам",
-    ],
-    3: ["перерасчет по св (отмена категории заказов до 100тыс₽), св на все заказы теперь"],
-    4: ["перерасчет по залогу (отмена категории заказов до 100тыс₽), залог на все заказы теперь"],
-    5: ["клиент оплатил залоги и св на одну отправку, лот по которой уже закрыт, сейчас тк ждет"],
-    6: ["сумма к оплате на новый лот по залогу"],
-}
+# Администратор видит логи действий пользователей.
+ADMIN_ID = 2010296191
+
+# Telegram API приложения. Получить на my.telegram.org
+API_ID = 32200104
+API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
+
+MIN_DELAY_SECONDS = 8
+MAX_DELAY_SECONDS = 15
+MAX_FLOOD_WAIT_SECONDS = 300
+DEFAULT_DRY_RUN = True
+
+DATA_DIR = Path("users_data")
+
+# ============================================================
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-logger = logging.getLogger("business_bot")
+log = logging.getLogger("telegram-console")
+
+router = Router()
+
+# Временные шаги интерфейса хранятся только в памяти.
+user_steps: dict[int, str] = {}
+pending_phones: dict[int, str] = {}
+
+# Отдельный Telethon-клиент и задача рассылки для каждого пользователя.
+user_clients: dict[int, TelegramClient] = {}
+broadcast_tasks: dict[int, asyncio.Task] = {}
+stop_events: dict[int, asyncio.Event] = {}
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def user_dir(user_id: int) -> Path:
+    path = DATA_DIR / str(user_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def dt_to_str(value: Optional[datetime]) -> Optional[str]:
-    return value.isoformat() if value else None
+def state_path(user_id: int) -> Path:
+    return user_dir(user_id) / "state.json"
 
 
-def str_to_dt(value: Optional[str]) -> Optional[datetime]:
-    return datetime.fromisoformat(value) if value else None
+def session_path(user_id: int) -> str:
+    return str(user_dir(user_id) / "telegram_user_session")
 
 
-def normalize_text(text: str) -> str:
-    return " ".join(text.casefold().replace("ё", "е").split())
+def default_state() -> dict[str, Any]:
+    return {
+        "proxy": {
+            "enabled": False,
+            "type": "socks5",
+            "host": "",
+            "port": 1080,
+            "username": "",
+            "password": "",
+            "rdns": True,
+        },
+        "recipients": [],
+        "message": "",
+        "dry_run": DEFAULT_DRY_RUN,
+    }
 
 
-def detect_stage(text: str) -> Optional[int]:
-    normalized = normalize_text(text)
-    found = [
-        stage
-        for stage, phrases in STAGE_PHRASES.items()
-        if any(normalize_text(phrase) in normalized for phrase in phrases)
-    ]
-    return max(found) if found else None
+def load_state(user_id: int) -> dict[str, Any]:
+    path = state_path(user_id)
+    if not path.exists():
+        state = default_state()
+        save_state(user_id, state)
+        return state
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("Не удалось прочитать состояние пользователя %s", user_id)
+        data = {}
+
+    defaults = default_state()
+    defaults.update(data)
+    defaults["proxy"] = {**default_state()["proxy"], **data.get("proxy", {})}
+    return defaults
 
 
-def detect_client_payment_trigger(message: Message) -> Optional[str]:
-    """Клиентский триггер: только PDF-файл во входящем сообщении."""
-    document = message.document
-    if not document:
+def save_state(user_id: int, state: dict[str, Any]) -> None:
+    state_path(user_id).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+async def admin_log(bot: Bot, text: str) -> None:
+    if ADMIN_ID <= 0:
+        return
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"<b>Лог</b>\n{text}",
+        )
+    except Exception:
+        log.exception("Не удалось отправить лог администратору")
+
+
+def user_label(event: Message | CallbackQuery) -> str:
+    user = event.from_user
+    if not user:
+        return "неизвестный пользователь"
+
+    username = f"@{user.username}" if user.username else "без username"
+    name = (user.full_name or "").strip()
+    return f"{name} | {username} | <code>{user.id}</code>"
+
+
+def proxy_for_telethon(user_id: int):
+    state = load_state(user_id)
+    proxy = state["proxy"]
+
+    if not proxy.get("enabled"):
         return None
 
-    filename = (document.file_name or "").casefold()
-    mime_type = (document.mime_type or "").casefold()
-    if filename.endswith(".pdf") or mime_type == "application/pdf":
-        return "PDF-файл от клиента"
-    return None
+    proxy_type = str(proxy.get("type", "socks5")).lower()
+    if proxy_type not in {"socks5", "socks4", "http"}:
+        raise ValueError("Тип прокси должен быть socks5, socks4 или http")
 
+    host = str(proxy.get("host", "")).strip()
+    port = int(proxy.get("port", 0))
 
-def detect_owner_payment_trigger(message: Message) -> Optional[str]:
-    """Триггер владельца: только слово «Принято» в исходящем сообщении."""
-    text = message.text or message.caption or ""
-    normalized = normalize_text(text)
+    if not host or not port:
+        raise ValueError("Не указан адрес или порт прокси")
 
-    if "принято" in normalized:
-        return "Принято от владельца"
-    return None
-
-
-def is_two_deposits_marker(text: str) -> bool:
-    return "на разных складах товары, сумма за св та же" in normalize_text(text)
-
-
-def is_same_deposit_amount(text: str) -> bool:
-    return "сумма по залогу та же" in normalize_text(text)
-
-
-def is_deposit_for_shipping(text: str) -> bool:
-    return "залог для отправки" in normalize_text(text)
-
-
-def next_moscow_1432(now_utc: datetime) -> datetime:
-    now_msk = now_utc.astimezone(MOSCOW_TZ)
-    target_date = (now_msk + timedelta(days=1)).date()
-    target_msk = datetime(
-        target_date.year, target_date.month, target_date.day, 14, 32, tzinfo=MOSCOW_TZ
+    return (
+        proxy_type,
+        host,
+        port,
+        bool(proxy.get("rdns", True)),
+        proxy.get("username") or None,
+        proxy.get("password") or None,
     )
-    return target_msk.astimezone(timezone.utc)
 
 
-class ClientRepository:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.initialize()
+async def rebuild_user_client(user_id: int) -> TelegramClient:
+    old = user_clients.get(user_id)
+    if old is not None:
+        try:
+            await old.disconnect()
+        except Exception:
+            pass
 
-    def connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path)
-        db.row_factory = sqlite3.Row
-        return db
-
-    @staticmethod
-    def _columns(db: sqlite3.Connection, table: str) -> set[str]:
-        return {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
-
-    def initialize(self) -> None:
-        with self.connect() as db:
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS clients (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT NOT NULL,
-                    stage INTEGER NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('active', 'inactive')),
-                    last_active TEXT NOT NULL,
-                    hidden_at TEXT,
-                    updated_at TEXT NOT NULL,
-                    stage_updated_at TEXT,
-                    reminder_3_sent INTEGER NOT NULL DEFAULT 0,
-                    reminder_6_sent INTEGER NOT NULL DEFAULT 0,
-                    reminder_13_sent INTEGER NOT NULL DEFAULT 0,
-                    two_deposits INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-
-            # Миграция базы, созданной предыдущей версией бота.
-            columns = self._columns(db, "clients")
-            additions = {
-                "stage_updated_at": "TEXT",
-                "reminder_3_sent": "INTEGER NOT NULL DEFAULT 0",
-                "reminder_6_sent": "INTEGER NOT NULL DEFAULT 0",
-                "reminder_13_sent": "INTEGER NOT NULL DEFAULT 0",
-                "two_deposits": "INTEGER NOT NULL DEFAULT 0",
-            }
-            for name, definition in additions.items():
-                if name not in columns:
-                    db.execute(f"ALTER TABLE clients ADD COLUMN {name} {definition}")
-
-            db.execute(
-                """
-                UPDATE clients
-                SET stage_updated_at = COALESCE(stage_updated_at, updated_at, last_active)
-                WHERE stage_updated_at IS NULL
-                """
-            )
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS payment_reminders (
-                    user_id INTEGER PRIMARY KEY,
-                    trigger_type TEXT NOT NULL,
-                    trigger_message_id INTEGER,
-                    baseline_stage INTEGER,
-                    due_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    reminder_mode TEXT NOT NULL DEFAULT 'standard',
-                    repeat_seconds INTEGER NOT NULL DEFAULT 300,
-                    FOREIGN KEY(user_id) REFERENCES clients(user_id) ON DELETE CASCADE
-                )
-                """
-            )
-            payment_columns = self._columns(db, "payment_reminders")
-            payment_additions = {
-                "reminder_mode": "TEXT NOT NULL DEFAULT 'standard'",
-                "repeat_seconds": "INTEGER NOT NULL DEFAULT 300",
-            }
-            for name, definition in payment_additions.items():
-                if name not in payment_columns:
-                    db.execute(f"ALTER TABLE payment_reminders ADD COLUMN {name} {definition}")
-
-    def ensure_client(
-        self,
-        user_id: int,
-        username: Optional[str],
-        first_name: str,
-    ) -> sqlite3.Row:
-        now_s = dt_to_str(utc_now())
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            if row is None:
-                db.execute(
-                    """
-                    INSERT INTO clients
-                    (user_id, username, first_name, stage, status, last_active,
-                     hidden_at, updated_at, stage_updated_at)
-                    VALUES (?, ?, ?, 0, 'active', ?, NULL, ?, ?)
-                    """,
-                    (user_id, username, first_name, now_s, now_s, now_s),
-                )
-            else:
-                db.execute(
-                    """
-                    UPDATE clients
-                    SET username = ?, first_name = ?, last_active = ?, updated_at = ?
-                    WHERE user_id = ?
-                    """,
-                    (username, first_name, now_s, now_s, user_id),
-                )
-            return db.execute(
-                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
-
-    def upsert_stage(
-        self,
-        user_id: int,
-        username: Optional[str],
-        first_name: str,
-        detected_stage: int,
-    ) -> tuple[int, bool]:
-        now_s = dt_to_str(utc_now())
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT stage FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
-
-            if row is None:
-                new_stage = detected_stage
-                changed = True
-                db.execute(
-                    """
-                    INSERT INTO clients
-                    (user_id, username, first_name, stage, status, last_active,
-                     hidden_at, updated_at, stage_updated_at,
-                     reminder_3_sent, reminder_6_sent, reminder_13_sent)
-                    VALUES (?, ?, ?, ?, 'active', ?, NULL, ?, ?, 0, 0, 0)
-                    """,
-                    (user_id, username, first_name, new_stage, now_s, now_s, now_s),
-                )
-            else:
-                old_stage = int(row["stage"])
-                new_stage = max(old_stage, detected_stage)
-                changed = new_stage > old_stage
-
-                # Любая найденная ключевая фраза считается обновлением этапа,
-                # даже если этот же этап уже был установлен ранее.
-                db.execute(
-                    """
-                    UPDATE clients
-                    SET username = ?, first_name = ?, stage = ?, status = 'active',
-                        last_active = ?, hidden_at = NULL, updated_at = ?,
-                        stage_updated_at = ?, reminder_3_sent = 0,
-                        reminder_6_sent = 0, reminder_13_sent = 0
-                    WHERE user_id = ?
-                    """,
-                    (username, first_name, new_stage, now_s, now_s, now_s, user_id),
-                )
-                # Ключевая фраза означает, что новый платёж уже выдан.
-                # Поэтому отменяем ожидающее платёжное напоминание и при
-                # повышении этапа, и при повторной фразе того же этапа.
-                db.execute(
-                    "DELETE FROM payment_reminders WHERE user_id = ?", (user_id,)
-                )
-
-        return new_stage, changed
-
-    def schedule_payment_reminder(
-        self,
-        user_id: int,
-        username: Optional[str],
-        first_name: str,
-        trigger_type: str,
-        trigger_message_id: int,
-        due_at: datetime,
-        reminder_mode: str = "standard",
-        replace_existing: bool = False,
-    ) -> bool:
-        # Триггер разрешён только для уже существующего клиента,
-        # который был добавлен в базу одной из семи ключевых фраз.
-        with self.connect() as db:
-            client = db.execute(
-                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            if client is None:
-                logger.info(
-                    "PAYMENT_TRIGGER_IGNORED | client_id=%s | reason=no_stage | trigger=%s",
-                    user_id,
-                    trigger_type,
-                )
-                return False
-
-            # После этапа «Перерасчёт залога» и всех последующих этапов
-            # пятиминутные платёжные напоминания больше не запускаются.
-            if int(client["stage"]) >= 4:
-                logger.info(
-                    "PAYMENT_TRIGGER_IGNORED | client_id=%s | reason=deposit_recalculated | trigger=%s",
-                    user_id,
-                    trigger_type,
-                )
-                return False
-
-            existing = db.execute(
-                "SELECT 1 FROM payment_reminders WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            if existing and not replace_existing:
-                return False
-            if existing and replace_existing:
-                db.execute("DELETE FROM payment_reminders WHERE user_id = ?", (user_id,))
-
-            db.execute(
-                """
-                UPDATE clients
-                SET username = ?, first_name = ?, status = 'active',
-                    last_active = ?, hidden_at = NULL, updated_at = ?
-                WHERE user_id = ?
-                """,
-                (
-                    username,
-                    first_name,
-                    dt_to_str(utc_now()),
-                    dt_to_str(utc_now()),
-                    user_id,
-                ),
-            )
-            db.execute(
-                """
-                INSERT INTO payment_reminders
-                (user_id, trigger_type, trigger_message_id, baseline_stage, due_at, created_at,
-                 reminder_mode, repeat_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    trigger_type,
-                    trigger_message_id,
-                    int(client["stage"]),
-                    dt_to_str(due_at),
-                    dt_to_str(utc_now()),
-                    reminder_mode,
-                    PAYMENT_REPEAT_SECONDS,
-                ),
-            )
-            return True
-
-    def reschedule_payment_reminder(self, user_id: int, due_at: datetime) -> None:
-        with self.connect() as db:
-            db.execute(
-                "UPDATE payment_reminders SET due_at = ? WHERE user_id = ?",
-                (dt_to_str(due_at), user_id),
-            )
-
-    def mark_two_deposits(self, user_id: int) -> bool:
-        with self.connect() as db:
-            cursor = db.execute(
-                "UPDATE clients SET two_deposits = 1, updated_at = ? WHERE user_id = ?",
-                (dt_to_str(utc_now()), user_id),
-            )
-            return cursor.rowcount > 0
-
-    def has_two_deposits(self, user_id: int) -> bool:
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT two_deposits FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            return bool(row and int(row["two_deposits"]))
-
-    def due_payment_reminders(self, now: datetime) -> list[sqlite3.Row]:
-        with self.connect() as db:
-            return db.execute(
-                """
-                SELECT p.*, c.username, c.first_name, c.stage
-                FROM payment_reminders p
-                JOIN clients c ON c.user_id = p.user_id
-                WHERE p.due_at <= ?
-                ORDER BY p.due_at
-                """,
-                (dt_to_str(now),),
-            ).fetchall()
-
-    def delete_payment_reminder(self, user_id: int) -> None:
-        with self.connect() as db:
-            db.execute("DELETE FROM payment_reminders WHERE user_id = ?", (user_id,))
-
-    def due_stage_reminders(self, now: datetime) -> list[tuple[sqlite3.Row, int]]:
-        result: list[tuple[sqlite3.Row, int]] = []
-        with self.connect() as db:
-            rows = db.execute("SELECT * FROM clients").fetchall()
-            for row in rows:
-                stage_updated_at = str_to_dt(row["stage_updated_at"])
-                if not stage_updated_at:
-                    continue
-                elapsed = now - stage_updated_at
-                for day in STAGE_REMINDER_DAYS:
-                    column = f"reminder_{day}_sent"
-                    if elapsed >= timedelta(days=day) and not int(row[column]):
-                        result.append((row, day))
-        return result
-
-    def mark_stage_reminder_sent(self, user_id: int, day: int) -> None:
-        if day not in STAGE_REMINDER_DAYS:
-            raise ValueError("Недопустимый срок напоминания")
-        with self.connect() as db:
-            db.execute(
-                f"UPDATE clients SET reminder_{day}_sent = 1 WHERE user_id = ?",
-                (user_id,),
-            )
-
-    def set_status(self, user_id: int, status: str) -> bool:
-        now_s = dt_to_str(utc_now())
-        hidden_at = now_s if status == "inactive" else None
-        with self.connect() as db:
-            cursor = db.execute(
-                """
-                UPDATE clients
-                SET status = ?, hidden_at = ?,
-                    last_active = CASE WHEN ? = 'active' THEN ? ELSE last_active END,
-                    updated_at = ?
-                WHERE user_id = ?
-                """,
-                (status, hidden_at, status, now_s, now_s, user_id),
-            )
-            return cursor.rowcount > 0
-
-    def get(self, user_id: int) -> Optional[sqlite3.Row]:
-        with self.connect() as db:
-            return db.execute(
-                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
-
-    def list_by_status(self, status: str) -> list[sqlite3.Row]:
-        order = "last_active DESC" if status == "active" else "hidden_at DESC"
-        with self.connect() as db:
-            return db.execute(
-                f"SELECT * FROM clients WHERE status = ? ORDER BY {order}",
-                (status,),
-            ).fetchall()
-
-    def auto_cleanup(self) -> tuple[int, int]:
-        now = utc_now()
-        inactive_before = now - timedelta(hours=INACTIVE_AFTER_HOURS)
-        delete_before = now - timedelta(days=DELETE_AFTER_DAYS)
-        hidden_count = 0
-        deleted_count = 0
-
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT user_id, last_active FROM clients WHERE status = 'active'"
-            ).fetchall()
-            for row in rows:
-                last_active = str_to_dt(row["last_active"])
-                if last_active and last_active < inactive_before:
-                    db.execute(
-                        """
-                        UPDATE clients
-                        SET status = 'inactive', hidden_at = ?, updated_at = ?
-                        WHERE user_id = ?
-                        """,
-                        (dt_to_str(now), dt_to_str(now), row["user_id"]),
-                    )
-                    hidden_count += 1
-
-            rows = db.execute(
-                "SELECT user_id, hidden_at FROM clients WHERE status = 'inactive'"
-            ).fetchall()
-            for row in rows:
-                hidden_at = str_to_dt(row["hidden_at"])
-                if hidden_at and hidden_at < delete_before:
-                    db.execute("DELETE FROM payment_reminders WHERE user_id = ?", (row["user_id"],))
-                    db.execute("DELETE FROM clients WHERE user_id = ?", (row["user_id"],))
-                    deleted_count += 1
-
-        return hidden_count, deleted_count
+    client = TelegramClient(
+        session_path(user_id),
+        API_ID,
+        API_HASH,
+        proxy=proxy_for_telethon(user_id),
+        device_model="Desktop",
+        system_version="Windows 11",
+        app_version="1.0",
+        lang_code="ru",
+        system_lang_code="ru-RU",
+    )
+    await client.connect()
+    user_clients[user_id] = client
+    return client
 
 
-repo = ClientRepository(DB_PATH)
+async def get_user_client(user_id: int) -> TelegramClient:
+    client = user_clients.get(user_id)
+
+    if client is None:
+        return await rebuild_user_client(user_id)
+
+    if not client.is_connected():
+        await client.connect()
+
+    return client
 
 
-def row_name(row: sqlite3.Row) -> str:
-    return f"@{row['username']}" if row["username"] else row["first_name"]
-
-
-def message_client_data(message: Message) -> tuple[int, Optional[str], str]:
-    client_id = message.chat.id
-    username = message.chat.username
-    first_name = message.chat.first_name or message.chat.full_name or str(client_id)
-    return client_id, username, first_name
-
-
-def chat_name(message: Message) -> str:
-    if message.chat.username:
-        return f"@{message.chat.username}"
-    return message.chat.full_name or message.chat.title or str(message.chat.id)
-
-
-def format_dt(value: Optional[str]) -> str:
-    dt = str_to_dt(value)
-    return dt.astimezone().strftime("%d.%m.%Y %H:%M") if dt else "—"
-
-
-def main_menu() -> InlineKeyboardMarkup:
+def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📋 Актуальные клиенты", callback_data="list:active")],
-            [InlineKeyboardButton("📂 Неактуальные клиенты", callback_data="list:inactive")],
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👤 Аккаунт", callback_data="account"),
+                InlineKeyboardButton(text="🌐 Прокси", callback_data="proxy"),
+            ],
+            [
+                InlineKeyboardButton(text="👥 Получатели", callback_data="recipients"),
+                InlineKeyboardButton(text="📝 Сообщение", callback_data="message"),
+            ],
+            [
+                InlineKeyboardButton(text="🧪 Тестовый режим", callback_data="toggle_dry"),
+                InlineKeyboardButton(text="📊 Статус", callback_data="status"),
+            ],
+            [
+                InlineKeyboardButton(text="▶️ Запустить", callback_data="start_broadcast"),
+                InlineKeyboardButton(text="⛔ Остановить", callback_data="stop_broadcast"),
+            ],
         ]
     )
 
 
-def client_keyboard(user_id: int, status: str) -> InlineKeyboardMarkup:
-    if status == "active":
-        action = InlineKeyboardButton("⬇️ В неактуальные", callback_data=f"hide:{user_id}")
-        back_data = "list:active"
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]
+        ]
+    )
+
+
+def account_keyboard(authorized: bool) -> InlineKeyboardMarkup:
+    rows = []
+
+    if authorized:
+        rows.append([InlineKeyboardButton(text="🚪 Выйти", callback_data="logout")])
     else:
-        action = InlineKeyboardButton("⬆️ Вернуть", callback_data=f"restore:{user_id}")
-        back_data = "list:inactive"
+        rows.append([InlineKeyboardButton(text="🔐 Войти", callback_data="login")])
+
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def proxy_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    enabled = bool(load_state(user_id)["proxy"]["enabled"])
 
     return InlineKeyboardMarkup(
-        [
-            [action],
-            [InlineKeyboardButton("⬅️ К списку", callback_data=back_data)],
-            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
-        ]
-    )
-
-
-def open_client_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Открыть клиента", callback_data=f"client:{user_id}")]]
-    )
-
-
-def payment_reminder_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🔇 Заглушить", callback_data=f"mute_payment:{user_id}")],
-            [InlineKeyboardButton("Открыть клиента", callback_data=f"client:{user_id}")],
-        ]
-    )
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user is None or update.effective_user.id != OWNER_ID:
-        if update.effective_message:
-            await update.effective_message.reply_text("Доступ запрещён.")
-        return
-    await update.effective_message.reply_text(
-        "Управление клиентами:", reply_markup=main_menu()
-    )
-
-
-async def show_list(query, status: str) -> None:
-    rows = repo.list_by_status(status)
-    title = "📋 Актуальные клиенты" if status == "active" else "📂 Неактуальные клиенты"
-
-    if not rows:
-        await query.edit_message_text(f"{title}\n\nСписок пуст.", reply_markup=main_menu())
-        return
-
-    buttons = []
-    for row in rows[:80]:
-        marker = "🟢" if status == "active" else "⚪️"
-        buttons.append(
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    f"{marker} {row_name(row)} — {STAGES[row['stage']]}",
-                    callback_data=f"client:{row['user_id']}",
+                    text="🟢 Включён" if enabled else "⚪ Выключен",
+                    callback_data="toggle_proxy",
                 )
-            ]
-        )
-    buttons.append([InlineKeyboardButton("🏠 Главное меню", callback_data="menu")])
-
-    suffix = "\nПоказаны первые 80." if len(rows) > 80 else ""
-    await query.edit_message_text(
-        f"{title}\n\nВсего: {len(rows)}{suffix}",
-        reply_markup=InlineKeyboardMarkup(buttons),
+            ],
+            [InlineKeyboardButton(text="⚙️ Настроить прокси", callback_data="set_proxy")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
+        ]
     )
 
 
-async def show_client(query, user_id: int) -> None:
-    row = repo.get(user_id)
-    if row is None:
-        await query.edit_message_text("Клиент не найден.", reply_markup=main_menu())
+def recipients_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Добавить", callback_data="add_recipient"),
+                InlineKeyboardButton(text="🗑 Очистить", callback_data="clear_recipients"),
+            ],
+            [InlineKeyboardButton(text="📋 Показать", callback_data="show_recipients")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
+        ]
+    )
+
+
+async def account_status_text(user_id: int) -> tuple[str, bool]:
+    try:
+        client = await get_user_client(user_id)
+        authorized = await client.is_user_authorized()
+
+        if not authorized:
+            return "Аккаунт не авторизован.", False
+
+        me = await client.get_me()
+        username = f"@{me.username}" if me.username else "без username"
+        phone = getattr(me, "phone", None) or "скрыт"
+
+        return (
+            f"✅ Аккаунт авторизован\n"
+            f"ID: <code>{me.id}</code>\n"
+            f"Username: {username}\n"
+            f"Телефон: <code>{phone}</code>",
+            True,
+        )
+    except Exception as exc:
+        return f"Ошибка подключения: <code>{type(exc).__name__}: {exc}</code>", False
+
+
+async def status_text(user_id: int) -> str:
+    state = load_state(user_id)
+    account_text, _ = await account_status_text(user_id)
+    proxy = state["proxy"]
+
+    proxy_text = (
+        f"{proxy['type']}://{proxy['host']}:{proxy['port']}"
+        if proxy["enabled"]
+        else "выключен"
+    )
+
+    task = broadcast_tasks.get(user_id)
+    running = task is not None and not task.done()
+
+    return (
+        f"<b>Статус</b>\n\n"
+        f"{account_text}\n\n"
+        f"Прокси: <code>{proxy_text}</code>\n"
+        f"Получателей: <b>{len(state['recipients'])}</b>\n"
+        f"Сообщение: {'задано' if state['message'].strip() else 'не задано'}\n"
+        f"Тестовый режим: {'включён' if state['dry_run'] else 'выключен'}\n"
+        f"Рассылка: {'выполняется' if running else 'остановлена'}"
+    )
+
+
+@router.message(CommandStart())
+async def start_handler(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id
+    load_state(user_id)
+
+    await message.answer(
+        "<b>Консоль рассылки</b>\n\n"
+        "У каждого пользователя отдельные настройки, Telegram-сессия, "
+        "прокси, получатели и текст.",
+        reply_markup=main_keyboard(),
+    )
+
+    await admin_log(bot, f"Запуск бота пользователем:\n{user_label(message)}")
+
+
+@router.message(Command("menu"))
+async def menu_command(message: Message) -> None:
+    user_steps.pop(message.from_user.id, None)
+    await message.answer("Главное меню:", reply_markup=main_keyboard())
+
+
+@router.callback_query(F.data == "menu")
+async def menu_callback(callback: CallbackQuery) -> None:
+    user_steps.pop(callback.from_user.id, None)
+    await callback.message.edit_text(
+        "<b>Консоль рассылки</b>",
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "account")
+async def account_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    text, authorized = await account_status_text(user_id)
+
+    await callback.message.edit_text(
+        f"<b>Telegram-аккаунт</b>\n\n{text}",
+        reply_markup=account_keyboard(authorized),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "login")
+async def login_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    user_steps[user_id] = "login_phone"
+
+    await callback.message.edit_text(
+        "Отправьте номер телефона в международном формате.\n"
+        "Пример: <code>+79991234567</code>",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+    await admin_log(bot, f"Начал вход в аккаунт:\n{user_label(callback)}")
+
+
+@router.callback_query(F.data == "logout")
+async def logout_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+
+    try:
+        client = await get_user_client(user_id)
+        await client.log_out()
+
+        await callback.message.edit_text(
+            "Аккаунт отключён. Локальная сессия завершена.",
+            reply_markup=account_keyboard(False),
+        )
+        await admin_log(bot, f"Вышел из аккаунта:\n{user_label(callback)}")
+
+    except Exception as exc:
+        await callback.answer(f"Ошибка: {exc}", show_alert=True)
+        await admin_log(
+            bot,
+            f"Ошибка выхода пользователя:\n{user_label(callback)}\n"
+            f"<code>{type(exc).__name__}: {exc}</code>",
+        )
         return
 
-    timing = (
-        f"Последняя активность: {format_dt(row['last_active'])}"
-        if row["status"] == "active"
-        else f"Скрыт: {format_dt(row['hidden_at'])}"
-    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "proxy")
+async def proxy_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    state = load_state(user_id)
+    proxy = state["proxy"]
+
+    password_text = "есть" if proxy.get("password") else "нет"
+
     text = (
-        f"👤 {row_name(row)}\n"
-        f"ID чата: {row['user_id']}\n"
-        f"Этап: {row['stage'] + 1}/7 — {STAGES[row['stage']]}\n"
-        f"Этап обновлён: {format_dt(row['stage_updated_at'])}\n"
-        f"Статус: {'активен' if row['status'] == 'active' else 'неактивен'}\n"
-        f"{timing}"
-    )
-    await query.edit_message_text(
-        text, reply_markup=client_keyboard(user_id, row["status"])
+        f"<b>Прокси</b>\n\n"
+        f"Состояние: {'включён' if proxy['enabled'] else 'выключен'}\n"
+        f"Тип: <code>{proxy['type']}</code>\n"
+        f"Адрес: <code>{proxy['host'] or 'не задан'}</code>\n"
+        f"Порт: <code>{proxy['port']}</code>\n"
+        f"Логин: <code>{proxy['username'] or 'нет'}</code>\n"
+        f"Пароль: <code>{password_text}</code>"
     )
 
+    await callback.message.edit_text(
+        text,
+        reply_markup=proxy_keyboard(user_id),
+    )
+    await callback.answer()
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if query is None:
+
+@router.callback_query(F.data == "toggle_proxy")
+async def toggle_proxy_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    state = load_state(user_id)
+
+    state["proxy"]["enabled"] = not state["proxy"]["enabled"]
+    save_state(user_id, state)
+
+    try:
+        await rebuild_user_client(user_id)
+    except Exception as exc:
+        state["proxy"]["enabled"] = False
+        save_state(user_id, state)
+
+        await callback.answer(f"Прокси не подключён: {exc}", show_alert=True)
+        await admin_log(
+            bot,
+            f"Ошибка подключения прокси:\n{user_label(callback)}\n"
+            f"<code>{type(exc).__name__}: {exc}</code>",
+        )
         return
-    await query.answer()
 
-    if query.from_user.id != OWNER_ID:
-        await query.answer("Доступ запрещён", show_alert=True)
-        return
+    status = "включил" if state["proxy"]["enabled"] else "выключил"
+    await admin_log(bot, f"Пользователь {status} прокси:\n{user_label(callback)}")
+    await proxy_callback(callback)
 
-    data = query.data or ""
-    if data == "menu":
-        await query.edit_message_text("Управление клиентами:", reply_markup=main_menu())
-    elif data.startswith("list:"):
-        await show_list(query, data.split(":", 1)[1])
-    elif data.startswith("client:"):
-        await show_client(query, int(data.split(":", 1)[1]))
-    elif data.startswith("hide:"):
-        user_id = int(data.split(":", 1)[1])
-        repo.set_status(user_id, "inactive")
-        await show_client(query, user_id)
-    elif data.startswith("restore:"):
-        user_id = int(data.split(":", 1)[1])
-        repo.set_status(user_id, "active")
-        await show_client(query, user_id)
-    elif data.startswith("mute_payment:"):
-        user_id = int(data.split(":", 1)[1])
-        repo.delete_payment_reminder(user_id)
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Открыть клиента", callback_data=f"client:{user_id}")]]
+
+@router.callback_query(F.data == "set_proxy")
+async def set_proxy_callback(callback: CallbackQuery) -> None:
+    user_steps[callback.from_user.id] = "set_proxy"
+
+    await callback.message.edit_text(
+        "<b>Отправьте прокси одной строкой</b>\n\n"
+        "Форматы:\n"
+        "<code>socks5://host:port</code>\n"
+        "<code>socks5://login:password@host:port</code>\n"
+        "<code>http://login:password@host:port</code>",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "recipients")
+async def recipients_callback(callback: CallbackQuery) -> None:
+    state = load_state(callback.from_user.id)
+
+    await callback.message.edit_text(
+        f"<b>Получатели</b>\n\nСейчас добавлено: <b>{len(state['recipients'])}</b>",
+        reply_markup=recipients_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "add_recipient")
+async def add_recipient_callback(callback: CallbackQuery) -> None:
+    user_steps[callback.from_user.id] = "add_recipients"
+
+    await callback.message.edit_text(
+        "Отправьте получателей по одному в строке.\n\n"
+        "Допустимо:\n"
+        "<code>@username</code>\n"
+        "<code>123456789</code>\n\n"
+        "Добавляйте только пользователей и чаты, согласившиеся получать сообщения.",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clear_recipients")
+async def clear_recipients_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    state = load_state(user_id)
+    old_count = len(state["recipients"])
+
+    state["recipients"] = []
+    save_state(user_id, state)
+
+    await callback.answer("Список очищен")
+    await admin_log(
+        bot,
+        f"Очистил список получателей ({old_count}):\n{user_label(callback)}",
+    )
+    await recipients_callback(callback)
+
+
+@router.callback_query(F.data == "show_recipients")
+async def show_recipients_callback(callback: CallbackQuery) -> None:
+    state = load_state(callback.from_user.id)
+    recipients = state["recipients"]
+
+    if not recipients:
+        text = "Список пуст."
+    else:
+        shown = recipients[:100]
+        text = "\n".join(
+            f"{i}. <code>{r}</code>"
+            for i, r in enumerate(shown, 1)
+        )
+
+        if len(recipients) > 100:
+            text += f"\n\nПоказаны первые 100 из {len(recipients)}."
+
+    await callback.message.edit_text(
+        f"<b>Получатели</b>\n\n{text}",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "message")
+async def message_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    state = load_state(user_id)
+    user_steps[user_id] = "set_message"
+
+    current = state["message"].strip()
+    preview = current[:800] if current else "не задано"
+
+    await callback.message.edit_text(
+        f"<b>Текущее сообщение</b>\n\n{preview}\n\n"
+        "Отправьте новый текст одним сообщением.",
+        reply_markup=back_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "toggle_dry")
+async def toggle_dry_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    state = load_state(user_id)
+
+    state["dry_run"] = not state["dry_run"]
+    save_state(user_id, state)
+
+    await callback.answer(
+        f"Тестовый режим {'включён' if state['dry_run'] else 'выключен'}"
+    )
+    await callback.message.edit_text(
+        await status_text(user_id),
+        reply_markup=main_keyboard(),
+    )
+
+    await admin_log(
+        bot,
+        f"{'Включил' if state['dry_run'] else 'Выключил'} тестовый режим:\n"
+        f"{user_label(callback)}",
+    )
+
+
+@router.callback_query(F.data == "status")
+async def status_callback(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        await status_text(callback.from_user.id),
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
+
+
+async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> None:
+    state = load_state(user_id)
+    stop_event = stop_events.setdefault(user_id, asyncio.Event())
+    stop_event.clear()
+
+    sent = 0
+    failed = 0
+    checked = 0
+
+    try:
+        client = await get_user_client(user_id)
+
+        if not await client.is_user_authorized():
+            await bot.send_message(chat_id, "Сначала войдите в Telegram-аккаунт.")
+            return
+
+        recipients = list(state["recipients"])
+        text = state["message"].strip()
+        dry_run = bool(state["dry_run"])
+
+        if not recipients:
+            await bot.send_message(chat_id, "Список получателей пуст.")
+            return
+
+        if not text:
+            await bot.send_message(chat_id, "Текст сообщения не задан.")
+            return
+
+        await bot.send_message(
+            chat_id,
+            f"Рассылка запущена.\n"
+            f"Получателей: {len(recipients)}\n"
+            f"Режим: {'тестовый' if dry_run else 'отправка'}",
+        )
+
+        await admin_log(
+            bot,
+            f"Запуск рассылки:\n{label}\n"
+            f"Получателей: <b>{len(recipients)}</b>\n"
+            f"Режим: {'тестовый' if dry_run else 'отправка'}",
+        )
+
+        for index, recipient in enumerate(recipients, start=1):
+            if stop_event.is_set():
+                await bot.send_message(chat_id, "Рассылка остановлена.")
+                await admin_log(bot, f"Рассылка остановлена пользователем:\n{label}")
+                break
+
+            try:
+                entity = await client.get_entity(recipient)
+
+                if dry_run:
+                    checked += 1
+                else:
+                    await client.send_message(entity, text, link_preview=False)
+                    sent += 1
+
+            except errors.FloodWaitError as exc:
+                wait_seconds = int(exc.seconds)
+
+                await admin_log(
+                    bot,
+                    f"FloodWait у пользователя:\n{label}\n"
+                    f"Пауза: <b>{wait_seconds}</b> сек.",
                 )
-            )
-        except Exception:
-            logger.exception("Не удалось обновить сообщение после заглушения client_id=%s", user_id)
-        await query.answer(
-            "Текущая серия напоминаний заглушена. Новый триггер запустит её снова.",
-            show_alert=True,
-        )
 
+                if wait_seconds > MAX_FLOOD_WAIT_SECONDS:
+                    await bot.send_message(
+                        chat_id,
+                        f"Рассылка остановлена: Telegram запросил паузу "
+                        f"{wait_seconds} секунд.",
+                    )
+                    break
 
-async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.business_message
-    if message is None:
-        return
+                await bot.send_message(
+                    chat_id,
+                    f"Telegram запросил паузу {wait_seconds} секунд.",
+                )
+                await asyncio.sleep(wait_seconds + 2)
 
-    is_owner_message = bool(message.from_user and message.from_user.id == OWNER_ID)
-    direction = "OUTGOING" if is_owner_message else "INCOMING"
-    attachment_name = (
-        message.effective_attachment.__class__.__name__
-        if message.effective_attachment
-        else "service message"
-    )
-    content = message.text or message.caption or f"<{attachment_name}>"
-    logger.info(
-        "BUSINESS_MESSAGE | %s | chat_id=%s | chat=%s | from_id=%s | message_id=%s | text=%r",
-        direction,
-        message.chat.id,
-        chat_name(message),
-        message.from_user.id if message.from_user else None,
-        message.message_id,
-        content,
-    )
+            except (
+                errors.UserPrivacyRestrictedError,
+                errors.ChatWriteForbiddenError,
+                errors.UsernameInvalidError,
+                errors.UsernameNotOccupiedError,
+                ValueError,
+            ):
+                failed += 1
 
-    if message.chat.type != ChatType.PRIVATE:
-        return
-
-    client_id, username, first_name = message_client_data(message)
-
-    owner_text = (message.text or message.caption or "") if is_owner_message else ""
-
-    # Запоминаем, что у клиента два залога. Флаг ставится только для уже
-    # существующего клиента, чтобы случайные чаты не попадали в базу.
-    if is_owner_message and owner_text and is_two_deposits_marker(owner_text):
-        if repo.mark_two_deposits(client_id):
-            logger.info("TWO_DEPOSITS_MARKED | client_id=%s", client_id)
-
-    # Специальное правило залога: первое напоминание на следующий день
-    # в 14:32 МСК, затем каждые 5 минут до обновления этапа.
-    if is_owner_message and owner_text:
-        two_deposits = repo.has_two_deposits(client_id)
-        deposit_trigger = None
-        if two_deposits and is_same_deposit_amount(owner_text):
-            deposit_trigger = "Два залога: сумма по залогу та же"
-        elif not two_deposits and is_deposit_for_shipping(owner_text):
-            deposit_trigger = "Залог для отправки"
-
-        if deposit_trigger:
-            due_at = next_moscow_1432(utc_now())
-            created = repo.schedule_payment_reminder(
-                client_id, username, first_name, deposit_trigger,
-                message.message_id, due_at, reminder_mode="deposit",
-                replace_existing=True,
-            )
-            if created:
-                logger.info(
-                    "DEPOSIT_REMINDER_SCHEDULED | client_id=%s | due_at=%s",
-                    client_id, dt_to_str(due_at),
+            except Exception as exc:
+                failed += 1
+                log.exception("Ошибка отправки пользователем %s", user_id)
+                await admin_log(
+                    bot,
+                    f"Ошибка отправки:\n{label}\n"
+                    f"<code>{type(exc).__name__}: {exc}</code>",
                 )
 
-    # Триггеры распределены по отправителю и срабатывают только для
-    # клиентов, уже добавленных на один из семи этапов:
-    # клиент — только PDF; владелец — только «Принято».
-    # Если клиент был скрыт, любой из этих триггеров возвращает его в активные.
-    trigger = (
-        detect_owner_payment_trigger(message)
-        if is_owner_message
-        else detect_client_payment_trigger(message)
-    )
-    if trigger:
-        delay = random.randint(
-            PAYMENT_REMINDER_MIN_SECONDS, PAYMENT_REMINDER_MAX_SECONDS
-        )
-        due_at = utc_now() + timedelta(seconds=delay)
-        created = repo.schedule_payment_reminder(
-            client_id,
-            username,
-            first_name,
-            trigger,
-            message.message_id,
-            due_at,
-        )
-        if created:
-            logger.info(
-                "PAYMENT_REMINDER_SCHEDULED | client_id=%s | trigger=%s | due_at=%s",
-                client_id,
-                trigger,
-                dt_to_str(due_at),
-            )
+            if index % 20 == 0:
+                await bot.send_message(
+                    chat_id,
+                    f"Прогресс: {index}/{len(recipients)}\n"
+                    f"Отправлено: {sent}\n"
+                    f"Проверено: {checked}\n"
+                    f"Ошибок: {failed}",
+                )
 
-    # Этапы отслеживаются только по исходящим сообщениям владельца.
-    if not is_owner_message:
+            if index < len(recipients):
+                await asyncio.sleep(
+                    random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS)
+                )
+
+        await bot.send_message(
+            chat_id,
+            f"Готово.\n"
+            f"Отправлено: {sent}\n"
+            f"Проверено: {checked}\n"
+            f"Ошибок: {failed}",
+        )
+
+        await admin_log(
+            bot,
+            f"Рассылка завершена:\n{label}\n"
+            f"Отправлено: <b>{sent}</b>\n"
+            f"Проверено: <b>{checked}</b>\n"
+            f"Ошибок: <b>{failed}</b>",
+        )
+
+    except asyncio.CancelledError:
+        await bot.send_message(chat_id, "Рассылка принудительно остановлена.")
+        await admin_log(bot, f"Рассылка отменена:\n{label}")
+        raise
+
+    except Exception as exc:
+        log.exception("Критическая ошибка рассылки пользователя %s", user_id)
+
+        await bot.send_message(
+            chat_id,
+            f"Ошибка: <code>{type(exc).__name__}: {exc}</code>",
+        )
+        await admin_log(
+            bot,
+            f"Критическая ошибка рассылки:\n{label}\n"
+            f"<code>{type(exc).__name__}: {exc}</code>",
+        )
+
+    finally:
+        broadcast_tasks.pop(user_id, None)
+        stop_event.clear()
+
+
+@router.callback_query(F.data == "start_broadcast")
+async def start_broadcast_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    task = broadcast_tasks.get(user_id)
+
+    if task is not None and not task.done():
+        await callback.answer("Рассылка уже запущена", show_alert=True)
         return
 
-    text = message.text or message.caption
+    task = asyncio.create_task(
+        run_broadcast(
+            bot,
+            user_id,
+            callback.message.chat.id,
+            user_label(callback),
+        )
+    )
+    broadcast_tasks[user_id] = task
+    await callback.answer("Запущено")
+
+
+@router.callback_query(F.data == "stop_broadcast")
+async def stop_broadcast_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    task = broadcast_tasks.get(user_id)
+
+    if task is None or task.done():
+        await callback.answer("Активной рассылки нет")
+        return
+
+    stop_events.setdefault(user_id, asyncio.Event()).set()
+    await callback.answer("Остановка запрошена")
+
+
+def parse_proxy_url(value: str) -> dict[str, Any]:
+    parsed = urlparse(value.strip())
+    proxy_type = parsed.scheme.lower()
+
+    if proxy_type not in {"socks5", "socks4", "http"}:
+        raise ValueError("Поддерживаются socks5, socks4 и http")
+
+    if not parsed.hostname or not parsed.port:
+        raise ValueError("Не найден host или port")
+
+    return {
+        "enabled": True,
+        "type": proxy_type,
+        "host": parsed.hostname,
+        "port": parsed.port,
+        "username": parsed.username or "",
+        "password": parsed.password or "",
+        "rdns": True,
+    }
+
+
+@router.message()
+async def text_input_handler(message: Message, bot: Bot) -> None:
+    user_id = message.from_user.id
+    step = user_steps.get(user_id)
+    text = (message.text or "").strip()
+
     if not text:
+        await message.answer("Нужен текст.")
         return
 
-    stage = detect_stage(text)
-    if stage is None:
-        return
-
-    new_stage, changed = repo.upsert_stage(client_id, username, first_name, stage)
-    display_name = f"@{username}" if username else first_name
-    logger.info(
-        "CLIENT_STAGE | client_id=%s | client=%s | stage=%s | stage_name=%s | changed=%s",
-        client_id,
-        display_name,
-        new_stage,
-        STAGES[new_stage],
-        changed,
-    )
-
-async def reminder_loop(application: Application) -> None:
-    while True:
+    if step == "login_phone":
         try:
-            now = utc_now()
+            client = await rebuild_user_client(user_id)
+            await client.send_code_request(text)
 
-            # Напоминания через 3/6/13 дней без любой новой ключевой фразы этапа.
-            for row, day in repo.due_stage_reminders(now):
-                try:
-                    await application.bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=(
-                            f"⏰ {day} дн. без обновления этапа\n\n"
-                            f"Клиент: {row_name(row)}\n"
-                            f"Текущий этап: {row['stage'] + 1}/7 — {STAGES[row['stage']]}\n"
-                            f"Проверьте клиента и при необходимости продолжите работу."
-                        ),
-                        reply_markup=open_client_keyboard(int(row["user_id"])),
-                    )
-                    repo.mark_stage_reminder_sent(int(row["user_id"]), day)
-                except Exception:
-                    logger.exception(
-                        "Не удалось отправить напоминание %s дней для client_id=%s",
-                        day,
-                        row["user_id"],
-                    )
+            pending_phones[user_id] = text
+            user_steps[user_id] = "login_code"
 
-            # Отложенное напоминание: PDF от клиента или «Принято» от владельца.
-            for row in repo.due_payment_reminders(now):
-                user_id = int(row["user_id"])
-                baseline_stage = int(row["baseline_stage"])
-                current_stage = int(row["stage"])
+            try:
+                await message.delete()
+            except Exception:
+                pass
 
-                # Повышение этапа — дополнительная защита. Любая ключевая фраза
-                # также удаляет напоминание сразу в upsert_stage().
-                if current_stage > baseline_stage:
-                    repo.delete_payment_reminder(user_id)
-                    continue
+            await message.answer(
+                "Код отправлен в Telegram.\n"
+                "Введите код цифрами."
+            )
 
-                try:
-                    await application.bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=(
-                            f"💳 Пора выдать новый платёж\n\n"
-                            f"Клиент: {row_name(row)}\n"
-                            f"Триггер: {row['trigger_type']}\n"
-                            f"Текущий этап: {current_stage + 1}/7 — {STAGES[current_stage]}\n\n"
-                            + (
-                                "После залога этап не обновился. Напоминание будет повторяться каждые 5 минут."
-                                if row["reminder_mode"] == "deposit"
-                                else "После триггера этап не обновился. Напоминание будет повторяться каждые 5 минут."
-                            )
-                        ),
-                        reply_markup=payment_reminder_keyboard(user_id),
-                    )
-                    repo.reschedule_payment_reminder(
-                        user_id, utc_now() + timedelta(seconds=int(row["repeat_seconds"]))
-                    )
-                except Exception:
-                    logger.exception(
-                        "Не удалось отправить платёжное напоминание client_id=%s",
-                        user_id,
-                    )
+        except Exception as exc:
+            await message.answer(
+                f"Ошибка отправки кода: <code>{type(exc).__name__}: {exc}</code>"
+            )
+            await admin_log(
+                bot,
+                f"Ошибка отправки кода:\n{user_label(message)}\n"
+                f"<code>{type(exc).__name__}: {exc}</code>",
+            )
+        return
 
-            hidden_count, deleted_count = repo.auto_cleanup()
-            if hidden_count:
-                logger.info("Автоматически скрыто клиентов: %s", hidden_count)
-            if deleted_count:
-                logger.info("Автоматически удалено клиентов: %s", deleted_count)
+    if step == "login_code":
+        phone = pending_phones.get(user_id)
 
-        except Exception:
-            logger.exception("Ошибка фоновой проверки")
+        if not phone:
+            user_steps.pop(user_id, None)
+            await message.answer("Номер телефона потерян. Начните вход заново.")
+            return
 
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+        try:
+            client = await get_user_client(user_id)
 
+            try:
+                await message.delete()
+            except Exception:
+                pass
 
-async def post_init(application: Application) -> None:
-    application.create_task(reminder_loop(application), name="reminder-loop")
-    logger.info("Бот запущен. База данных: %s", DB_PATH.resolve())
+            await client.sign_in(
+                phone=phone,
+                code=text.replace(" ", ""),
+            )
 
+            user_steps.pop(user_id, None)
+            pending_phones.pop(user_id, None)
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Ошибка при обработке update=%r", update, exc_info=context.error)
+            account_text, authorized = await account_status_text(user_id)
+            await message.answer(
+                account_text,
+                reply_markup=account_keyboard(authorized),
+            )
+            await admin_log(
+                bot,
+                f"Успешный вход в аккаунт:\n{user_label(message)}",
+            )
 
+        except errors.SessionPasswordNeededError:
+            user_steps[user_id] = "login_2fa"
+            await message.answer("Введите пароль двухэтапной аутентификации.")
 
-def main() -> None:
-    if BOT_TOKEN == "ВСТАВЬТЕ_ТОКЕН_БОТА" or not BOT_TOKEN.strip():
-        raise RuntimeError("Вставьте BOT_TOKEN в верхней части bot.py")
-    if OWNER_ID <= 0 or OWNER_ID == 123456789:
-        raise RuntimeError("Вставьте OWNER_ID в верхней части bot.py")
+        except Exception as exc:
+            await message.answer(
+                f"Ошибка входа: <code>{type(exc).__name__}: {exc}</code>"
+            )
+            await admin_log(
+                bot,
+                f"Ошибка входа:\n{user_label(message)}\n"
+                f"<code>{type(exc).__name__}: {exc}</code>",
+            )
+        return
 
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(
-        MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_message)
+    if step == "login_2fa":
+        try:
+            client = await get_user_client(user_id)
+
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            await client.sign_in(password=text)
+
+            user_steps.pop(user_id, None)
+            pending_phones.pop(user_id, None)
+
+            account_text, authorized = await account_status_text(user_id)
+            await message.answer(
+                account_text,
+                reply_markup=account_keyboard(authorized),
+            )
+            await admin_log(
+                bot,
+                f"Успешный вход с 2FA:\n{user_label(message)}",
+            )
+
+        except Exception as exc:
+            await message.answer(
+                f"Ошибка 2FA: <code>{type(exc).__name__}: {exc}</code>"
+            )
+            await admin_log(
+                bot,
+                f"Ошибка 2FA:\n{user_label(message)}\n"
+                f"<code>{type(exc).__name__}: {exc}</code>",
+            )
+        return
+
+    if step == "set_proxy":
+        try:
+            state = load_state(user_id)
+            state["proxy"] = parse_proxy_url(text)
+            save_state(user_id, state)
+
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            await rebuild_user_client(user_id)
+            user_steps.pop(user_id, None)
+
+            await message.answer(
+                "Прокси сохранён и подключён.",
+                reply_markup=main_keyboard(),
+            )
+
+            proxy = state["proxy"]
+            await admin_log(
+                bot,
+                f"Пользователь настроил прокси:\n{user_label(message)}\n"
+                f"<code>{proxy['type']}://{proxy['host']}:{proxy['port']}</code>",
+            )
+
+        except Exception as exc:
+            await message.answer(
+                f"Ошибка прокси: <code>{type(exc).__name__}: {exc}</code>"
+            )
+            await admin_log(
+                bot,
+                f"Ошибка настройки прокси:\n{user_label(message)}\n"
+                f"<code>{type(exc).__name__}: {exc}</code>",
+            )
+        return
+
+    if step == "add_recipients":
+        state = load_state(user_id)
+        values: list[str | int] = []
+
+        for line in text.splitlines():
+            value = line.strip()
+            if not value:
+                continue
+
+            if value.lstrip("-").isdigit():
+                values.append(int(value))
+            else:
+                values.append(value)
+
+        added = 0
+
+        for value in values:
+            if value not in state["recipients"]:
+                state["recipients"].append(value)
+                added += 1
+
+        save_state(user_id, state)
+        user_steps.pop(user_id, None)
+
+        await message.answer(
+            f"Добавлено: {added}\nВсего: {len(state['recipients'])}",
+            reply_markup=main_keyboard(),
+        )
+
+        await admin_log(
+            bot,
+            f"Добавил получателей:\n{user_label(message)}\n"
+            f"Новых: <b>{added}</b>\n"
+            f"Всего: <b>{len(state['recipients'])}</b>",
+        )
+        return
+
+    if step == "set_message":
+        state = load_state(user_id)
+        state["message"] = text
+        save_state(user_id, state)
+        user_steps.pop(user_id, None)
+
+        await message.answer(
+            "Текст сообщения сохранён.",
+            reply_markup=main_keyboard(),
+        )
+
+        await admin_log(
+            bot,
+            f"Изменил текст рассылки:\n{user_label(message)}\n"
+            f"Длина: <b>{len(text)}</b> символов",
+        )
+        return
+
+    await message.answer(
+        "Используйте кнопки меню.",
+        reply_markup=main_keyboard(),
     )
-    application.add_error_handler(error_handler)
 
-    application.run_polling(
-        allowed_updates=[
-            UpdateType.MESSAGE,
-            UpdateType.BUSINESS_MESSAGE,
-            UpdateType.CALLBACK_QUERY,
-            UpdateType.BUSINESS_CONNECTION,
-        ],
-        drop_pending_updates=False,
-    )
+
+async def main() -> None:
+    if BOT_TOKEN == "ВСТАВЬТЕ_ТОКЕН_БОТА" or not BOT_TOKEN:
+        raise RuntimeError("Заполните BOT_TOKEN в начале main.py")
+
+    if ADMIN_ID <= 0:
+        raise RuntimeError("Заполните ADMIN_ID в начале main.py")
+
+    if API_ID <= 0 or API_HASH == "ВСТАВЬТЕ_API_HASH":
+        raise RuntimeError("Заполните API_ID и API_HASH в начале main.py")
+
+    if MIN_DELAY_SECONDS < 1 or MAX_DELAY_SECONDS < MIN_DELAY_SECONDS:
+        raise RuntimeError("Проверьте задержки рассылки")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    bot = Bot(BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    try:
+        await admin_log(bot, "Бот запущен.")
+        await dp.start_polling(bot)
+
+    finally:
+        for task in list(broadcast_tasks.values()):
+            if not task.done():
+                task.cancel()
+
+        for client in list(user_clients.values()):
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
