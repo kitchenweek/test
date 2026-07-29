@@ -44,6 +44,13 @@ MAX_DELAY_SECONDS = 420
 MAX_FLOOD_WAIT_SECONDS = 900
 MAX_TEXT_TEMPLATES = 5
 MAX_GROUP_TEMPLATES = 100
+MAX_TEMPLATE_SENDS = 100
+
+TEMPLATE_REQUIRED_PHRASES = [
+    "@WorldOfPoizon",
+    "18.06",
+    "Egor Sobolev",
+]
 
 DATA_DIR = Path("users_data")
 
@@ -180,6 +187,9 @@ def default_state() -> dict[str, Any]:
         "recipients": [],
         "bound_groups": [],
         "group_templates": [],
+        "template_usage": {},
+        "last_template_key": None,
+        "template_filter_version": 1,
     }
 
 
@@ -198,6 +208,17 @@ def load_state(user_id: int) -> dict[str, Any]:
 
     state = default_state()
     state.update(loaded)
+
+    # В старых версиях сохранялись все сообщения группы. Их нельзя
+    # надёжно проверить без повторного чтения Telegram, поэтому при
+    # первом запуске новой версии старая база очищается.
+    if int(loaded.get("template_filter_version", 0)) < 1:
+        state["group_templates"] = []
+        state["template_usage"] = {}
+        state["last_template_key"] = None
+        state["template_filter_version"] = 1
+        save_state(user_id, state)
+
     return state
 
 
@@ -507,31 +528,81 @@ async def resolve_dialog_entity(client: TelegramClient, chat_id: int) -> Any:
         )
 
 
-async def send_group_templates(
+class TemplatePoolEmptyError(Exception):
+    """Нет доступного шаблона для следующей отправки."""
+
+
+def make_template_key(chat_id: int, message_id: int) -> str:
+    return f"{int(chat_id)}:{int(message_id)}"
+
+
+def get_template_message_text(message: Message) -> str:
+    """Возвращает текст сообщения или подпись к медиафайлу."""
+    return (message.text or message.caption or "").strip()
+
+
+def contains_required_template_phrase(message: Message) -> bool:
+    """Проверяет наличие хотя бы одной разрешённой фразы."""
+    content = get_template_message_text(message).casefold()
+    if not content:
+        return False
+    return any(phrase.casefold() in content for phrase in TEMPLATE_REQUIRED_PHRASES)
+
+
+def choose_random_template(state: dict[str, Any]) -> dict[str, int]:
+    """
+    Выбирает один случайный шаблон.
+
+    Один шаблон нельзя отправлять два раза подряд и нельзя
+    использовать более MAX_TEMPLATE_SENDS раз.
+    """
+    usage = state.setdefault("template_usage", {})
+    last_key = state.get("last_template_key")
+    available: list[dict[str, int]] = []
+
+    for template in state.get("group_templates", []):
+        key = make_template_key(template["chat_id"], template["message_id"])
+        if int(usage.get(key, 0)) >= MAX_TEMPLATE_SENDS:
+            continue
+        if key == last_key:
+            continue
+        available.append(template)
+
+    if not available:
+        raise TemplatePoolEmptyError
+
+    return random.choice(available)
+
+
+async def send_random_group_template(
     client: TelegramClient,
     recipient_entity: Any,
-    templates: list[dict[str, int]],
-) -> tuple[int, int]:
-    sent = 0
-    failed = 0
-    for template in templates:
-        source_chat = int(template["chat_id"])
-        message_id = int(template["message_id"])
-        try:
-            source_entity = await resolve_dialog_entity(client, source_chat)
-            forwarded = await client.forward_messages(
-                recipient_entity,
-                message_id,
-                from_peer=source_entity,
-            )
-            if forwarded:
-                sent += 1
-            else:
-                failed += 1
-        except Exception:
-            failed += 1
-            log.exception("Не удалось переслать шаблон %s/%s", source_chat, message_id)
-    return sent, failed
+    state: dict[str, Any],
+) -> dict[str, int]:
+    """
+    Пересылает один случайный шаблон как оригинальное сообщение.
+
+    За счёт forward_messages сохраняются форматирование, ссылки,
+    спойлеры, цитаты, медиафайлы и custom/premium emoji.
+    """
+    template = choose_random_template(state)
+    source_chat = int(template["chat_id"])
+    message_id = int(template["message_id"])
+    source_entity = await resolve_dialog_entity(client, source_chat)
+
+    forwarded = await client.forward_messages(
+        recipient_entity,
+        message_id,
+        from_peer=source_entity,
+    )
+    if not forwarded:
+        raise RuntimeError("Telegram не вернул пересланное сообщение")
+
+    key = make_template_key(source_chat, message_id)
+    usage = state.setdefault("template_usage", {})
+    usage[key] = int(usage.get(key, 0)) + 1
+    state["last_template_key"] = key
+    return template
 
 
 async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> None:
@@ -584,19 +655,43 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> Non
                 if stop_event.is_set():
                     break
 
-                forwarded_count, forward_errors = await send_group_templates(
-                    client, entity, state["group_templates"]
-                )
-                if state["group_templates"] and forwarded_count == 0:
-                    raise RuntimeError(
-                        "Не удалось переслать ни одного группового шаблона. "
-                        "Проверьте, что подключённый аккаунт состоит в привязанной группе."
-                    )
-                if forward_errors:
-                    log.warning(
-                        "Не переслано шаблонов: %s для получателя %s",
-                        forward_errors, recipient,
-                    )
+                if state["group_templates"]:
+                    try:
+                        selected_template = await send_random_group_template(
+                            client,
+                            entity,
+                            state,
+                        )
+                        save_state(user_id, state)
+                        selected_key = make_template_key(
+                            selected_template["chat_id"],
+                            selected_template["message_id"],
+                        )
+                        log.info(
+                            "Отправлен шаблон %s (%s/%s)",
+                            selected_key,
+                            state["template_usage"].get(selected_key, 0),
+                            MAX_TEMPLATE_SENDS,
+                        )
+                    except TemplatePoolEmptyError:
+                        stop_event.set()
+                        await bot.send_message(
+                            chat_id,
+                            "⚠️ <b>Шаблоны закончились</b>\n\n"
+                            "Нет доступного шаблона для следующей отправки. "
+                            "Каждый шаблон можно использовать не более 100 раз, "
+                            "а один и тот же шаблон нельзя отправлять два раза подряд.\n\n"
+                            "Пополните базу шаблонов в привязанной группе.",
+                            reply_markup=main_keyboard(),
+                        )
+                        await admin_log(
+                            bot,
+                            "⚠️ <b>Шаблоны закончились</b>\n\n"
+                            f"Пользователь:\n{label}\n\n"
+                            "Рассылка остановлена. Пополните базу шаблонов.",
+                        )
+                        break
+
                 sent_recipients += 1
 
             except errors.FloodWaitError as exc:
@@ -763,18 +858,54 @@ async def bind_group_handler(message: Message, bot: Bot) -> None:
 
 
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def capture_group_template(message: Message) -> None:
+async def capture_group_template(message: Message, bot: Bot) -> None:
     if message.text and message.text.startswith("/bind"):
         return
 
-    for owner_id in owners_for_group(message.chat.id):
-        state = load_state(owner_id)
-        ref = {"chat_id": message.chat.id, "message_id": message.message_id}
+    owners = owners_for_group(message.chat.id)
+    if not owners:
+        return
 
-        if ref not in state["group_templates"]:
-            state["group_templates"].append(ref)
-            state["group_templates"] = state["group_templates"][-MAX_GROUP_TEMPLATES:]
-            save_state(owner_id, state)
+    # В базу заносятся только сообщения с одной из обязательных фраз.
+    if not contains_required_template_phrase(message):
+        return
+
+    for owner_id in owners:
+        state = load_state(owner_id)
+        ref = {
+            "chat_id": message.chat.id,
+            "message_id": message.message_id,
+        }
+
+        if ref in state["group_templates"]:
+            continue
+
+        state["group_templates"].append(ref)
+        state["group_templates"] = state["group_templates"][-MAX_GROUP_TEMPLATES:]
+
+        # Удаляем счётчики шаблонов, которые выпали из базы из-за лимита.
+        valid_keys = {
+            make_template_key(item["chat_id"], item["message_id"])
+            for item in state["group_templates"]
+        }
+        state["template_usage"] = {
+            key: int(value)
+            for key, value in state.setdefault("template_usage", {}).items()
+            if key in valid_keys
+        }
+
+        key = make_template_key(message.chat.id, message.message_id)
+        state["template_usage"].setdefault(key, 0)
+        save_state(owner_id, state)
+
+        try:
+            await bot.send_message(
+                owner_id,
+                "✅ <b>Шаблон добавлен</b>\n\n"
+                f"Всего шаблонов: <b>{len(state['group_templates'])}</b>",
+            )
+        except Exception:
+            log.exception("Не удалось уведомить владельца %s", owner_id)
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)
@@ -1128,12 +1259,32 @@ async def clear_recipients_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "group_templates")
 async def group_templates_callback(callback: CallbackQuery) -> None:
     state = load_state(callback.from_user.id)
-    groups = "\n".join(f"• <code>{group_id}</code>" for group_id in state["bound_groups"]) or "Нет привязанных групп."
+    groups = "\n".join(
+        f"• <code>{group_id}</code>"
+        for group_id in state["bound_groups"]
+    ) or "Нет привязанных групп."
+
+    usage = state.setdefault("template_usage", {})
+    total_sends = sum(int(value) for value in usage.values())
+    exhausted = 0
+    for template in state["group_templates"]:
+        key = make_template_key(template["chat_id"], template["message_id"])
+        if int(usage.get(key, 0)) >= MAX_TEMPLATE_SENDS:
+            exhausted += 1
 
     await callback.message.edit_text(
         f"<b>Шаблоны из групп</b>\n\n"
         f"Привязанные группы:\n{groups}\n\n"
-        f"Сохранено сообщений: <b>{len(state['group_templates'])}</b>",
+        f"Сохранено шаблонов: <b>{len(state['group_templates'])}</b>\n"
+        f"Всего отправок шаблонов: <b>{total_sends}</b>\n"
+        f"Исчерпали лимит: <b>{exhausted}</b>\n\n"
+        "В базу попадают только сообщения, содержащие хотя бы одну фразу:\n"
+        "• <code>@WorldOfPoizon</code>\n"
+        "• <code>18.06</code>\n"
+        "• <code>Egor Sobolev</code>\n\n"
+        "Каждому получателю пересылается один случайный шаблон. "
+        "Он не повторяется два раза подряд и может быть использован "
+        f"не более {MAX_TEMPLATE_SENDS} раз.",
         reply_markup=group_templates_keyboard(),
     )
     await callback.answer()
@@ -1143,6 +1294,8 @@ async def group_templates_callback(callback: CallbackQuery) -> None:
 async def clear_group_templates_callback(callback: CallbackQuery) -> None:
     state = load_state(callback.from_user.id)
     state["group_templates"] = []
+    state["template_usage"] = {}
+    state["last_template_key"] = None
     save_state(callback.from_user.id, state)
     await callback.answer("Шаблоны очищены")
     await group_templates_callback(callback)
