@@ -7,6 +7,7 @@ import logging
 import random
 import time
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -31,11 +32,11 @@ from telethon.network.connection import ConnectionTcpMTProxyAbridged
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = "ВСТАВЬ_НОВЫЙ_BOT_TOKEN"
+BOT_TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
 ADMIN_ID = 2010296191
 
 API_ID = 32200104
-API_HASH = "ВСТАВЬ_API_HASH"
+API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
 
 MIN_DELAY_SECONDS = 180
 MAX_DELAY_SECONDS = 420
@@ -59,6 +60,7 @@ router = Router()
 user_steps: dict[int, str] = {}
 pending_phones: dict[int, str] = {}
 pending_proxy: dict[int, dict[str, Any]] = {}
+pending_proxy_protocols: dict[int, str] = {}
 qr_tasks: dict[int, asyncio.Task] = {}
 
 user_clients: dict[int, TelegramClient] = {}
@@ -296,46 +298,106 @@ def group_templates_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def parse_proxy(value: str) -> dict[str, Any]:
+def proxy_protocol_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="SOCKS5", callback_data="proxy_protocol:socks5"),
+                InlineKeyboardButton(text="SOCKS4", callback_data="proxy_protocol:socks4"),
+            ],
+            [
+                InlineKeyboardButton(text="HTTP", callback_data="proxy_protocol:http"),
+                InlineKeyboardButton(text="MTProto", callback_data="proxy_protocol:mtproto"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="account")],
+        ]
+    )
+
+
+def parse_proxy(value: str, protocol: str | None = None) -> dict[str, Any]:
+    """
+    Поддерживает удобный формат:
+      SOCKS/HTTP: IP:PORT:LOGIN:PASSWORD
+      MTProto:    IP:PORT:SECRET
+
+    Старые URL-форматы тоже продолжают работать.
+    """
     value = value.strip()
 
-    if value.lower().startswith("tg://proxy"):
+    # Старые URL-форматы.
+    if "://" in value:
+        if value.lower().startswith("tg://proxy"):
+            parsed = urlparse(value)
+            query = parse_qs(parsed.query)
+            host = (query.get("server") or [""])[0]
+            port = int((query.get("port") or ["0"])[0])
+            secret = (query.get("secret") or [""])[0]
+            if not host or not port or not secret:
+                raise ValueError("В MTProto-ссылке нужны server, port и secret")
+            return {"type": "mtproto", "host": host, "port": port, "secret": secret}
+
         parsed = urlparse(value)
-        query = parse_qs(parsed.query)
-        host = (query.get("server") or [""])[0]
-        port = int((query.get("port") or ["0"])[0])
-        secret = (query.get("secret") or [""])[0]
-        if not host or not port or not secret:
-            raise ValueError("В MTProto-ссылке нужны server, port и secret")
-        return {"type": "mtproto", "host": host, "port": port, "secret": secret}
+        scheme = parsed.scheme.lower()
+        if scheme in {"socks5", "socks4", "http"}:
+            if not parsed.hostname or not parsed.port:
+                raise ValueError("Не найдены IP или порт прокси")
+            return {
+                "type": scheme,
+                "host": parsed.hostname,
+                "port": parsed.port,
+                "username": parsed.username or "",
+                "password": parsed.password or "",
+                "rdns": True,
+            }
+        if scheme == "mtproto":
+            if not parsed.hostname or not parsed.port:
+                raise ValueError("Не найдены IP или порт MTProto-прокси")
+            secret = parsed.username or parsed.path.lstrip("/")
+            if not secret:
+                raise ValueError("Не найден secret MTProto-прокси")
+            return {"type": "mtproto", "host": parsed.hostname, "port": parsed.port, "secret": secret}
 
-    parsed = urlparse(value)
-    scheme = parsed.scheme.lower()
+    if not protocol:
+        raise ValueError("Сначала выберите протокол прокси")
 
-    if scheme in {"socks5", "socks4", "http"}:
-        if not parsed.hostname or not parsed.port:
-            raise ValueError("Не найдены адрес или порт прокси")
+    parts = value.split(":")
+    protocol = protocol.lower()
+
+    if protocol in {"socks5", "socks4", "http"}:
+        if len(parts) not in {2, 4}:
+            raise ValueError("Формат: IP:ПОРТ:ЛОГИН:ПАРОЛЬ")
+        host = parts[0].strip()
+        try:
+            port = int(parts[1].strip())
+        except ValueError as exc:
+            raise ValueError("Порт должен быть числом") from exc
+        username = parts[2].strip() if len(parts) == 4 else ""
+        password = parts[3].strip() if len(parts) == 4 else ""
+        if not host or not (1 <= port <= 65535):
+            raise ValueError("Проверьте IP и порт")
         return {
-            "type": scheme,
-            "host": parsed.hostname,
-            "port": parsed.port,
-            "username": parsed.username or "",
-            "password": parsed.password or "",
+            "type": protocol,
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
             "rdns": True,
         }
 
-    if scheme == "mtproto":
-        if not parsed.hostname or not parsed.port:
-            raise ValueError("Не найдены адрес или порт MTProto-прокси")
-        secret = parsed.username or parsed.path.lstrip("/")
-        if not secret:
-            raise ValueError(
-                "Используйте mtproto://SECRET@HOST:PORT или "
-                "tg://proxy?server=...&port=...&secret=..."
-            )
-        return {"type": "mtproto", "host": parsed.hostname, "port": parsed.port, "secret": secret}
+    if protocol == "mtproto":
+        if len(parts) != 3:
+            raise ValueError("Формат MTProto: IP:ПОРТ:SECRET")
+        host = parts[0].strip()
+        try:
+            port = int(parts[1].strip())
+        except ValueError as exc:
+            raise ValueError("Порт должен быть числом") from exc
+        secret = parts[2].strip()
+        if not host or not secret or not (1 <= port <= 65535):
+            raise ValueError("Проверьте IP, порт и secret")
+        return {"type": "mtproto", "host": host, "port": port, "secret": secret}
 
-    raise ValueError("Поддерживаются SOCKS5, SOCKS4, HTTP и MTProto")
+    raise ValueError("Неизвестный протокол прокси")
 
 
 def client_options(user_id: int) -> dict[str, Any]:
@@ -431,18 +493,45 @@ async def full_status(user_id: int) -> str:
     )
 
 
-async def send_group_templates(client: TelegramClient, recipient_entity: Any, templates: list[dict[str, int]]) -> int:
+async def resolve_dialog_entity(client: TelegramClient, chat_id: int) -> Any:
+    """Находит группу/канал среди диалогов пользовательского аккаунта."""
+    try:
+        return await client.get_entity(chat_id)
+    except Exception:
+        async for dialog in client.iter_dialogs():
+            if int(dialog.id) == int(chat_id):
+                return dialog.entity
+        raise ValueError(
+            f"Группа {chat_id} не найдена в диалогах аккаунта. "
+            "Убедитесь, что подключённый аккаунт состоит в этой группе."
+        )
+
+
+async def send_group_templates(
+    client: TelegramClient,
+    recipient_entity: Any,
+    templates: list[dict[str, int]],
+) -> tuple[int, int]:
     sent = 0
+    failed = 0
     for template in templates:
         source_chat = int(template["chat_id"])
         message_id = int(template["message_id"])
         try:
-            source_entity = await client.get_entity(source_chat)
-            await client.forward_messages(recipient_entity, message_id, from_peer=source_entity)
-            sent += 1
+            source_entity = await resolve_dialog_entity(client, source_chat)
+            forwarded = await client.forward_messages(
+                recipient_entity,
+                message_id,
+                from_peer=source_entity,
+            )
+            if forwarded:
+                sent += 1
+            else:
+                failed += 1
         except Exception:
+            failed += 1
             log.exception("Не удалось переслать шаблон %s/%s", source_chat, message_id)
-    return sent
+    return sent, failed
 
 
 async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> None:
@@ -495,7 +584,19 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> Non
                 if stop_event.is_set():
                     break
 
-                await send_group_templates(client, entity, state["group_templates"])
+                forwarded_count, forward_errors = await send_group_templates(
+                    client, entity, state["group_templates"]
+                )
+                if state["group_templates"] and forwarded_count == 0:
+                    raise RuntimeError(
+                        "Не удалось переслать ни одного группового шаблона. "
+                        "Проверьте, что подключённый аккаунт состоит в привязанной группе."
+                    )
+                if forward_errors:
+                    log.warning(
+                        "Не переслано шаблонов: %s для получателя %s",
+                        forward_errors, recipient,
+                    )
                 sent_recipients += 1
 
             except errors.FloodWaitError as exc:
@@ -693,7 +794,8 @@ async def private_input_handler(message: Message, bot: Bot) -> None:
 
     if step == "await_proxy":
         try:
-            proxy = parse_proxy(text)
+            protocol = pending_proxy_protocols.get(user_id)
+            proxy = parse_proxy(text, protocol)
             state = load_state(user_id)
             state["proxy"] = proxy
             save_state(user_id, state)
@@ -702,9 +804,11 @@ async def private_input_handler(message: Message, bot: Bot) -> None:
             client = await rebuild_client(user_id)
             if await client.is_user_authorized():
                 user_steps.pop(user_id, None)
+                pending_proxy_protocols.pop(user_id, None)
                 await message.answer("Прокси подключён. Аккаунт уже авторизован.", reply_markup=main_keyboard())
             else:
                 user_steps.pop(user_id, None)
+                pending_proxy_protocols.pop(user_id, None)
                 await message.answer("✅ Прокси подключён. Выберите способ входа:", reply_markup=login_method_keyboard())
         except Exception as exc:
             await message.answer(f"Прокси не подключён:\n<code>{html.escape(str(exc))}</code>")
@@ -843,13 +947,33 @@ async def account_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "begin_proxy")
 async def begin_proxy_callback(callback: CallbackQuery) -> None:
-    user_steps[callback.from_user.id] = "await_proxy"
+    user_steps.pop(callback.from_user.id, None)
+    pending_proxy_protocols.pop(callback.from_user.id, None)
     await callback.message.edit_text(
-        "<b>Введите прокси</b>\n\n"
-        "<code>socks5://login:password@host:port</code>\n"
-        "<code>socks4://host:port</code>\n"
-        "<code>http://login:password@host:port</code>\n"
-        "<code>mtproto://SECRET@host:port</code>",
+        "<b>Выберите протокол прокси:</b>",
+        reply_markup=proxy_protocol_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("proxy_protocol:"))
+async def proxy_protocol_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    protocol = callback.data.split(":", 1)[1].lower()
+    pending_proxy_protocols[user_id] = protocol
+    user_steps[user_id] = "await_proxy"
+
+    if protocol == "mtproto":
+        example = "196.19.123.231:443:SECRET"
+        format_text = "IP:ПОРТ:SECRET"
+    else:
+        example = "196.19.123.231:8000:xm4Wj1:D2mF2K"
+        format_text = "IP:ПОРТ:ЛОГИН:ПАРОЛЬ"
+
+    await callback.message.edit_text(
+        f"<b>Введите {protocol.upper()}-прокси</b>\n\n"
+        f"Формат: <code>{format_text}</code>\n"
+        f"Пример: <code>{html.escape(example)}</code>",
         reply_markup=back_keyboard(),
     )
     await callback.answer()
