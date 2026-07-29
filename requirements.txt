@@ -1,3 +1,4 @@
 aiogram>=3.7,<4.0
-Telethon==1.40.0
-python-socks[asyncio]==2.7.1
+Telethon>=1.36,<2.0
+qrcode[pil]>=7.4
+python-socks[asyncio]>=2.5
