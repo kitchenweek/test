@@ -24,7 +24,6 @@ from aiogram.types import (
 from telethon import TelegramClient, errors
 from telethon.network.connection import ConnectionTcpMTProxyAbridged
 
-
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
@@ -47,7 +46,6 @@ DATA_DIR = Path("users_data")
 
 # ============================================================
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -64,7 +62,6 @@ qr_tasks: dict[int, asyncio.Task] = {}
 user_clients: dict[int, TelegramClient] = {}
 broadcast_tasks: dict[int, asyncio.Task] = {}
 stop_events: dict[int, asyncio.Event] = {}
-
 
 # ============================================================
 # СПАМБОТ ТРЕКЕР
@@ -114,7 +111,6 @@ SPAM_BLOCK_PHRASES = [
     "restricted from posting",
 ]
 
-
 def is_spam_block_message(text: str) -> bool:
     """Проверяет, является ли сообщение уведомлением о спам-блоке"""
     if not text:
@@ -136,7 +132,6 @@ def is_spam_block_message(text: str) -> bool:
     ])
     
     return has_restriction and has_sending
-
 
 async def handle_spam_block(user_id: int, bot: Bot, message: Message) -> None:
     """Обрабатывает уведомление о спам-блоке от Telegram"""
@@ -196,7 +191,6 @@ async def handle_spam_block(user_id: int, bot: Bot, message: Message) -> None:
             f"3. Повторите через 1-2 минуты"
         )
 
-
 # ============================================================
 # ТРАНСЛИТЕРАЦИЯ
 # ============================================================
@@ -230,7 +224,6 @@ def apply_transliteration(text: str) -> str:
     
     return ''.join(result)
 
-
 # ============================================================
 # СКОРОСТЬ ПЕЧАТИ
 # ============================================================
@@ -243,7 +236,6 @@ async def typing_speed_simulate(client, entity, text: str) -> None:
     delay = 0.09 * len(text)
     await asyncio.sleep(delay)
 
-
 # ============================================================
 # ОСНОВНЫЕ ФУНКЦИИ
 # ============================================================
@@ -253,14 +245,11 @@ def user_dir(user_id: int) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
-
 def state_path(user_id: int) -> Path:
     return user_dir(user_id) / "state.json"
 
-
 def session_path(user_id: int) -> str:
     return str(user_dir(user_id) / "telegram_user_session")
-
 
 def default_state() -> dict[str, Any]:
     return {
@@ -270,7 +259,6 @@ def default_state() -> dict[str, Any]:
         "bound_groups": [],
         "group_templates": [],
     }
-
 
 def load_state(user_id: int) -> dict[str, Any]:
     path = state_path(user_id)
@@ -289,13 +277,11 @@ def load_state(user_id: int) -> dict[str, Any]:
     state.update(loaded)
     return state
 
-
 def save_state(user_id: int, state: dict[str, Any]) -> None:
     state_path(user_id).write_text(
         json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
 
 def event_user_label(event: Message | CallbackQuery) -> str:
     user = event.from_user
@@ -304,13 +290,11 @@ def event_user_label(event: Message | CallbackQuery) -> str:
     username = f"@{user.username}" if user.username else "без username"
     return f"{html.escape(user.full_name)} | {username} | <code>{user.id}</code>"
 
-
 async def admin_log(bot: Bot, text: str) -> None:
     try:
         await bot.send_message(ADMIN_ID, f"<b>Лог</b>\n{text}")
     except Exception:
         log.exception("Не удалось отправить лог администратору")
-
 
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -331,12 +315,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-
 def back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]]
     )
-
 
 def login_method_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -349,7 +331,6 @@ def login_method_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-
 def messages_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -359,6 +340,14 @@ def messages_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
+def add_message_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для процесса добавления сообщения"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Завершить и сохранить", callback_data="finish_messages")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="cancel_messages")],
+        ]
+    )
 
 def recipients_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -369,7 +358,6 @@ def recipients_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-
 def group_templates_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -377,7 +365,6 @@ def group_templates_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
         ]
     )
-
 
 def parse_proxy(value: str) -> dict[str, Any]:
     value = value.strip()
@@ -430,7 +417,6 @@ def parse_proxy(value: str) -> dict[str, Any]:
 
     raise ValueError("Поддерживаются SOCKS5, SOCKS4, HTTP и MTProto")
 
-
 def client_options(user_id: int) -> dict[str, Any]:
     state = load_state(user_id)
     proxy = state.get("proxy")
@@ -464,7 +450,6 @@ def client_options(user_id: int) -> dict[str, Any]:
 
     return common
 
-
 async def rebuild_client(user_id: int) -> TelegramClient:
     old = user_clients.pop(user_id, None)
     if old:
@@ -483,7 +468,6 @@ async def rebuild_client(user_id: int) -> TelegramClient:
     user_clients[user_id] = client
     return client
 
-
 async def get_client(user_id: int) -> TelegramClient:
     client = user_clients.get(user_id)
     if client is None:
@@ -491,7 +475,6 @@ async def get_client(user_id: int) -> TelegramClient:
     if not client.is_connected():
         await client.connect()
     return client
-
 
 async def account_summary(user_id: int) -> tuple[str, bool]:
     state = load_state(user_id)
@@ -514,7 +497,6 @@ async def account_summary(user_id: int) -> tuple[str, bool]:
     except Exception as exc:
         return f"Ошибка подключения: <code>{html.escape(str(exc))}</code>", False
 
-
 async def full_status(user_id: int) -> str:
     state = load_state(user_id)
     account, _ = await account_summary(user_id)
@@ -534,7 +516,6 @@ async def full_status(user_id: int) -> str:
         f"Шаблонов группы: <b>{len(state['group_templates'])}</b>\n"
         f"Рассылка: <b>{'идёт' if running else 'остановлена'}</b>"
     )
-
 
 async def send_group_templates(
     client: TelegramClient,
@@ -560,7 +541,6 @@ async def send_group_templates(
                 message_id,
             )
     return sent
-
 
 async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> None:
     state = load_state(user_id)
@@ -694,7 +674,6 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> Non
         broadcast_tasks.pop(user_id, None)
         stop_event.clear()
 
-
 async def perform_qr_login(bot: Bot, chat_id: int, user_id: int) -> None:
     try:
         client = await rebuild_client(user_id)
@@ -767,7 +746,6 @@ async def perform_qr_login(bot: Bot, chat_id: int, user_id: int) -> None:
     finally:
         qr_tasks.pop(user_id, None)
 
-
 def owners_for_group(group_id: int) -> list[int]:
     owners: list[int] = []
     if not DATA_DIR.exists():
@@ -781,7 +759,6 @@ def owners_for_group(group_id: int) -> list[int]:
         if group_id in state["bound_groups"]:
             owners.append(owner_id)
     return owners
-
 
 # ============================================================
 # ХЕНДЛЕРЫ
@@ -797,12 +774,10 @@ async def start_handler(message: Message, bot: Bot) -> None:
     )
     await admin_log(bot, f"Запустил бота:\n{event_user_label(message)}")
 
-
 @router.message(Command("menu"))
 async def menu_command(message: Message) -> None:
     user_steps.pop(message.from_user.id, None)
     await message.answer("Главное меню:", reply_markup=main_keyboard())
-
 
 @router.message(Command("bind"))
 async def bind_group_handler(message: Message, bot: Bot) -> None:
@@ -827,7 +802,6 @@ async def bind_group_handler(message: Message, bot: Bot) -> None:
         f"{event_user_label(message)}",
     )
 
-
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def capture_group_template(message: Message) -> None:
     if message.text and message.text.startswith("/bind"):
@@ -841,7 +815,6 @@ async def capture_group_template(message: Message) -> None:
             state["group_templates"].append(ref)
             state["group_templates"] = state["group_templates"][-MAX_GROUP_TEMPLATES:]
             save_state(owner_id, state)
-
 
 @router.message(F.chat.type == ChatType.PRIVATE)
 async def private_input_handler(message: Message, bot: Bot) -> None:
@@ -962,26 +935,36 @@ async def private_input_handler(message: Message, bot: Bot) -> None:
         if not text:
             await message.answer("Текст не может быть пустым.")
             return
+        
         state = load_state(user_id)
         if len(state["messages"]) >= MAX_TEXT_TEMPLATES:
-            user_steps.pop(user_id, None)
-            await message.answer("Уже добавлено максимум 5 сообщений.")
+            await message.answer(
+                f"❌ Достигнут лимит: максимум {MAX_TEXT_TEMPLATES} сообщений.\n"
+                "Нажмите 'Завершить' чтобы сохранить."
+            )
             return
+        
+        # Сохраняем сообщение
         state["messages"].append(text)
         save_state(user_id, state)
-        user_steps.pop(user_id, None)
+        
+        # Показываем превью добавленного сообщения
+        preview = text[:200] + "..." if len(text) > 200 else text
+        
         await message.answer(
-            f"Сообщение добавлено: {len(state['messages'])}/{MAX_TEXT_TEMPLATES}",
-            reply_markup=main_keyboard(),
+            f"✅ Сообщение добавлено!\n\n"
+            f"📝 <b>Текст:</b>\n{html.escape(preview)}\n\n"
+            f"<b>Всего добавлено: {len(state['messages'])}/{MAX_TEXT_TEMPLATES}</b>\n\n"
+            f"Отправьте следующее сообщение или нажмите 'Завершить'.",
+            reply_markup=add_message_keyboard()
         )
+        
         await admin_log(
             bot,
-            f"Добавил основное сообщение:\n{event_user_label(message)}\n"
-            f"Всего: <b>{len(state['messages'])}</b>",
+            f"Добавил сообщение:\n{event_user_label(message)}\n"
+            f"Всего: <b>{len(state['messages'])}</b>"
         )
-        return
-
-    if step == "await_recipients":
+        return    if step == "await_recipients":
         state = load_state(user_id)
         added = 0
         for line in text.splitlines():
@@ -996,7 +979,8 @@ async def private_input_handler(message: Message, bot: Bot) -> None:
         save_state(user_id, state)
         user_steps.pop(user_id, None)
         await message.answer(
-            f"Добавлено: {added}\nВсего: {len(state['recipients'])}",
+            f"✅ Добавлено: {added}\n"
+            f"Всего получателей: {len(state['recipients'])}",
             reply_markup=main_keyboard(),
         )
         await admin_log(
@@ -1004,7 +988,7 @@ async def private_input_handler(message: Message, bot: Bot) -> None:
             f"Добавил получателей:\n{event_user_label(message)}\n"
             f"Новых: <b>{added}</b>",
         )
-
+        return
 
 # ============================================================
 # CALLBACK ХЕНДЛЕРЫ
@@ -1018,7 +1002,6 @@ async def menu_callback(callback: CallbackQuery) -> None:
         reply_markup=main_keyboard(),
     )
     await callback.answer()
-
 
 @router.callback_query(F.data == "account")
 async def account_callback(callback: CallbackQuery) -> None:
@@ -1050,7 +1033,6 @@ async def account_callback(callback: CallbackQuery) -> None:
         )
     await callback.answer()
 
-
 @router.callback_query(F.data == "begin_proxy")
 async def begin_proxy_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_proxy"
@@ -1066,7 +1048,6 @@ async def begin_proxy_callback(callback: CallbackQuery) -> None:
     )
     await callback.answer()
 
-
 @router.callback_query(F.data == "login_phone")
 async def login_phone_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_phone"
@@ -1076,7 +1057,6 @@ async def login_phone_callback(callback: CallbackQuery) -> None:
         reply_markup=back_keyboard(),
     )
     await callback.answer()
-
 
 @router.callback_query(F.data == "login_qr")
 async def login_qr_callback(callback: CallbackQuery, bot: Bot) -> None:
@@ -1090,7 +1070,6 @@ async def login_qr_callback(callback: CallbackQuery, bot: Bot) -> None:
         perform_qr_login(bot, callback.message.chat.id, user_id)
     )
     await callback.answer("Создаю QR-код")
-
 
 @router.callback_query(F.data == "logout")
 async def logout_callback(callback: CallbackQuery, bot: Bot) -> None:
@@ -1108,7 +1087,6 @@ async def logout_callback(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer(str(exc), show_alert=True)
         return
     await callback.answer()
-
 
 @router.callback_query(F.data == "messages")
 async def messages_callback(callback: CallbackQuery) -> None:
@@ -1128,21 +1106,52 @@ async def messages_callback(callback: CallbackQuery) -> None:
     )
     await callback.answer()
 
-
 @router.callback_query(F.data == "add_message")
 async def add_message_callback(callback: CallbackQuery) -> None:
     state = load_state(callback.from_user.id)
     if len(state["messages"]) >= MAX_TEXT_TEMPLATES:
-        await callback.answer("Можно добавить максимум 5 сообщений", show_alert=True)
+        await callback.answer(f"Можно добавить максимум {MAX_TEXT_TEMPLATES} сообщений", show_alert=True)
         return
 
+    # Устанавливаем шаг и показываем приглашение
     user_steps[callback.from_user.id] = "await_message"
+    
     await callback.message.edit_text(
-        "Отправьте текст нового сообщения.",
-        reply_markup=back_keyboard(),
+        f"<b>Добавление сообщения</b>\n\n"
+        f"Отправьте текст сообщения.\n"
+        f"<b>Добавлено: {len(state['messages'])}/{MAX_TEXT_TEMPLATES}</b>\n\n"
+        f"После отправки сообщения вы сможете добавить ещё или завершить.",
+        reply_markup=add_message_keyboard(),
     )
     await callback.answer()
 
+@router.callback_query(F.data == "finish_messages")
+async def finish_messages_callback(callback: CallbackQuery) -> None:
+    """Завершает добавление сообщений и возвращает в меню"""
+    user_id = callback.from_user.id
+    state = load_state(user_id)
+    count = len(state["messages"])
+    
+    user_steps.pop(user_id, None)
+    
+    await callback.message.edit_text(
+        f"✅ Добавление завершено.\n"
+        f"Сохранено сообщений: <b>{count}</b>",
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "cancel_messages")
+async def cancel_messages_callback(callback: CallbackQuery) -> None:
+    """Отменяет добавление сообщений"""
+    user_id = callback.from_user.id
+    user_steps.pop(user_id, None)
+    
+    await callback.message.edit_text(
+        "❌ Добавление сообщений отменено.",
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
 
 @router.callback_query(F.data == "delete_message")
 async def delete_message_callback(callback: CallbackQuery) -> None:
@@ -1157,11 +1166,10 @@ async def delete_message_callback(callback: CallbackQuery) -> None:
     ]
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="messages")])
     await callback.message.edit_text(
-        "Выберите сообщение:",
+        "Выберите сообщение для удаления:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("delmsg:"))
 async def delete_selected_message(callback: CallbackQuery) -> None:
@@ -1169,13 +1177,12 @@ async def delete_selected_message(callback: CallbackQuery) -> None:
     state = load_state(user_id)
     try:
         index = int(callback.data.split(":", 1)[1])
-        state["messages"].pop(index)
+        deleted = state["messages"].pop(index)
         save_state(user_id, state)
-        await callback.answer("Удалено")
+        await callback.answer(f"Удалено: {deleted[:50]}...")
         await messages_callback(callback)
     except (ValueError, IndexError):
         await callback.answer("Сообщение уже отсутствует", show_alert=True)
-
 
 @router.callback_query(F.data == "recipients")
 async def recipients_callback(callback: CallbackQuery) -> None:
@@ -1191,7 +1198,6 @@ async def recipients_callback(callback: CallbackQuery) -> None:
     )
     await callback.answer()
 
-
 @router.callback_query(F.data == "add_recipients")
 async def add_recipients_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_recipients"
@@ -1201,7 +1207,6 @@ async def add_recipients_callback(callback: CallbackQuery) -> None:
         reply_markup=back_keyboard(),
     )
     await callback.answer()
-
 
 @router.callback_query(F.data == "clear_recipients")
 async def clear_recipients_callback(callback: CallbackQuery, bot: Bot) -> None:
@@ -1215,7 +1220,6 @@ async def clear_recipients_callback(callback: CallbackQuery, bot: Bot) -> None:
         f"Очистил список из {count} получателей:\n{event_user_label(callback)}",
     )
     await recipients_callback(callback)
-
 
 @router.callback_query(F.data == "group_templates")
 async def group_templates_callback(callback: CallbackQuery) -> None:
@@ -1235,7 +1239,6 @@ async def group_templates_callback(callback: CallbackQuery) -> None:
     )
     await callback.answer()
 
-
 @router.callback_query(F.data == "clear_group_templates")
 async def clear_group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
     state = load_state(callback.from_user.id)
@@ -1249,7 +1252,6 @@ async def clear_group_templates_callback(callback: CallbackQuery, bot: Bot) -> N
     )
     await group_templates_callback(callback)
 
-
 @router.callback_query(F.data == "status")
 async def status_callback(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
@@ -1257,7 +1259,6 @@ async def status_callback(callback: CallbackQuery) -> None:
         reply_markup=main_keyboard(),
     )
     await callback.answer()
-
 
 @router.callback_query(F.data == "start_broadcast")
 async def start_broadcast_callback(callback: CallbackQuery, bot: Bot) -> None:
@@ -1278,7 +1279,6 @@ async def start_broadcast_callback(callback: CallbackQuery, bot: Bot) -> None:
     broadcast_tasks[user_id] = task
     await callback.answer("Рассылка запущена")
 
-
 @router.callback_query(F.data == "stop_broadcast")
 async def stop_broadcast_callback(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
@@ -1288,7 +1288,6 @@ async def stop_broadcast_callback(callback: CallbackQuery) -> None:
         return
     stop_events.setdefault(user_id, asyncio.Event()).set()
     await callback.answer("Остановка запрошена")
-
 
 # ============================================================
 # ЗАПУСК
@@ -1327,7 +1326,6 @@ async def main() -> None:
                 pass
 
         await bot.session.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
