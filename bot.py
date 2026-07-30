@@ -605,6 +605,22 @@ async def send_random_group_template(
     return template
 
 
+def remove_recipient_from_state(
+    user_id: int,
+    state: dict[str, Any],
+    recipient: str | int,
+) -> bool:
+    """Удаляет недоступного получателя из сохранённого списка."""
+
+    recipients = state.get("recipients", [])
+    if recipient not in recipients:
+        return False
+
+    recipients.remove(recipient)
+    save_state(user_id, state)
+    return True
+
+
 async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> None:
     state = load_state(user_id)
     stop_event = stop_events.setdefault(user_id, asyncio.Event())
@@ -636,7 +652,9 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> Non
             f"Пауза: {MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} секунд.",
         )
 
-        for index, recipient in enumerate(state["recipients"], 1):
+        recipients_snapshot = list(state["recipients"])
+
+        for index, recipient in enumerate(recipients_snapshot, 1):
             if stop_event.is_set():
                 await bot.send_message(chat_id, "Рассылка остановлена.")
                 break
@@ -710,8 +728,24 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> Non
                 errors.UsernameInvalidError,
                 errors.UsernameNotOccupiedError,
                 ValueError,
-            ):
+            ) as exc:
                 failed += 1
+
+                # Если адресат больше не принимает сообщения, заблокировал
+                # аккаунт, удалил username или указан некорректно — удаляем
+                # его из списка, чтобы при следующем запуске не писать снова.
+                removed = remove_recipient_from_state(
+                    user_id,
+                    state,
+                    recipient,
+                )
+
+                if removed:
+                    log.info(
+                        "Получатель %r удалён из списка после ошибки %s",
+                        recipient,
+                        type(exc).__name__,
+                    )
 
             except Exception as exc:
                 failed += 1
@@ -725,12 +759,12 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> Non
             if index % 10 == 0:
                 await bot.send_message(
                     chat_id,
-                    f"Прогресс: {index}/{len(state['recipients'])}\n"
+                    f"Прогресс: {index}/{len(recipients_snapshot)}\n"
                     f"Успешных получателей: {sent_recipients}\n"
                     f"Ошибок: {failed}",
                 )
 
-            if index < len(state["recipients"]):
+            if index < len(recipients_snapshot):
                 await asyncio.sleep(random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
 
         await bot.send_message(
@@ -1021,19 +1055,48 @@ async def private_input_handler(message: Message, bot: Bot) -> None:
     if step == "await_recipients":
         state = load_state(user_id)
         added = 0
-        for line in text.splitlines():
-            value = line.strip()
+        skipped = 0
+
+        # Разрешены разделители: пробел, запятая, точка с запятой
+        # или перенос строки.
+        values = re.split(r"[\s,;]+", text)
+
+        for raw_value in values:
+            value = raw_value.strip()
             if not value:
                 continue
-            parsed: str | int = int(value) if value.lstrip("-").isdigit() else value
-            if parsed not in state["recipients"]:
-                state["recipients"].append(parsed)
-                added += 1
+
+            # Ссылки t.me/username приводим к @username.
+            value = re.sub(
+                r"^https?://(?:www\.)?t\.me/",
+                "@",
+                value,
+                flags=re.IGNORECASE,
+            )
+
+            # Удаляем завершающий слеш у ссылки/username.
+            value = value.rstrip("/")
+
+            parsed: str | int = (
+                int(value)
+                if value.lstrip("-").isdigit()
+                else value
+            )
+
+            if parsed in state["recipients"]:
+                skipped += 1
+                continue
+
+            state["recipients"].append(parsed)
+            added += 1
 
         save_state(user_id, state)
         user_steps.pop(user_id, None)
+
         await message.answer(
-            f"Добавлено: {added}\nВсего: {len(state['recipients'])}",
+            f"✅ Добавлено: {added}\n"
+            f"Пропущено повторов: {skipped}\n"
+            f"Всего получателей: {len(state['recipients'])}",
             reply_markup=main_keyboard(),
         )
 
@@ -1241,7 +1304,11 @@ async def recipients_callback(callback: CallbackQuery) -> None:
 async def add_recipients_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_recipients"
     await callback.message.edit_text(
-        "Отправьте @username, ссылки или ID — по одному в строке.",
+        "<b>Добавление получателей</b>\n\n"
+        "Отправьте @username, ссылки или ID.\n"
+        "Можно разделять пробелом, запятой или новой строкой.\n\n"
+        "Пример:\n"
+        "<code>@user1, @user2 123456789\nhttps://t.me/user3</code>",
         reply_markup=back_keyboard(),
     )
     await callback.answer()
