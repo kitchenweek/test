@@ -31,8 +31,8 @@ from telethon.network.connection import ConnectionTcpMTProxyAbridged
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = "8623083352:AAHPhZkAFymFxs272OO_YYECCeXQUXfH8is"
-ADMIN_ID = 2010296191
+BOT_TOKEN = "8925857176:AAEAAlJVQXWvevidnUJxkGsIderHqbyMYRM"
+ADMIN_ID = 7517164478
 
 API_ID = 32200104
 API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
