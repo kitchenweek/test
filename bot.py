@@ -848,8 +848,7 @@ async def send_log_to_user(
     log_text += f"Получатель: <code>{html.escape(str(recipient))}</code>\n"
     
     if status == "success":
-        log_text += f"\n✅ Отписка выполнена успешно!\n"
-        log_text += f"📌 Получатель удалён из списка"
+        log_text += f"\n✅ Отписка выполнена успешно!
     else:
         log_text += f"\n❌ Причина: <code>{html.escape(error_reason)}</code>\n"
         if "спам" in error_reason.lower() or "flood" in error_reason.lower():
