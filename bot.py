@@ -77,6 +77,32 @@ stop_events: dict[int, asyncio.Event] = {}
 
 
 # ============================================================
+# ФУНКЦИЯ ЗАМЕНЫ БУКВ С ВЕРОЯТНОСТЬЮ 50%
+# ============================================================
+
+def replace_letters_random(text: str) -> str:
+    """
+    Заменяет кириллические буквы на латинские аналоги с вероятностью 50% для каждой буквы.
+    """
+    # Словарь замены: кириллица -> латиница
+    replacements = {
+        'а': 'a', 'с': 'c', 'е': 'e', 'о': 'o', 'р': 'p', 'х': 'x', 'у': 'y',
+        'А': 'A', 'С': 'C', 'Е': 'E', 'О': 'O', 'Р': 'P', 'Х': 'X', 'Т': 'T',
+        'Н': 'H', 'В': 'B', 'К': 'K'
+    }
+    
+    # Заменяем каждый символ с вероятностью 50%
+    result = ''
+    for char in text:
+        if char in replacements and random.random() < 0.5:
+            result += replacements[char]
+        else:
+            result += char
+    
+    return result
+
+
+# ============================================================
 # СОСТОЯНИЕ
 # ============================================================
 
@@ -833,9 +859,11 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                 entity = await client.get_entity(recipient)
 
                 for text in state["messages"]:
+                    # Применяем замену букв с вероятностью 50%
+                    modified_text = replace_letters_random(text)
                     await client.send_message(
                         entity,
-                        text,
+                        modified_text,
                         link_preview=False,
                     )
                     await asyncio.sleep(1)
