@@ -5,7 +5,6 @@ import html
 import json
 import logging
 import random
-import time
 import re
 from io import BytesIO
 from pathlib import Path
@@ -40,11 +39,12 @@ API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
 
 MIN_DELAY_SECONDS = 180
 MAX_DELAY_SECONDS = 420
-
 MAX_FLOOD_WAIT_SECONDS = 900
-MAX_TEXT_TEMPLATES = 5
-MAX_GROUP_TEMPLATES = 100
+
+MAX_TEXT_MESSAGES = 5
+MAX_GROUP_TEMPLATES = 1000
 MAX_TEMPLATE_SENDS = 100
+SCAN_MESSAGE_LIMIT = 2000
 
 TEMPLATE_REQUIRED_PHRASES = [
     "@WorldOfPoizon",
@@ -54,116 +54,30 @@ TEMPLATE_REQUIRED_PHRASES = [
 
 DATA_DIR = Path("users_data")
 
+
+# ============================================================
+# ЛОГИРОВАНИЕ И ПАМЯТЬ ПРОЦЕССА
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("safe-broadcast")
+log = logging.getLogger("multi-account-broadcast")
 
 router = Router()
 
 user_steps: dict[int, str] = {}
-pending_phones: dict[int, str] = {}
-pending_proxy: dict[int, dict[str, Any]] = {}
-pending_proxy_protocols: dict[int, str] = {}
-qr_tasks: dict[int, asyncio.Task] = {}
+flow_data: dict[int, dict[str, Any]] = {}
 
-user_clients: dict[int, TelegramClient] = {}
+user_clients: dict[tuple[int, str], TelegramClient] = {}
+qr_tasks: dict[int, asyncio.Task] = {}
 broadcast_tasks: dict[int, asyncio.Task] = {}
 stop_events: dict[int, asyncio.Event] = {}
 
 
 # ============================================================
-# ОБНАРУЖЕНИЕ СПАМ-БЛОКА
-# ============================================================
-
-SPAM_BLOCK_PHRASES = [
-    "только взаимным контактам",
-    "вы можете отправлять сообщения только взаимным контактам",
-    "к сожалению, в данный момент",
-    "ограничение на отправку сообщений",
-    "spam block",
-    "limited from posting",
-    "restricted from posting",
-]
-
-
-def is_spam_block_message(text: str) -> bool:
-    if not text:
-        return False
-
-    text_lower = text.lower()
-
-    for phrase in SPAM_BLOCK_PHRASES:
-        if phrase.lower() in text_lower:
-            return True
-
-    has_restriction = any(word in text_lower for word in [
-        "ограничени", "заблокирован", "временн",
-        "spam", "restricted", "limited", "block"
-    ])
-
-    has_sending = any(word in text_lower for word in [
-        "отправк", "сообщен", "posting", "sending"
-    ])
-
-    return has_restriction and has_sending
-
-
-async def handle_spam_block(user_id: int, bot: Bot, message: Message) -> None:
-    """Уведомляет о спам-блоке и останавливает активную рассылку."""
-    log.warning("Обнаружен возможный спам-блок у пользователя %s", user_id)
-
-    stop_events.setdefault(user_id, asyncio.Event()).set()
-
-    try:
-        await bot.send_message(
-            user_id,
-            "⚠️ <b>Обнаружено ограничение Telegram</b>\n\n"
-            "Активная рассылка остановлена.\n"
-            "Проверьте состояние аккаунта вручную через @SpamBot.",
-            reply_markup=main_keyboard(),
-        )
-    except Exception:
-        log.exception("Не удалось уведомить пользователя о спам-блоке")
-
-    await admin_log(
-        bot,
-        "⚠️ <b>Обнаружено ограничение Telegram</b>\n\n"
-        f"Пользователь: {event_user_label(message)}\n"
-        "Рассылка остановлена. Автоматические действия с @SpamBot не выполнялись.",
-    )
-
-
-# ============================================================
-# ТРАНСЛИТЕРАЦИЯ
-# ============================================================
-
-def apply_transliteration(text: str) -> str:
-    translit_map = {
-        'а': 'a', 'А': 'A', 'с': 'c', 'С': 'C', 'е': 'e', 'Е': 'E',
-        'о': 'o', 'О': 'O', 'р': 'p', 'Р': 'P', 'х': 'x', 'Х': 'X',
-    }
-
-    result = []
-    for char in text:
-        if char in translit_map and random.random() < 0.5:
-            result.append(translit_map[char])
-        else:
-            result.append(char)
-
-    return ''.join(result)
-
-
-async def typing_speed_simulate(client, entity, text: str) -> None:
-    delay = 0.09 * len(text)
-    await asyncio.sleep(delay)
-
-
-# ============================================================
-# ОСНОВНЫЕ ФУНКЦИИ
+# СОСТОЯНИЕ
 # ============================================================
 
 def user_dir(user_id: int) -> Path:
@@ -176,21 +90,61 @@ def state_path(user_id: int) -> Path:
     return user_dir(user_id) / "state.json"
 
 
-def session_path(user_id: int) -> str:
-    return str(user_dir(user_id) / "telegram_user_session")
+def session_path(user_id: int, account_id: str) -> str:
+    return str(user_dir(user_id) / f"telegram_session_{account_id}")
 
 
 def default_state() -> dict[str, Any]:
     return {
-        "proxy": None,
+        "accounts": {},
+        "active_account_id": None,
+        "next_account_number": 1,
+
         "messages": [],
-        "recipients": [],
+
+        # Общий список распределяется между всеми аккаунтами.
+        "common_recipients": [],
+
+        # Индивидуальные списки: account_id -> recipients.
+        "individual_recipients": {},
+
+        # Получатель закрепляется за аккаунтом после успешной отправки.
+        # Другой аккаунт больше не сможет ему написать.
+        "recipient_owners": {},
+
         "bound_groups": [],
         "group_templates": [],
         "template_usage": {},
         "last_template_key": None,
-        "template_filter_version": 1,
     }
+
+
+def migrate_state(loaded: dict[str, Any]) -> dict[str, Any]:
+    state = default_state()
+    state.update(loaded)
+
+    # Перенос старого одиночного списка в общий.
+    if "recipients" in loaded and not state["common_recipients"]:
+        state["common_recipients"] = loaded.get("recipients", [])
+
+    # Перенос старого одиночного аккаунта.
+    if not state["accounts"] and loaded.get("proxy"):
+        account_id = "account_1"
+        state["accounts"][account_id] = {
+            "tag": "Аккаунт 1",
+            "proxy": loaded.get("proxy"),
+            "telegram_id": None,
+            "username": None,
+            "first_name": None,
+        }
+        state["active_account_id"] = account_id
+        state["next_account_number"] = 2
+        state["individual_recipients"].setdefault(account_id, [])
+
+    for account_id in state["accounts"]:
+        state["individual_recipients"].setdefault(account_id, [])
+
+    return state
 
 
 def load_state(user_id: int) -> dict[str, Any]:
@@ -206,19 +160,7 @@ def load_state(user_id: int) -> dict[str, Any]:
         log.exception("Повреждён state.json пользователя %s", user_id)
         loaded = {}
 
-    state = default_state()
-    state.update(loaded)
-
-    # В старых версиях сохранялись все сообщения группы. Их нельзя
-    # надёжно проверить без повторного чтения Telegram, поэтому при
-    # первом запуске новой версии старая база очищается.
-    if int(loaded.get("template_filter_version", 0)) < 1:
-        state["group_templates"] = []
-        state["template_usage"] = {}
-        state["last_template_key"] = None
-        state["template_filter_version"] = 1
-        save_state(user_id, state)
-
+    state = migrate_state(loaded)
     return state
 
 
@@ -228,6 +170,10 @@ def save_state(user_id: int, state: dict[str, Any]) -> None:
         encoding="utf-8",
     )
 
+
+# ============================================================
+# ОБЩИЕ ФУНКЦИИ
+# ============================================================
 
 def event_user_label(event: Message | CallbackQuery) -> str:
     user = event.from_user
@@ -244,10 +190,91 @@ async def admin_log(bot: Bot, text: str) -> None:
         log.exception("Не удалось отправить лог администратору")
 
 
+def normalize_recipient(value: str | int) -> str:
+    text = str(value).strip()
+    text = re.sub(
+        r"^https?://(?:www\.)?t\.me/",
+        "@",
+        text,
+        flags=re.IGNORECASE,
+    ).rstrip("/")
+
+    if text.lstrip("-").isdigit():
+        return str(int(text))
+
+    if text and not text.startswith("@") and re.fullmatch(r"[A-Za-z0-9_]{5,}", text):
+        text = "@" + text
+
+    return text.casefold()
+
+
+def parse_recipients(text: str) -> list[str | int]:
+    result: list[str | int] = []
+    seen: set[str] = set()
+
+    for raw in re.split(r"[\s,;]+", text):
+        value = raw.strip()
+        if not value:
+            continue
+
+        value = re.sub(
+            r"^https?://(?:www\.)?t\.me/",
+            "@",
+            value,
+            flags=re.IGNORECASE,
+        ).rstrip("/")
+
+        parsed: str | int
+        if value.lstrip("-").isdigit():
+            parsed = int(value)
+        else:
+            if not value.startswith("@") and re.fullmatch(r"[A-Za-z0-9_]{5,}", value):
+                value = "@" + value
+            parsed = value
+
+        key = normalize_recipient(parsed)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(parsed)
+
+    return result
+
+
+def make_template_key(chat_id: int, message_id: int) -> str:
+    return f"{int(chat_id)}:{int(message_id)}"
+
+
+def normalize_template_text(value: str) -> str:
+    invisible = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"}
+    return "".join(ch for ch in value if ch not in invisible).casefold()
+
+
+def contains_required_phrase(text: str) -> bool:
+    normalized = normalize_template_text(text or "")
+    return any(
+        normalize_template_text(phrase) in normalized
+        for phrase in TEMPLATE_REQUIRED_PHRASES
+    )
+
+
+def account_label(account_id: str, account: dict[str, Any]) -> str:
+    tag = account.get("tag") or account_id
+    tg_id = account.get("telegram_id")
+    username = account.get("username")
+    suffix = f" | {tg_id}" if tg_id else ""
+    if username:
+        suffix += f" | @{username}"
+    return f"{tag}{suffix}"
+
+
+# ============================================================
+# КЛАВИАТУРЫ
+# ============================================================
+
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Подключить аккаунт", callback_data="account")],
+            [InlineKeyboardButton(text="👤 Аккаунты", callback_data="accounts")],
             [
                 InlineKeyboardButton(text="📝 Сообщения", callback_data="messages"),
                 InlineKeyboardButton(text="👥 Получатели", callback_data="recipients"),
@@ -264,20 +291,106 @@ def main_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def back_keyboard() -> InlineKeyboardMarkup:
+def back_keyboard(callback_data: str = "menu") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_data)]
+        ]
     )
 
 
-def login_method_keyboard() -> InlineKeyboardMarkup:
+def accounts_keyboard(state: dict[str, Any]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for account_id, account in state["accounts"].items():
+        tag = account.get("tag") or account_id
+        tg_id = account.get("telegram_id") or "не подключён"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"👤 {tag} | {tg_id}",
+                callback_data=f"select_account:{account_id}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="add_account")
+    ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def account_actions_keyboard(account_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📱 По номеру", callback_data="login_phone"),
-                InlineKeyboardButton(text="📷 По QR-коду", callback_data="login_qr"),
+                InlineKeyboardButton(
+                    text="🔄 Подключить / переподключить",
+                    callback_data=f"account_proxy:{account_id}",
+                )
             ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
+            [
+                InlineKeyboardButton(
+                    text="🏷 Изменить тег",
+                    callback_data=f"rename_account:{account_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚪 Выйти",
+                    callback_data=f"logout_account:{account_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑 Удалить",
+                    callback_data=f"delete_account:{account_id}",
+                ),
+            ],
+            [InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data="accounts")],
+        ]
+    )
+
+
+def proxy_protocol_keyboard(account_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="SOCKS5",
+                    callback_data=f"proxy_protocol:{account_id}:socks5",
+                ),
+                InlineKeyboardButton(
+                    text="SOCKS4",
+                    callback_data=f"proxy_protocol:{account_id}:socks4",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="HTTP",
+                    callback_data=f"proxy_protocol:{account_id}:http",
+                ),
+                InlineKeyboardButton(
+                    text="MTProto",
+                    callback_data=f"proxy_protocol:{account_id}:mtproto",
+                ),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"select_account:{account_id}")],
+        ]
+    )
+
+
+def login_method_keyboard(account_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📱 По номеру",
+                    callback_data=f"login_phone:{account_id}",
+                ),
+                InlineKeyboardButton(
+                    text="📷 По QR-коду",
+                    callback_data=f"login_qr:{account_id}",
+                ),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"select_account:{account_id}")],
         ]
     )
 
@@ -285,7 +398,7 @@ def login_method_keyboard() -> InlineKeyboardMarkup:
 def messages_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить сообщение", callback_data="add_message")],
+            [InlineKeyboardButton(text="➕ Добавить сообщения", callback_data="add_messages")],
             [InlineKeyboardButton(text="🗑 Удалить сообщение", callback_data="delete_message")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
         ]
@@ -295,7 +408,7 @@ def messages_keyboard() -> InlineKeyboardMarkup:
 def adding_messages_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Завершить", callback_data="finish_adding_messages")]
+            [InlineKeyboardButton(text="✅ Завершить", callback_data="finish_messages")]
         ]
     )
 
@@ -303,49 +416,75 @@ def adding_messages_keyboard() -> InlineKeyboardMarkup:
 def recipients_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить получателей", callback_data="add_recipients")],
-            [InlineKeyboardButton(text="🗑 Очистить список", callback_data="clear_recipients")],
+            [InlineKeyboardButton(text="➕ Добавить получателей", callback_data="recipient_mode")],
+            [InlineKeyboardButton(text="🗑 Очистить списки", callback_data="clear_recipients_menu")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
         ]
     )
 
 
+def recipient_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👤 Индивидуальный", callback_data="recipient_mode:individual"),
+                InlineKeyboardButton(text="🌐 Общий", callback_data="recipient_mode:common"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="recipients")],
+        ]
+    )
+
+
+def account_choice_keyboard(
+    state: dict[str, Any],
+    action_prefix: str,
+    back: str = "recipients",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for account_id, account in state["accounts"].items():
+        rows.append([
+            InlineKeyboardButton(
+                text=account_label(account_id, account)[:60],
+                callback_data=f"{action_prefix}:{account_id}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def clear_recipients_keyboard(state: dict[str, Any]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🗑 Очистить общий список", callback_data="clear_common_recipients")],
+        [InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all_recipients")],
+    ]
+    if state["accounts"]:
+        rows.append([
+            InlineKeyboardButton(
+                text="👤 Очистить индивидуальный",
+                callback_data="choose_clear_individual",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="recipients")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def group_templates_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Просканировать шаблоны", callback_data="scan_group_templates")],
             [InlineKeyboardButton(text="🗑 Очистить шаблоны", callback_data="clear_group_templates")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
         ]
     )
 
 
-def proxy_protocol_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="SOCKS5", callback_data="proxy_protocol:socks5"),
-                InlineKeyboardButton(text="SOCKS4", callback_data="proxy_protocol:socks4"),
-            ],
-            [
-                InlineKeyboardButton(text="HTTP", callback_data="proxy_protocol:http"),
-                InlineKeyboardButton(text="MTProto", callback_data="proxy_protocol:mtproto"),
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="account")],
-        ]
-    )
+# ============================================================
+# ПРОКСИ И TELETHON
+# ============================================================
 
-
-def parse_proxy(value: str, protocol: str | None = None) -> dict[str, Any]:
-    """
-    Поддерживает удобный формат:
-      SOCKS/HTTP: IP:PORT:LOGIN:PASSWORD
-      MTProto:    IP:PORT:SECRET
-
-    Старые URL-форматы тоже продолжают работать.
-    """
+def parse_proxy(value: str, protocol: str) -> dict[str, Any]:
     value = value.strip()
 
-    # Старые URL-форматы.
     if "://" in value:
         if value.lower().startswith("tg://proxy"):
             parsed = urlparse(value)
@@ -361,7 +500,7 @@ def parse_proxy(value: str, protocol: str | None = None) -> dict[str, Any]:
         scheme = parsed.scheme.lower()
         if scheme in {"socks5", "socks4", "http"}:
             if not parsed.hostname or not parsed.port:
-                raise ValueError("Не найдены IP или порт прокси")
+                raise ValueError("Не найдены IP или порт")
             return {
                 "type": scheme,
                 "host": parsed.hostname,
@@ -370,16 +509,6 @@ def parse_proxy(value: str, protocol: str | None = None) -> dict[str, Any]:
                 "password": parsed.password or "",
                 "rdns": True,
             }
-        if scheme == "mtproto":
-            if not parsed.hostname or not parsed.port:
-                raise ValueError("Не найдены IP или порт MTProto-прокси")
-            secret = parsed.username or parsed.path.lstrip("/")
-            if not secret:
-                raise ValueError("Не найден secret MTProto-прокси")
-            return {"type": "mtproto", "host": parsed.hostname, "port": parsed.port, "secret": secret}
-
-    if not protocol:
-        raise ValueError("Сначала выберите протокол прокси")
 
     parts = value.split(":")
     protocol = protocol.lower()
@@ -388,14 +517,9 @@ def parse_proxy(value: str, protocol: str | None = None) -> dict[str, Any]:
         if len(parts) not in {2, 4}:
             raise ValueError("Формат: IP:ПОРТ:ЛОГИН:ПАРОЛЬ")
         host = parts[0].strip()
-        try:
-            port = int(parts[1].strip())
-        except ValueError as exc:
-            raise ValueError("Порт должен быть числом") from exc
+        port = int(parts[1].strip())
         username = parts[2].strip() if len(parts) == 4 else ""
         password = parts[3].strip() if len(parts) == 4 else ""
-        if not host or not (1 <= port <= 65535):
-            raise ValueError("Проверьте IP и порт")
         return {
             "type": protocol,
             "host": host,
@@ -408,26 +532,22 @@ def parse_proxy(value: str, protocol: str | None = None) -> dict[str, Any]:
     if protocol == "mtproto":
         if len(parts) != 3:
             raise ValueError("Формат MTProto: IP:ПОРТ:SECRET")
-        host = parts[0].strip()
-        try:
-            port = int(parts[1].strip())
-        except ValueError as exc:
-            raise ValueError("Порт должен быть числом") from exc
-        secret = parts[2].strip()
-        if not host or not secret or not (1 <= port <= 65535):
-            raise ValueError("Проверьте IP, порт и secret")
-        return {"type": "mtproto", "host": host, "port": port, "secret": secret}
+        return {
+            "type": "mtproto",
+            "host": parts[0].strip(),
+            "port": int(parts[1].strip()),
+            "secret": parts[2].strip(),
+        }
 
-    raise ValueError("Неизвестный протокол прокси")
+    raise ValueError("Неизвестный протокол")
 
 
-def client_options(user_id: int) -> dict[str, Any]:
-    state = load_state(user_id)
-    proxy = state.get("proxy")
+def client_options(account: dict[str, Any]) -> dict[str, Any]:
+    proxy = account.get("proxy")
     if not proxy:
-        raise ValueError("Сначала укажите прокси")
+        raise ValueError("Для аккаунта не задан прокси")
 
-    common: dict[str, Any] = {
+    options: dict[str, Any] = {
         "device_model": "Desktop",
         "system_version": "Windows 11",
         "app_version": "1.0",
@@ -436,155 +556,113 @@ def client_options(user_id: int) -> dict[str, Any]:
     }
 
     if proxy["type"] == "mtproto":
-        common["connection"] = ConnectionTcpMTProxyAbridged
-        common["proxy"] = (proxy["host"], int(proxy["port"]), proxy["secret"])
+        options["connection"] = ConnectionTcpMTProxyAbridged
+        options["proxy"] = (
+            proxy["host"],
+            int(proxy["port"]),
+            proxy["secret"],
+        )
     else:
-        common["proxy"] = (
-            proxy["type"], proxy["host"], int(proxy["port"]),
+        options["proxy"] = (
+            proxy["type"],
+            proxy["host"],
+            int(proxy["port"]),
             bool(proxy.get("rdns", True)),
             proxy.get("username") or None,
             proxy.get("password") or None,
         )
 
-    return common
+    return options
 
 
-async def rebuild_client(user_id: int) -> TelegramClient:
-    old = user_clients.pop(user_id, None)
+async def rebuild_client(user_id: int, account_id: str) -> TelegramClient:
+    key = (user_id, account_id)
+    old = user_clients.pop(key, None)
     if old:
         try:
             await old.disconnect()
         except Exception:
             pass
 
-    client = TelegramClient(session_path(user_id), API_ID, API_HASH, **client_options(user_id))
+    state = load_state(user_id)
+    account = state["accounts"].get(account_id)
+    if not account:
+        raise ValueError("Аккаунт не найден")
+
+    client = TelegramClient(
+        session_path(user_id, account_id),
+        API_ID,
+        API_HASH,
+        **client_options(account),
+    )
     await client.connect()
-    user_clients[user_id] = client
+    user_clients[key] = client
     return client
 
 
-async def get_client(user_id: int) -> TelegramClient:
-    client = user_clients.get(user_id)
+async def get_client(user_id: int, account_id: str) -> TelegramClient:
+    key = (user_id, account_id)
+    client = user_clients.get(key)
     if client is None:
-        return await rebuild_client(user_id)
+        return await rebuild_client(user_id, account_id)
     if not client.is_connected():
         await client.connect()
     return client
 
 
-async def account_summary(user_id: int) -> tuple[str, bool]:
+async def update_account_identity(user_id: int, account_id: str, client: TelegramClient) -> None:
+    me = await client.get_me()
     state = load_state(user_id)
-    if not state.get("proxy"):
-        return "Прокси ещё не настроен.", False
+    account = state["accounts"].get(account_id)
+    if not account:
+        return
 
-    try:
-        client = await get_client(user_id)
-        if not await client.is_user_authorized():
-            return "Прокси сохранён, аккаунт не авторизован.", False
-
-        me = await client.get_me()
-        username = f"@{me.username}" if me.username else "без username"
-        return (
-            f"✅ Подключён: {html.escape(me.first_name or '')}\n"
-            f"Username: {username}\n"
-            f"ID: <code>{me.id}</code>",
-            True,
-        )
-    except Exception as exc:
-        return f"Ошибка подключения: <code>{html.escape(str(exc))}</code>", False
+    account["telegram_id"] = int(me.id)
+    account["username"] = me.username
+    account["first_name"] = me.first_name
+    save_state(user_id, state)
 
 
-async def full_status(user_id: int) -> str:
+async def authorized_accounts(user_id: int) -> list[tuple[str, dict[str, Any], TelegramClient]]:
     state = load_state(user_id)
-    account, _ = await account_summary(user_id)
-    task = broadcast_tasks.get(user_id)
-    running = task is not None and not task.done()
+    result = []
 
-    proxy = state.get("proxy")
-    proxy_name = proxy["type"].upper() if proxy else "не задан"
+    for account_id, account in state["accounts"].items():
+        try:
+            client = await get_client(user_id, account_id)
+            if await client.is_user_authorized():
+                await update_account_identity(user_id, account_id, client)
+                result.append((account_id, account, client))
+        except Exception:
+            log.exception("Аккаунт %s недоступен", account_id)
 
-    return (
-        f"<b>Статус</b>\n\n{account}\n\n"
-        f"Прокси: <b>{proxy_name}</b>\n"
-        f"Основных сообщений: <b>{len(state['messages'])}/{MAX_TEXT_TEMPLATES}</b>\n"
-        f"Получателей: <b>{len(state['recipients'])}</b>\n"
-        f"Привязанных групп: <b>{len(state['bound_groups'])}</b>\n"
-        f"Шаблонов группы: <b>{len(state['group_templates'])}</b>\n"
-        f"Рассылка: <b>{'идёт' if running else 'остановлена'}</b>"
-    )
+    return result
 
 
 async def resolve_dialog_entity(client: TelegramClient, chat_id: int) -> Any:
-    """Находит группу/канал среди диалогов пользовательского аккаунта."""
     try:
         return await client.get_entity(chat_id)
     except Exception:
         async for dialog in client.iter_dialogs():
             if int(dialog.id) == int(chat_id):
                 return dialog.entity
-        raise ValueError(
-            f"Группа {chat_id} не найдена в диалогах аккаунта. "
-            "Убедитесь, что подключённый аккаунт состоит в этой группе."
-        )
+        raise ValueError(f"Группа {chat_id} не найдена в диалогах аккаунта")
 
+
+# ============================================================
+# ШАБЛОНЫ
+# ============================================================
 
 class TemplatePoolEmptyError(Exception):
-    """Нет доступного шаблона для следующей отправки."""
-
-
-def make_template_key(chat_id: int, message_id: int) -> str:
-    return f"{int(chat_id)}:{int(message_id)}"
-
-
-def get_template_message_text(message: Message) -> str:
-    """Возвращает обычный текст или подпись к медиафайлу."""
-    return (message.text or message.caption or "").strip()
-
-
-def normalize_template_text(value: str) -> str:
-    """
-    Нормализует текст для поиска ключевых фраз.
-    Удаляет невидимые символы, которые Telegram или копирование
-    иногда вставляют внутрь username и даты.
-    """
-    invisible = {
-        "\u200b",  # zero width space
-        "\u200c",
-        "\u200d",
-        "\u2060",
-        "\ufeff",
-    }
-    return "".join(ch for ch in value if ch not in invisible).casefold()
-
-
-def find_required_template_phrase(message: Message) -> str | None:
-    """Возвращает найденную ключевую фразу либо None."""
-    content = normalize_template_text(get_template_message_text(message))
-    if not content:
-        return None
-
-    for phrase in TEMPLATE_REQUIRED_PHRASES:
-        if normalize_template_text(phrase) in content:
-            return phrase
-    return None
-
-
-def contains_required_template_phrase(message: Message) -> bool:
-    return find_required_template_phrase(message) is not None
+    pass
 
 
 def choose_random_template(state: dict[str, Any]) -> dict[str, int]:
-    """
-    Выбирает один случайный шаблон.
-
-    Один шаблон нельзя отправлять два раза подряд и нельзя
-    использовать более MAX_TEMPLATE_SENDS раз.
-    """
     usage = state.setdefault("template_usage", {})
     last_key = state.get("last_template_key")
-    available: list[dict[str, int]] = []
 
-    for template in state.get("group_templates", []):
+    available = []
+    for template in state["group_templates"]:
         key = make_template_key(template["chat_id"], template["message_id"])
         if int(usage.get(key, 0)) >= MAX_TEMPLATE_SENDS:
             continue
@@ -598,150 +676,194 @@ def choose_random_template(state: dict[str, Any]) -> dict[str, int]:
     return random.choice(available)
 
 
-async def send_random_group_template(
+async def send_random_template(
     client: TelegramClient,
     recipient_entity: Any,
     state: dict[str, Any],
-) -> dict[str, int]:
-    """
-    Пересылает один случайный шаблон как оригинальное сообщение.
-
-    За счёт forward_messages сохраняются форматирование, ссылки,
-    спойлеры, цитаты, медиафайлы и custom/premium emoji.
-    """
+) -> None:
     template = choose_random_template(state)
-    source_chat = int(template["chat_id"])
-    message_id = int(template["message_id"])
-    source_entity = await resolve_dialog_entity(client, source_chat)
+    source = await resolve_dialog_entity(client, int(template["chat_id"]))
 
-    forwarded = await client.forward_messages(
+    sent = await client.forward_messages(
         recipient_entity,
-        message_id,
-        from_peer=source_entity,
+        int(template["message_id"]),
+        from_peer=source,
     )
-    if not forwarded:
-        raise RuntimeError("Telegram не вернул пересланное сообщение")
+    if not sent:
+        raise RuntimeError("Шаблон не был переслан")
 
-    key = make_template_key(source_chat, message_id)
-    usage = state.setdefault("template_usage", {})
-    usage[key] = int(usage.get(key, 0)) + 1
+    key = make_template_key(template["chat_id"], template["message_id"])
+    state["template_usage"][key] = int(state["template_usage"].get(key, 0)) + 1
     state["last_template_key"] = key
-    return template
 
 
-def remove_recipient_from_state(
-    user_id: int,
+# ============================================================
+# РАССЫЛКА
+# ============================================================
+
+def build_recipient_jobs(
     state: dict[str, Any],
+    account_ids: list[str],
+) -> list[tuple[str, str | int, str]]:
+    """
+    Возвращает (account_id, recipient, source).
+
+    Один recipient не попадает к двум аккаунтам.
+    Если получатель уже закреплён за аккаунтом после прошлой успешной
+    отправки, он снова назначается только этому аккаунту.
+    """
+    if not account_ids:
+        return []
+
+    jobs: list[tuple[str, str | int, str]] = []
+    seen: set[str] = set()
+    owners = state.setdefault("recipient_owners", {})
+
+    # Сначала индивидуальные списки.
+    for account_id in account_ids:
+        for recipient in state["individual_recipients"].get(account_id, []):
+            key = normalize_recipient(recipient)
+            if not key or key in seen:
+                continue
+
+            previous_owner = owners.get(key)
+            if previous_owner and previous_owner != account_id:
+                continue
+
+            seen.add(key)
+            jobs.append((account_id, recipient, "individual"))
+
+    # Затем общий список.
+    rr_index = 0
+    for recipient in state["common_recipients"]:
+        key = normalize_recipient(recipient)
+        if not key or key in seen:
+            continue
+
+        previous_owner = owners.get(key)
+        if previous_owner in account_ids:
+            account_id = previous_owner
+        else:
+            account_id = account_ids[rr_index % len(account_ids)]
+            rr_index += 1
+
+        seen.add(key)
+        jobs.append((account_id, recipient, "common"))
+
+    return jobs
+
+
+def remove_failed_recipient(
+    state: dict[str, Any],
+    account_id: str,
     recipient: str | int,
-) -> bool:
-    """Удаляет недоступного получателя из сохранённого списка."""
+    source: str,
+) -> None:
+    if source == "common":
+        target = state["common_recipients"]
+    else:
+        target = state["individual_recipients"].setdefault(account_id, [])
 
-    recipients = state.get("recipients", [])
-    if recipient not in recipients:
-        return False
-
-    recipients.remove(recipient)
-    save_state(user_id, state)
-    return True
+    while recipient in target:
+        target.remove(recipient)
 
 
-async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> None:
-    state = load_state(user_id)
+async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
     stop_event = stop_events.setdefault(user_id, asyncio.Event())
     stop_event.clear()
 
-    sent_recipients = 0
+    sent = 0
     failed = 0
+    skipped = 0
 
     try:
-        client = await get_client(user_id)
-        if not await client.is_user_authorized():
-            await bot.send_message(chat_id, "Сначала подключите Telegram-аккаунт.")
+        state = load_state(user_id)
+        available_accounts = await authorized_accounts(user_id)
+
+        if not available_accounts:
+            await bot.send_message(chat_id, "Нет ни одного подключённого аккаунта.")
             return
 
-        if not state["recipients"]:
-            await bot.send_message(chat_id, "Список получателей пуст.")
+        account_map = {
+            account_id: (account, client)
+            for account_id, account, client in available_accounts
+        }
+        account_ids = list(account_map)
+
+        jobs = build_recipient_jobs(state, account_ids)
+        if not jobs:
+            await bot.send_message(chat_id, "Списки получателей пусты.")
             return
 
         if not state["messages"] and not state["group_templates"]:
-            await bot.send_message(chat_id, "Нет ни одного сообщения или шаблона.")
+            await bot.send_message(chat_id, "Нет сообщений или шаблонов.")
+            return
+
+        if state["group_templates"] and len(state["group_templates"]) < 2:
+            await bot.send_message(
+                chat_id,
+                "❌ Для случайной пересылки нужно минимум 2 шаблона.",
+                reply_markup=group_templates_keyboard(),
+            )
             return
 
         await bot.send_message(
             chat_id,
-            f"Рассылка запущена.\n"
-            f"Получателей: {len(state['recipients'])}\n"
-            f"Основных сообщений: {len(state['messages'])}\n"
-            f"Шаблонов группы: {len(state['group_templates'])}\n"
-            f"Пауза: {MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} секунд.",
+            "▶️ <b>Рассылка запущена</b>\n\n"
+            f"Аккаунтов: <b>{len(account_ids)}</b>\n"
+            f"Уникальных получателей: <b>{len(jobs)}</b>\n"
+            f"Общих: <b>{len(state['common_recipients'])}</b>\n"
+            f"Пауза: <b>{MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} сек.</b>",
         )
 
-        recipients_snapshot = list(state["recipients"])
-
-        for index, recipient in enumerate(recipients_snapshot, 1):
+        for index, (account_id, recipient, source) in enumerate(jobs, 1):
             if stop_event.is_set():
-                await bot.send_message(chat_id, "Рассылка остановлена.")
+                await bot.send_message(chat_id, "⛔ Рассылка остановлена.")
                 break
+
+            account, client = account_map[account_id]
+            recipient_key = normalize_recipient(recipient)
+            previous_owner = state["recipient_owners"].get(recipient_key)
+
+            if previous_owner and previous_owner != account_id:
+                skipped += 1
+                continue
 
             try:
                 entity = await client.get_entity(recipient)
 
-                for original_text in state["messages"]:
-                    if stop_event.is_set():
-                        break
-                    prepared_text = apply_transliteration(original_text)
-                    await typing_speed_simulate(client, entity, prepared_text)
-                    await client.send_message(entity, prepared_text, link_preview=False)
+                for text in state["messages"]:
+                    await client.send_message(
+                        entity,
+                        text,
+                        link_preview=False,
+                    )
                     await asyncio.sleep(1)
 
-                if stop_event.is_set():
-                    break
-
                 if state["group_templates"]:
-                    try:
-                        selected_template = await send_random_group_template(
-                            client,
-                            entity,
-                            state,
-                        )
-                        save_state(user_id, state)
-                        selected_key = make_template_key(
-                            selected_template["chat_id"],
-                            selected_template["message_id"],
-                        )
-                        log.info(
-                            "Отправлен шаблон %s (%s/%s)",
-                            selected_key,
-                            state["template_usage"].get(selected_key, 0),
-                            MAX_TEMPLATE_SENDS,
-                        )
-                    except TemplatePoolEmptyError:
-                        stop_event.set()
-                        await bot.send_message(
-                            chat_id,
-                            "⚠️ <b>Шаблоны закончились</b>\n\n"
-                            "Нет доступного шаблона для следующей отправки. "
-                            "Каждый шаблон можно использовать не более 100 раз, "
-                            "а один и тот же шаблон нельзя отправлять два раза подряд.\n\n"
-                            "Пополните базу шаблонов в привязанной группе.",
-                            reply_markup=main_keyboard(),
-                        )
-                        await admin_log(
-                            bot,
-                            "⚠️ <b>Шаблоны закончились</b>\n\n"
-                            f"Пользователь:\n{label}\n\n"
-                            "Рассылка остановлена. Пополните базу шаблонов.",
-                        )
-                        break
+                    await send_random_template(client, entity, state)
 
-                sent_recipients += 1
+                # Только после успешной отправки закрепляем адресата.
+                state["recipient_owners"][recipient_key] = account_id
+                save_state(user_id, state)
+                sent += 1
+
+            except TemplatePoolEmptyError:
+                await bot.send_message(
+                    chat_id,
+                    "⚠️ <b>Доступные шаблоны закончились</b>\n\n"
+                    "Пополните базу шаблонов.",
+                    reply_markup=group_templates_keyboard(),
+                )
+                break
 
             except errors.FloodWaitError as exc:
                 wait_seconds = int(exc.seconds)
                 if wait_seconds > MAX_FLOOD_WAIT_SECONDS:
                     await bot.send_message(
                         chat_id,
-                        f"Telegram запросил паузу {wait_seconds} секунд. Рассылка остановлена.",
+                        f"Telegram запросил паузу {wait_seconds} секунд. "
+                        "Рассылка остановлена.",
                     )
                     break
                 await asyncio.sleep(wait_seconds + 2)
@@ -751,54 +873,47 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> Non
                 errors.ChatWriteForbiddenError,
                 errors.UsernameInvalidError,
                 errors.UsernameNotOccupiedError,
+                errors.UserDeactivatedError,
                 ValueError,
-            ) as exc:
+            ):
                 failed += 1
-
-                # Если адресат больше не принимает сообщения, заблокировал
-                # аккаунт, удалил username или указан некорректно — удаляем
-                # его из списка, чтобы при следующем запуске не писать снова.
-                removed = remove_recipient_from_state(
-                    user_id,
-                    state,
-                    recipient,
-                )
-
-                if removed:
-                    log.info(
-                        "Получатель %r удалён из списка после ошибки %s",
-                        recipient,
-                        type(exc).__name__,
-                    )
+                remove_failed_recipient(state, account_id, recipient, source)
+                save_state(user_id, state)
 
             except Exception as exc:
                 failed += 1
-                log.exception("Ошибка рассылки пользователя %s", user_id)
+                log.exception("Ошибка отправки account=%s recipient=%r", account_id, recipient)
                 await admin_log(
                     bot,
-                    f"Ошибка рассылки:\n{label}\n"
-                    f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>",
+                    f"Ошибка отправки:\n"
+                    f"Аккаунт: <code>{html.escape(account_label(account_id, account))}</code>\n"
+                    f"Получатель: <code>{html.escape(str(recipient))}</code>\n"
+                    f"Ошибка: <code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>",
                 )
 
             if index % 10 == 0:
                 await bot.send_message(
                     chat_id,
-                    f"Прогресс: {index}/{len(recipients_snapshot)}\n"
-                    f"Успешных получателей: {sent_recipients}\n"
-                    f"Ошибок: {failed}",
+                    f"Прогресс: {index}/{len(jobs)}\n"
+                    f"Успешно: {sent}\n"
+                    f"Ошибок: {failed}\n"
+                    f"Пропущено: {skipped}",
                 )
 
-            if index < len(recipients_snapshot):
+            if index < len(jobs):
                 await asyncio.sleep(random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
 
         await bot.send_message(
             chat_id,
-            f"Готово.\nУспешных получателей: {sent_recipients}\nОшибок: {failed}",
+            "✅ <b>Готово</b>\n\n"
+            f"Успешно: <b>{sent}</b>\n"
+            f"Ошибок: <b>{failed}</b>\n"
+            f"Пропущено пересечений: <b>{skipped}</b>",
             reply_markup=main_keyboard(),
         )
 
     except Exception as exc:
-        log.exception("Критическая ошибка")
+        log.exception("Критическая ошибка рассылки")
         await bot.send_message(
             chat_id,
             f"Ошибка: <code>{html.escape(str(exc))}</code>",
@@ -809,9 +924,18 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int, label: str) -> Non
         stop_event.clear()
 
 
-async def perform_qr_login(bot: Bot, chat_id: int, user_id: int) -> None:
+# ============================================================
+# QR-ВХОД
+# ============================================================
+
+async def perform_qr_login(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    account_id: str,
+) -> None:
     try:
-        client = await rebuild_client(user_id)
+        client = await rebuild_client(user_id, account_id)
         qr_login = await client.qr_login()
 
         qr = qrcode.QRCode(border=3)
@@ -822,48 +946,88 @@ async def perform_qr_login(bot: Bot, chat_id: int, user_id: int) -> None:
         buffer = BytesIO()
         image.save(buffer, format="PNG")
 
-        sent = await bot.send_photo(
+        sent_message = await bot.send_photo(
             chat_id,
             BufferedInputFile(buffer.getvalue(), filename="telegram_login_qr.png"),
             caption=(
                 "<b>Вход по QR-коду</b>\n\n"
-                "Откройте Telegram: Настройки → Устройства → Подключить устройство."
+                "Telegram → Настройки → Устройства → Подключить устройство."
             ),
         )
 
         try:
             await qr_login.wait(timeout=120)
         except errors.SessionPasswordNeededError:
+            flow_data.setdefault(user_id, {})["account_id"] = account_id
             user_steps[user_id] = "await_qr_2fa"
             await bot.send_message(chat_id, "Введите пароль двухэтапной аутентификации.")
             return
 
-        me = await client.get_me()
+        await update_account_identity(user_id, account_id, client)
         await bot.send_message(
             chat_id,
-            f"✅ Аккаунт подключён: {html.escape(me.first_name or '')}",
+            "✅ Аккаунт подключён.",
             reply_markup=main_keyboard(),
         )
 
         try:
-            await sent.delete()
+            await sent_message.delete()
         except Exception:
             pass
 
     except asyncio.TimeoutError:
-        await bot.send_message(chat_id, "Время QR-кода истекло.", reply_markup=main_keyboard())
+        await bot.send_message(chat_id, "QR-код истёк. Запустите вход снова.")
     except Exception as exc:
         await bot.send_message(
             chat_id,
             f"Ошибка QR-входа: <code>{html.escape(str(exc))}</code>",
-            reply_markup=main_keyboard(),
         )
     finally:
         qr_tasks.pop(user_id, None)
 
 
+# ============================================================
+# КОМАНДЫ И ГРУППЫ
+# ============================================================
+
+@router.message(CommandStart())
+async def start_handler(message: Message, bot: Bot) -> None:
+    load_state(message.from_user.id)
+    await message.answer(
+        "<b>Панель рассылки</b>",
+        reply_markup=main_keyboard(),
+    )
+    await admin_log(bot, f"Запустил бота:\n{event_user_label(message)}")
+
+
+@router.message(Command("menu"))
+async def menu_handler(message: Message) -> None:
+    user_steps.pop(message.from_user.id, None)
+    flow_data.pop(message.from_user.id, None)
+    await message.answer("Главное меню:", reply_markup=main_keyboard())
+
+
+@router.message(Command("bind"))
+async def bind_handler(message: Message) -> None:
+    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        await message.answer("Команду /bind нужно отправить в группе.")
+        return
+
+    state = load_state(message.from_user.id)
+    group_id = int(message.chat.id)
+
+    if group_id not in state["bound_groups"]:
+        state["bound_groups"].append(group_id)
+        save_state(message.from_user.id, state)
+
+    await message.answer(
+        "✅ Группа привязана. Используйте кнопку "
+        "«Просканировать шаблоны» в разделе шаблонов."
+    )
+
+
 def owners_for_group(group_id: int) -> list[int]:
-    owners: list[int] = []
+    owners = []
     if not DATA_DIR.exists():
         return owners
 
@@ -872,131 +1036,39 @@ def owners_for_group(group_id: int) -> list[int]:
             continue
         owner_id = int(directory.name)
         state = load_state(owner_id)
-        if group_id in state["bound_groups"]:
+        if int(group_id) in [int(item) for item in state["bound_groups"]]:
             owners.append(owner_id)
+
     return owners
-
-
-# ============================================================
-# ХЕНДЛЕРЫ
-# ============================================================
-
-@router.message(CommandStart())
-async def start_handler(message: Message, bot: Bot) -> None:
-    load_state(message.from_user.id)
-    await message.answer(
-        "<b>Панель рассылки</b>\n\nПеред входом в аккаунт бот обязательно запросит прокси.",
-        reply_markup=main_keyboard(),
-    )
-    await admin_log(bot, f"Запустил бота:\n{event_user_label(message)}")
-
-
-@router.message(Command("menu"))
-async def menu_command(message: Message) -> None:
-    user_steps.pop(message.from_user.id, None)
-    await message.answer("Главное меню:", reply_markup=main_keyboard())
-
-
-@router.message(Command("bind"))
-async def bind_group_handler(message: Message, bot: Bot) -> None:
-    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        await message.answer("Команду /bind нужно отправить в группе.")
-        return
-
-    user_id = message.from_user.id
-    state = load_state(user_id)
-
-    if message.chat.id not in state["bound_groups"]:
-        state["bound_groups"].append(message.chat.id)
-        save_state(user_id, state)
-
-    await message.answer(
-        "✅ Группа привязана. Новые сообщения этой группы будут сохранены как шаблоны."
-    )
 
 
 @router.message(F.chat.type == ChatType.GROUP)
 @router.message(F.chat.type == ChatType.SUPERGROUP)
-async def capture_group_template(message: Message, bot: Bot) -> None:
-    # Команду привязки не сохраняем как шаблон.
-    if message.text and message.text.split()[0].split("@")[0].lower() == "/bind":
+async def capture_template(message: Message, bot: Bot) -> None:
+    if message.text and message.text.startswith("/bind"):
         return
 
-    log.info(
-        "Получено групповое сообщение: chat=%s message=%s text=%r caption=%r",
-        message.chat.id,
-        message.message_id,
-        message.text,
-        message.caption,
-    )
-
-    owners = owners_for_group(int(message.chat.id))
-    if not owners:
-        log.warning(
-            "Сообщение из группы %s получено, но группа не найдена в bound_groups",
-            message.chat.id,
-        )
+    text = (message.text or message.caption or "").strip()
+    if not contains_required_phrase(text):
         return
 
-    content = get_template_message_text(message)
-    matched_phrase = find_required_template_phrase(message)
-
-    if not content:
-        for owner_id in owners:
-            try:
-                await bot.send_message(
-                    owner_id,
-                    "⚠️ Получено сообщение из привязанной группы, "
-                    "но в нём нет текста или подписи к медиа.",
-                )
-            except Exception:
-                log.exception("Не удалось отправить диагностическое уведомление")
-        return
-
-    if matched_phrase is None:
-        for owner_id in owners:
-            try:
-                await bot.send_message(
-                    owner_id,
-                    "⚠️ <b>Сообщение из группы получено, но не добавлено</b>\n\n"
-                    "Не найдена ключевая фраза:\n"
-                    "• <code>@WorldOfPoizon</code>\n"
-                    "• <code>18.06</code>\n"
-                    "• <code>Egor Sobolev</code>\n\n"
-                    f"Полученный текст: <code>{html.escape(content[:500])}</code>",
-                )
-            except Exception:
-                log.exception("Не удалось отправить диагностическое уведомление")
-        return
-
-    for owner_id in owners:
+    for owner_id in owners_for_group(message.chat.id):
         state = load_state(owner_id)
         ref = {
             "chat_id": int(message.chat.id),
             "message_id": int(message.message_id),
         }
 
+        # Два разных сообщения с одинаковым текстом разрешены.
+        # Повторно не добавляется только то же самое сообщение
+        # с тем же chat_id и message_id.
         if ref in state["group_templates"]:
-            try:
-                await bot.send_message(owner_id, "ℹ️ Этот шаблон уже находится в базе.")
-            except Exception:
-                pass
             continue
 
         state["group_templates"].append(ref)
         state["group_templates"] = state["group_templates"][-MAX_GROUP_TEMPLATES:]
 
-        valid_keys = {
-            make_template_key(item["chat_id"], item["message_id"])
-            for item in state["group_templates"]
-        }
-        state["template_usage"] = {
-            key: int(value)
-            for key, value in state.setdefault("template_usage", {}).items()
-            if key in valid_keys
-        }
-
-        key = make_template_key(message.chat.id, message.message_id)
+        key = make_template_key(ref["chat_id"], ref["message_id"])
         state["template_usage"].setdefault(key, 0)
         save_state(owner_id, state)
 
@@ -1004,312 +1076,458 @@ async def capture_group_template(message: Message, bot: Bot) -> None:
             await bot.send_message(
                 owner_id,
                 "✅ <b>Шаблон добавлен</b>\n\n"
-                f"Ключевая фраза: <code>{html.escape(matched_phrase)}</code>\n"
-                f"Группа: <code>{message.chat.id}</code>\n"
-                f"ID сообщения: <code>{message.message_id}</code>\n"
                 f"Всего шаблонов: <b>{len(state['group_templates'])}</b>",
             )
         except Exception:
-            log.exception("Не удалось уведомить владельца %s", owner_id)
+            pass
 
+
+# ============================================================
+# ПРИВАТНЫЙ ВВОД
+# ============================================================
 
 @router.message(F.chat.type == ChatType.PRIVATE)
-async def private_input_handler(message: Message, bot: Bot) -> None:
+async def private_input(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id
-
-    if message.text and is_spam_block_message(message.text):
-        await handle_spam_block(user_id, bot, message)
-        return
-
     step = user_steps.get(user_id)
     text = (message.text or "").strip()
+    data = flow_data.setdefault(user_id, {})
 
     if not step:
         await message.answer("Используйте кнопки меню.", reply_markup=main_keyboard())
         return
 
+    if step == "await_account_tag":
+        if not text:
+            await message.answer("Тег не может быть пустым.")
+            return
+
+        state = load_state(user_id)
+        account_id = f"account_{state['next_account_number']}"
+        state["next_account_number"] += 1
+        state["accounts"][account_id] = {
+            "tag": text[:50],
+            "proxy": None,
+            "telegram_id": None,
+            "username": None,
+            "first_name": None,
+        }
+        state["individual_recipients"][account_id] = []
+        state["active_account_id"] = account_id
+        save_state(user_id, state)
+
+        user_steps.pop(user_id, None)
+        await message.answer(
+            "Аккаунт создан. Выберите протокол прокси:",
+            reply_markup=proxy_protocol_keyboard(account_id),
+        )
+        return
+
+    if step == "await_rename_account":
+        account_id = data.get("account_id")
+        state = load_state(user_id)
+        if account_id not in state["accounts"]:
+            await message.answer("Аккаунт не найден.")
+            return
+        state["accounts"][account_id]["tag"] = text[:50]
+        save_state(user_id, state)
+        user_steps.pop(user_id, None)
+        await message.answer("✅ Тег изменён.", reply_markup=accounts_keyboard(state))
+        return
+
     if step == "await_proxy":
+        account_id = data.get("account_id")
+        protocol = data.get("protocol")
         try:
-            protocol = pending_proxy_protocols.get(user_id)
             proxy = parse_proxy(text, protocol)
             state = load_state(user_id)
-            state["proxy"] = proxy
+            state["accounts"][account_id]["proxy"] = proxy
             save_state(user_id, state)
-            pending_proxy[user_id] = proxy
 
-            client = await rebuild_client(user_id)
+            client = await rebuild_client(user_id, account_id)
+            user_steps.pop(user_id, None)
+
             if await client.is_user_authorized():
-                user_steps.pop(user_id, None)
-                pending_proxy_protocols.pop(user_id, None)
-                await message.answer("Прокси подключён. Аккаунт уже авторизован.", reply_markup=main_keyboard())
+                await update_account_identity(user_id, account_id, client)
+                await message.answer(
+                    "✅ Прокси подключён. Аккаунт уже авторизован.",
+                    reply_markup=main_keyboard(),
+                )
             else:
-                user_steps.pop(user_id, None)
-                pending_proxy_protocols.pop(user_id, None)
-                await message.answer("✅ Прокси подключён. Выберите способ входа:", reply_markup=login_method_keyboard())
+                await message.answer(
+                    "✅ Прокси подключён. Выберите способ входа:",
+                    reply_markup=login_method_keyboard(account_id),
+                )
         except Exception as exc:
-            await message.answer(f"Прокси не подключён:\n<code>{html.escape(str(exc))}</code>")
+            await message.answer(
+                f"Прокси не подключён:\n<code>{html.escape(str(exc))}</code>"
+            )
         return
 
     if step == "await_phone":
+        account_id = data.get("account_id")
         try:
-            client = await rebuild_client(user_id)
+            client = await rebuild_client(user_id, account_id)
             await client.send_code_request(text)
-            pending_phones[user_id] = text
+            data["phone"] = text
             user_steps[user_id] = "await_code"
             await message.answer("Код отправлен. Введите его цифрами.")
         except Exception as exc:
-            await message.answer(f"Не удалось отправить код:\n<code>{html.escape(str(exc))}</code>")
+            await message.answer(
+                f"Не удалось отправить код:\n<code>{html.escape(str(exc))}</code>"
+            )
         return
 
     if step == "await_code":
-        phone = pending_phones.get(user_id)
-        if not phone:
-            user_steps.pop(user_id, None)
-            await message.answer("Начните вход заново.", reply_markup=main_keyboard())
-            return
+        account_id = data.get("account_id")
+        phone = data.get("phone")
         try:
-            client = await get_client(user_id)
+            client = await get_client(user_id, account_id)
             await client.sign_in(phone=phone, code=text.replace(" ", ""))
-            pending_phones.pop(user_id, None)
+            await update_account_identity(user_id, account_id, client)
             user_steps.pop(user_id, None)
             await message.answer("✅ Аккаунт подключён.", reply_markup=main_keyboard())
         except errors.SessionPasswordNeededError:
             user_steps[user_id] = "await_2fa"
             await message.answer("Введите пароль двухэтапной аутентификации.")
         except Exception as exc:
-            await message.answer(f"Ошибка входа:\n<code>{html.escape(str(exc))}</code>")
+            await message.answer(
+                f"Ошибка входа:\n<code>{html.escape(str(exc))}</code>"
+            )
         return
 
     if step in {"await_2fa", "await_qr_2fa"}:
+        account_id = data.get("account_id")
         try:
-            client = await get_client(user_id)
+            client = await get_client(user_id, account_id)
             await client.sign_in(password=text)
+            await update_account_identity(user_id, account_id, client)
             user_steps.pop(user_id, None)
-            pending_phones.pop(user_id, None)
             await message.answer("✅ Аккаунт подключён.", reply_markup=main_keyboard())
         except Exception as exc:
-            await message.answer(f"Ошибка 2FA:\n<code>{html.escape(str(exc))}</code>")
+            await message.answer(
+                f"Ошибка 2FA:\n<code>{html.escape(str(exc))}</code>"
+            )
         return
 
-    if step == "await_messages_loop":
+    if step == "await_messages":
         if not text:
-            await message.answer("Сообщение не может быть пустым.", reply_markup=adding_messages_keyboard())
+            await message.answer(
+                "Сообщение не может быть пустым.",
+                reply_markup=adding_messages_keyboard(),
+            )
             return
 
         state = load_state(user_id)
-        if len(state["messages"]) >= MAX_TEXT_TEMPLATES:
+        if len(state["messages"]) >= MAX_TEXT_MESSAGES:
             user_steps.pop(user_id, None)
             await message.answer(
-                f"Достигнут лимит: {MAX_TEXT_TEMPLATES} сообщений.",
+                f"Достигнут лимит {MAX_TEXT_MESSAGES}.",
                 reply_markup=messages_keyboard(),
             )
             return
 
         state["messages"].append(text)
         save_state(user_id, state)
-        current_count = len(state["messages"])
 
         await message.answer(
-            f"✅ Добавлено сообщение №{current_count}.\n\n"
-            "Отправьте следующее сообщение или нажмите «Завершить».",
+            f"✅ Добавлено: {len(state['messages'])}/{MAX_TEXT_MESSAGES}\n"
+            "Отправьте следующее или нажмите «Завершить».",
             reply_markup=adding_messages_keyboard(),
         )
-
-        if current_count >= MAX_TEXT_TEMPLATES:
-            user_steps.pop(user_id, None)
-            await message.answer(
-                f"Добавлено максимальное количество сообщений: {MAX_TEXT_TEMPLATES}.",
-                reply_markup=messages_keyboard(),
-            )
         return
 
-    if step == "await_recipients":
+    if step == "await_common_recipients":
         state = load_state(user_id)
+        values = parse_recipients(text)
+        existing = {normalize_recipient(item) for item in state["common_recipients"]}
         added = 0
-        skipped = 0
 
-        # Разрешены разделители: пробел, запятая, точка с запятой
-        # или перенос строки.
-        values = re.split(r"[\s,;]+", text)
-
-        for raw_value in values:
-            value = raw_value.strip()
-            if not value:
-                continue
-
-            # Ссылки t.me/username приводим к @username.
-            value = re.sub(
-                r"^https?://(?:www\.)?t\.me/",
-                "@",
-                value,
-                flags=re.IGNORECASE,
-            )
-
-            # Удаляем завершающий слеш у ссылки/username.
-            value = value.rstrip("/")
-
-            parsed: str | int = (
-                int(value)
-                if value.lstrip("-").isdigit()
-                else value
-            )
-
-            if parsed in state["recipients"]:
-                skipped += 1
-                continue
-
-            state["recipients"].append(parsed)
-            added += 1
+        for item in values:
+            key = normalize_recipient(item)
+            if key not in existing:
+                state["common_recipients"].append(item)
+                existing.add(key)
+                added += 1
 
         save_state(user_id, state)
         user_steps.pop(user_id, None)
-
         await message.answer(
-            f"✅ Добавлено: {added}\n"
-            f"Пропущено повторов: {skipped}\n"
-            f"Всего получателей: {len(state['recipients'])}",
-            reply_markup=main_keyboard(),
+            f"✅ В общий список добавлено: {added}\n"
+            f"Всего: {len(state['common_recipients'])}",
+            reply_markup=recipients_keyboard(),
         )
+        return
+
+    if step == "await_individual_recipients":
+        account_id = data.get("account_id")
+        state = load_state(user_id)
+        target = state["individual_recipients"].setdefault(account_id, [])
+        values = parse_recipients(text)
+        existing = {normalize_recipient(item) for item in target}
+        added = 0
+
+        for item in values:
+            key = normalize_recipient(item)
+            if key not in existing:
+                target.append(item)
+                existing.add(key)
+                added += 1
+
+        save_state(user_id, state)
+        user_steps.pop(user_id, None)
+        account = state["accounts"][account_id]
+        await message.answer(
+            f"✅ Для аккаунта <b>{html.escape(account['tag'])}</b> добавлено: {added}\n"
+            f"Всего: {len(target)}",
+            reply_markup=recipients_keyboard(),
+        )
+        return
 
 
 # ============================================================
-# CALLBACK ХЕНДЛЕРЫ
+# CALLBACK: МЕНЮ
 # ============================================================
 
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery) -> None:
     user_steps.pop(callback.from_user.id, None)
-    await callback.message.edit_text("<b>Панель рассылки</b>", reply_markup=main_keyboard())
+    flow_data.pop(callback.from_user.id, None)
+    await callback.message.edit_text(
+        "<b>Панель рассылки</b>",
+        reply_markup=main_keyboard(),
+    )
     await callback.answer()
 
 
-@router.callback_query(F.data == "account")
-async def account_callback(callback: CallbackQuery) -> None:
+# ============================================================
+# CALLBACK: АККАУНТЫ
+# ============================================================
+
+@router.callback_query(F.data == "accounts")
+async def accounts_callback(callback: CallbackQuery) -> None:
+    state = load_state(callback.from_user.id)
+    await callback.message.edit_text(
+        f"<b>Аккаунты: {len(state['accounts'])}</b>\n\n"
+        "У каждого аккаунта собственный тег, прокси, сессия "
+        "и индивидуальный список получателей.",
+        reply_markup=accounts_keyboard(state),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "add_account")
+async def add_account_callback(callback: CallbackQuery) -> None:
+    user_steps[callback.from_user.id] = "await_account_tag"
+    await callback.message.edit_text(
+        "Введите тег нового аккаунта.\n\n"
+        "Например: <code>Основной</code> или <code>Аккаунт 2</code>",
+        reply_markup=back_keyboard("accounts"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("select_account:"))
+async def select_account_callback(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
-    summary, authorized = await account_summary(user_id)
+    account_id = callback.data.split(":", 1)[1]
+    state = load_state(user_id)
+    account = state["accounts"].get(account_id)
 
-    if authorized:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🚪 Выйти из аккаунта", callback_data="logout")],
-                [InlineKeyboardButton(text="🔄 Переподключить", callback_data="begin_proxy")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-            ]
-        )
-        await callback.message.edit_text(f"<b>Аккаунт</b>\n\n{summary}", reply_markup=keyboard)
-    else:
-        await callback.message.edit_text(
-            f"<b>Подключение аккаунта</b>\n\n{summary}\n\nСначала необходимо указать прокси.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="Продолжить", callback_data="begin_proxy")],
-                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-                ]
-            ),
-        )
+    if not account:
+        await callback.answer("Аккаунт не найден", show_alert=True)
+        return
+
+    state["active_account_id"] = account_id
+    save_state(user_id, state)
+
+    proxy = account.get("proxy")
+    proxy_name = proxy["type"].upper() if proxy else "не задан"
+    individual_count = len(state["individual_recipients"].get(account_id, []))
+
+    await callback.message.edit_text(
+        "<b>Аккаунт</b>\n\n"
+        f"Тег: <b>{html.escape(account.get('tag') or account_id)}</b>\n"
+        f"Telegram ID: <code>{account.get('telegram_id') or 'не подключён'}</code>\n"
+        f"Username: "
+        f"{'@' + account['username'] if account.get('username') else 'нет'}\n"
+        f"Прокси: <b>{proxy_name}</b>\n"
+        f"Индивидуальных получателей: <b>{individual_count}</b>",
+        reply_markup=account_actions_keyboard(account_id),
+    )
     await callback.answer()
 
 
-@router.callback_query(F.data == "begin_proxy")
-async def begin_proxy_callback(callback: CallbackQuery) -> None:
-    user_steps.pop(callback.from_user.id, None)
-    pending_proxy_protocols.pop(callback.from_user.id, None)
+@router.callback_query(F.data.startswith("rename_account:"))
+async def rename_account_callback(callback: CallbackQuery) -> None:
+    account_id = callback.data.split(":", 1)[1]
+    flow_data[callback.from_user.id] = {"account_id": account_id}
+    user_steps[callback.from_user.id] = "await_rename_account"
+    await callback.message.edit_text(
+        "Введите новый тег аккаунта:",
+        reply_markup=back_keyboard(f"select_account:{account_id}"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("account_proxy:"))
+async def account_proxy_callback(callback: CallbackQuery) -> None:
+    account_id = callback.data.split(":", 1)[1]
     await callback.message.edit_text(
         "<b>Выберите протокол прокси:</b>",
-        reply_markup=proxy_protocol_keyboard(),
+        reply_markup=proxy_protocol_keyboard(account_id),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("proxy_protocol:"))
 async def proxy_protocol_callback(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    protocol = callback.data.split(":", 1)[1].lower()
-    pending_proxy_protocols[user_id] = protocol
-    user_steps[user_id] = "await_proxy"
+    _, account_id, protocol = callback.data.split(":", 2)
+    flow_data[callback.from_user.id] = {
+        "account_id": account_id,
+        "protocol": protocol,
+    }
+    user_steps[callback.from_user.id] = "await_proxy"
 
     if protocol == "mtproto":
-        example = "196.19.123.231:443:SECRET"
         format_text = "IP:ПОРТ:SECRET"
+        example = "196.19.123.231:443:SECRET"
     else:
-        example = "196.19.123.231:8000:xm4Wj1:D2mF2K"
         format_text = "IP:ПОРТ:ЛОГИН:ПАРОЛЬ"
+        example = "196.19.123.231:8000:xm4Wj1:D2mF2K"
 
     await callback.message.edit_text(
         f"<b>Введите {protocol.upper()}-прокси</b>\n\n"
         f"Формат: <code>{format_text}</code>\n"
         f"Пример: <code>{html.escape(example)}</code>",
-        reply_markup=back_keyboard(),
+        reply_markup=back_keyboard(f"select_account:{account_id}"),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "login_phone")
+@router.callback_query(F.data.startswith("login_phone:"))
 async def login_phone_callback(callback: CallbackQuery) -> None:
+    account_id = callback.data.split(":", 1)[1]
+    flow_data[callback.from_user.id] = {"account_id": account_id}
     user_steps[callback.from_user.id] = "await_phone"
+
     await callback.message.edit_text(
-        "Введите номер телефона в международном формате:\n<code>+79991234567</code>",
-        reply_markup=back_keyboard(),
+        "Введите номер телефона:\n<code>+79991234567</code>",
+        reply_markup=back_keyboard(f"select_account:{account_id}"),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "login_qr")
+@router.callback_query(F.data.startswith("login_qr:"))
 async def login_qr_callback(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
-    old_task = qr_tasks.get(user_id)
-    if old_task and not old_task.done():
-        await callback.answer("QR-код уже создан", show_alert=True)
+    account_id = callback.data.split(":", 1)[1]
+
+    old = qr_tasks.get(user_id)
+    if old and not old.done():
+        await callback.answer("QR-вход уже запущен", show_alert=True)
         return
 
+    flow_data[user_id] = {"account_id": account_id}
     qr_tasks[user_id] = asyncio.create_task(
-        perform_qr_login(bot, callback.message.chat.id, user_id)
+        perform_qr_login(bot, callback.message.chat.id, user_id, account_id)
     )
     await callback.answer("Создаю QR-код")
 
 
-@router.callback_query(F.data == "logout")
-async def logout_callback(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("logout_account:"))
+async def logout_account_callback(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
+    account_id = callback.data.split(":", 1)[1]
+
     try:
-        client = await get_client(user_id)
+        client = await get_client(user_id, account_id)
         await client.log_out()
-        user_clients.pop(user_id, None)
-        await callback.message.edit_text("Аккаунт отключён.", reply_markup=main_keyboard())
+        user_clients.pop((user_id, account_id), None)
+
+        state = load_state(user_id)
+        account = state["accounts"].get(account_id)
+        if account:
+            account["telegram_id"] = None
+            account["username"] = None
+            account["first_name"] = None
+            save_state(user_id, state)
+
+        await callback.message.edit_text(
+            "Аккаунт отключён.",
+            reply_markup=accounts_keyboard(state),
+        )
     except Exception as exc:
         await callback.answer(str(exc), show_alert=True)
         return
+
     await callback.answer()
 
+
+@router.callback_query(F.data.startswith("delete_account:"))
+async def delete_account_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    account_id = callback.data.split(":", 1)[1]
+    state = load_state(user_id)
+
+    client = user_clients.pop((user_id, account_id), None)
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    state["accounts"].pop(account_id, None)
+    state["individual_recipients"].pop(account_id, None)
+
+    # Удаляем закрепления удалённого аккаунта.
+    state["recipient_owners"] = {
+        key: owner
+        for key, owner in state["recipient_owners"].items()
+        if owner != account_id
+    }
+
+    if state.get("active_account_id") == account_id:
+        state["active_account_id"] = next(iter(state["accounts"]), None)
+
+    save_state(user_id, state)
+
+    await callback.message.edit_text(
+        "Аккаунт удалён.",
+        reply_markup=accounts_keyboard(state),
+    )
+    await callback.answer()
+
+
+# ============================================================
+# CALLBACK: СООБЩЕНИЯ
+# ============================================================
 
 @router.callback_query(F.data == "messages")
 async def messages_callback(callback: CallbackQuery) -> None:
     state = load_state(callback.from_user.id)
-    if state["messages"]:
-        preview = "\n\n".join(
-            f"<b>{index}.</b> {html.escape(text[:300])}"
-            for index, text in enumerate(state["messages"], 1)
-        )
-    else:
-        preview = "Сообщения ещё не добавлены."
+    preview = "\n\n".join(
+        f"<b>{index}.</b> {html.escape(text[:300])}"
+        for index, text in enumerate(state["messages"], 1)
+    ) or "Сообщения ещё не добавлены."
 
     await callback.message.edit_text(
-        f"<b>Основные сообщения: {len(state['messages'])}/{MAX_TEXT_TEMPLATES}</b>\n\n{preview}",
+        f"<b>Сообщения: {len(state['messages'])}/{MAX_TEXT_MESSAGES}</b>\n\n"
+        f"{preview}",
         reply_markup=messages_keyboard(),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "add_message")
-async def add_message_callback(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "add_messages")
+async def add_messages_callback(callback: CallbackQuery) -> None:
     state = load_state(callback.from_user.id)
-    if len(state["messages"]) >= MAX_TEXT_TEMPLATES:
-        await callback.answer(f"Можно добавить максимум {MAX_TEXT_TEMPLATES} сообщений", show_alert=True)
+    if len(state["messages"]) >= MAX_TEXT_MESSAGES:
+        await callback.answer("Достигнут лимит", show_alert=True)
         return
 
-    user_steps[callback.from_user.id] = "await_messages_loop"
+    user_steps[callback.from_user.id] = "await_messages"
     await callback.message.edit_text(
-        "<b>Добавление сообщений</b>\n\n"
         "Введите сообщение. После сохранения можно сразу отправить следующее.\n"
         "Когда закончите — нажмите «Завершить».",
         reply_markup=adding_messages_keyboard(),
@@ -1317,8 +1535,8 @@ async def add_message_callback(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "finish_adding_messages")
-async def finish_adding_messages_callback(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "finish_messages")
+async def finish_messages_callback(callback: CallbackQuery) -> None:
     user_steps.pop(callback.from_user.id, None)
     await callback.answer("Добавление завершено")
     await messages_callback(callback)
@@ -1331,118 +1549,384 @@ async def delete_message_callback(callback: CallbackQuery) -> None:
         await callback.answer("Удалять нечего", show_alert=True)
         return
 
-    buttons = [
-        [InlineKeyboardButton(text=f"Удалить №{i}", callback_data=f"delmsg:{i - 1}")]
-        for i in range(1, len(state["messages"]) + 1)
+    rows = [
+        [InlineKeyboardButton(
+            text=f"Удалить №{index + 1}",
+            callback_data=f"delete_message_index:{index}",
+        )]
+        for index in range(len(state["messages"]))
     ]
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="messages")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="messages")])
+
     await callback.message.edit_text(
         "Выберите сообщение:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("delmsg:"))
-async def delete_selected_message(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("delete_message_index:"))
+async def delete_message_index_callback(callback: CallbackQuery) -> None:
+    index = int(callback.data.split(":", 1)[1])
     state = load_state(callback.from_user.id)
-    try:
-        index = int(callback.data.split(":", 1)[1])
+
+    if 0 <= index < len(state["messages"]):
         state["messages"].pop(index)
         save_state(callback.from_user.id, state)
-        await callback.answer("Удалено")
-        await messages_callback(callback)
-    except (ValueError, IndexError):
-        await callback.answer("Сообщение уже отсутствует", show_alert=True)
 
+    await callback.answer("Удалено")
+    await messages_callback(callback)
+
+
+# ============================================================
+# CALLBACK: ПОЛУЧАТЕЛИ
+# ============================================================
 
 @router.callback_query(F.data == "recipients")
 async def recipients_callback(callback: CallbackQuery) -> None:
     state = load_state(callback.from_user.id)
-    preview = "\n".join(
-        f"{i}. <code>{html.escape(str(item))}</code>"
-        for i, item in enumerate(state["recipients"][:30], 1)
-    ) or "Список пуст."
+
+    lines = [
+        "<b>Получатели</b>",
+        "",
+        f"Общий список: <b>{len(state['common_recipients'])}</b>",
+        "",
+        "<b>Индивидуальные списки:</b>",
+    ]
+
+    if state["accounts"]:
+        for account_id, account in state["accounts"].items():
+            count = len(state["individual_recipients"].get(account_id, []))
+            lines.append(
+                f"• {html.escape(account_label(account_id, account))}: <b>{count}</b>"
+            )
+    else:
+        lines.append("Нет аккаунтов.")
+
+    lines.extend([
+        "",
+        "<b>Общий</b> — список распределяется между всеми аккаунтами.",
+        "<b>Индивидуальный</b> — список используется только выбранным аккаунтом.",
+        "",
+        "Один и тот же получатель не отправляется двум разным аккаунтам.",
+    ])
 
     await callback.message.edit_text(
-        f"<b>Получатели: {len(state['recipients'])}</b>\n\n{preview}",
+        "\n".join(lines),
         reply_markup=recipients_keyboard(),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "add_recipients")
-async def add_recipients_callback(callback: CallbackQuery) -> None:
-    user_steps[callback.from_user.id] = "await_recipients"
+@router.callback_query(F.data == "recipient_mode")
+async def recipient_mode_callback(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
-        "<b>Добавление получателей</b>\n\n"
-        "Отправьте @username, ссылки или ID.\n"
-        "Можно разделять пробелом, запятой или новой строкой.\n\n"
-        "Пример:\n"
-        "<code>@user1, @user2 123456789\nhttps://t.me/user3</code>",
-        reply_markup=back_keyboard(),
+        "<b>Выберите режим добавления</b>\n\n"
+        "<b>Индивидуальный</b> — список только для одного аккаунта.\n"
+        "<b>Общий</b> — список для всех аккаунтов сразу.",
+        reply_markup=recipient_mode_keyboard(),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "clear_recipients")
-async def clear_recipients_callback(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "recipient_mode:common")
+async def common_mode_callback(callback: CallbackQuery) -> None:
+    user_steps[callback.from_user.id] = "await_common_recipients"
+    await callback.message.edit_text(
+        "Отправьте получателей через пробел, запятую или новую строку.\n\n"
+        "Пример:\n<code>@user1, @user2\n123456789</code>",
+        reply_markup=back_keyboard("recipients"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "recipient_mode:individual")
+async def individual_mode_callback(callback: CallbackQuery) -> None:
     state = load_state(callback.from_user.id)
-    state["recipients"] = []
+    if not state["accounts"]:
+        await callback.answer("Сначала добавьте аккаунт", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "Выберите аккаунт по тегу и Telegram ID:",
+        reply_markup=account_choice_keyboard(
+            state,
+            "choose_individual_account",
+            back="recipients",
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("choose_individual_account:"))
+async def choose_individual_account_callback(callback: CallbackQuery) -> None:
+    account_id = callback.data.split(":", 1)[1]
+    flow_data[callback.from_user.id] = {"account_id": account_id}
+    user_steps[callback.from_user.id] = "await_individual_recipients"
+
+    await callback.message.edit_text(
+        "Отправьте получателей через пробел, запятую или новую строку.",
+        reply_markup=back_keyboard("recipients"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clear_recipients_menu")
+async def clear_recipients_menu_callback(callback: CallbackQuery) -> None:
+    state = load_state(callback.from_user.id)
+    await callback.message.edit_text(
+        "Что очистить?",
+        reply_markup=clear_recipients_keyboard(state),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clear_common_recipients")
+async def clear_common_recipients_callback(callback: CallbackQuery) -> None:
+    state = load_state(callback.from_user.id)
+    state["common_recipients"] = []
     save_state(callback.from_user.id, state)
-    await callback.answer("Список очищен")
+    await callback.answer("Общий список очищен")
     await recipients_callback(callback)
 
 
-@router.callback_query(F.data == "group_templates")
-async def group_templates_callback(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "clear_all_recipients")
+async def clear_all_recipients_callback(callback: CallbackQuery) -> None:
     state = load_state(callback.from_user.id)
-    groups = "\n".join(
-        f"• <code>{group_id}</code>"
-        for group_id in state["bound_groups"]
-    ) or "Нет привязанных групп."
+    state["common_recipients"] = []
+    state["individual_recipients"] = {
+        account_id: [] for account_id in state["accounts"]
+    }
+    state["recipient_owners"] = {}
+    save_state(callback.from_user.id, state)
+    await callback.answer("Все списки очищены")
+    await recipients_callback(callback)
 
-    usage = state.setdefault("template_usage", {})
-    total_sends = sum(int(value) for value in usage.values())
-    exhausted = 0
-    for template in state["group_templates"]:
-        key = make_template_key(template["chat_id"], template["message_id"])
-        if int(usage.get(key, 0)) >= MAX_TEMPLATE_SENDS:
-            exhausted += 1
+
+@router.callback_query(F.data == "choose_clear_individual")
+async def choose_clear_individual_callback(callback: CallbackQuery) -> None:
+    state = load_state(callback.from_user.id)
+    await callback.message.edit_text(
+        "Выберите аккаунт:",
+        reply_markup=account_choice_keyboard(
+            state,
+            "clear_individual_account",
+            back="recipients",
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("clear_individual_account:"))
+async def clear_individual_account_callback(callback: CallbackQuery) -> None:
+    account_id = callback.data.split(":", 1)[1]
+    state = load_state(callback.from_user.id)
+    state["individual_recipients"][account_id] = []
+    save_state(callback.from_user.id, state)
+    await callback.answer("Индивидуальный список очищен")
+    await recipients_callback(callback)
+
+
+# ============================================================
+# CALLBACK: ШАБЛОНЫ
+# ============================================================
+
+async def group_names(bot: Bot, group_ids: list[int]) -> str:
+    if not group_ids:
+        return "Нет привязанных групп."
+
+    result = []
+    for group_id in group_ids:
+        try:
+            chat = await bot.get_chat(group_id)
+            result.append(f"• {html.escape(chat.title or str(group_id))}")
+        except Exception:
+            result.append(f"• {group_id}")
+    return "\n".join(result)
+
+
+@router.callback_query(F.data == "group_templates")
+async def group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
+    state = load_state(callback.from_user.id)
+    names = await group_names(bot, state["bound_groups"])
+
+    total_sends = sum(int(value) for value in state["template_usage"].values())
+    exhausted = sum(
+        1
+        for template in state["group_templates"]
+        if int(state["template_usage"].get(
+            make_template_key(template["chat_id"], template["message_id"]),
+            0,
+        )) >= MAX_TEMPLATE_SENDS
+    )
 
     await callback.message.edit_text(
-        f"<b>Шаблоны из групп</b>\n\n"
-        f"Привязанные группы:\n{groups}\n\n"
+        "<b>Шаблоны из групп</b>\n\n"
+        f"Привязанные группы:\n{names}\n\n"
         f"Сохранено шаблонов: <b>{len(state['group_templates'])}</b>\n"
         f"Всего отправок шаблонов: <b>{total_sends}</b>\n"
         f"Исчерпали лимит: <b>{exhausted}</b>\n\n"
-        "В базу попадают только сообщения, содержащие хотя бы одну фразу:\n"
+        "В базу попадают только сообщения, содержащие хотя бы одну из этих фраз:\n"
         "• <code>@WorldOfPoizon</code>\n"
         "• <code>18.06</code>\n"
         "• <code>Egor Sobolev</code>\n\n"
         "Каждому получателю пересылается один случайный шаблон. "
         "Он не повторяется два раза подряд и может быть использован "
-        f"не более {MAX_TEMPLATE_SENDS} раз.",
+        f"не более {MAX_TEMPLATE_SENDS} раз.\n\n"
+        "Одинаковые по содержанию сообщения разрешены. "
+        "Повторно не добавляется только то же сообщение группы.",
         reply_markup=group_templates_keyboard(),
     )
     await callback.answer()
 
 
+@router.callback_query(F.data == "scan_group_templates")
+async def scan_group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    state = load_state(user_id)
+
+    if not state["bound_groups"]:
+        await callback.answer("Сначала привяжите группу через /bind", show_alert=True)
+        return
+
+    accounts = await authorized_accounts(user_id)
+    if not accounts:
+        await callback.answer("Сначала подключите аккаунт", show_alert=True)
+        return
+
+    await callback.answer("Сканирование запущено")
+    status = await callback.message.answer("🔎 Сканирую сообщения…")
+
+    added = 0
+    scanned = 0
+    errors_count = 0
+
+    existing_refs = {
+        make_template_key(item["chat_id"], item["message_id"])
+        for item in state["group_templates"]
+    }
+
+    for group_id in state["bound_groups"]:
+        source = None
+        source_client = None
+
+        for _, _, client in accounts:
+            try:
+                source = await resolve_dialog_entity(client, int(group_id))
+                source_client = client
+                break
+            except Exception:
+                continue
+
+        if source is None or source_client is None:
+            errors_count += 1
+            continue
+
+        try:
+            async for tg_message in source_client.iter_messages(
+                source,
+                limit=SCAN_MESSAGE_LIMIT,
+            ):
+                scanned += 1
+                if not contains_required_phrase(tg_message.message or ""):
+                    continue
+
+                ref_key = make_template_key(group_id, tg_message.id)
+                if ref_key in existing_refs:
+                    continue
+
+                # Одинаковый текст допускается, если это другое сообщение.
+                state["group_templates"].append({
+                    "chat_id": int(group_id),
+                    "message_id": int(tg_message.id),
+                })
+                state["template_usage"].setdefault(ref_key, 0)
+                existing_refs.add(ref_key)
+                added += 1
+
+                if len(state["group_templates"]) >= MAX_GROUP_TEMPLATES:
+                    break
+        except Exception:
+            errors_count += 1
+            log.exception("Ошибка сканирования группы %s", group_id)
+
+    state["group_templates"] = state["group_templates"][-MAX_GROUP_TEMPLATES:]
+    valid_keys = {
+        make_template_key(item["chat_id"], item["message_id"])
+        for item in state["group_templates"]
+    }
+    state["template_usage"] = {
+        key: int(value)
+        for key, value in state["template_usage"].items()
+        if key in valid_keys
+    }
+    save_state(user_id, state)
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    total = len(state["group_templates"])
+    if total < 2:
+        await bot.send_message(
+            callback.message.chat.id,
+            "❌ <b>Недостаточно шаблонов</b>\n\n"
+            f"Найдено: <b>{total}</b>. Нужно минимум 2.\n"
+            "Пополните привязанную группу подходящими сообщениями.",
+            reply_markup=group_templates_keyboard(),
+        )
+        return
+
+    await bot.send_message(
+        callback.message.chat.id,
+        "✅ <b>Сканирование завершено</b>\n\n"
+        f"Проверено сообщений: <b>{scanned}</b>\n"
+        f"Добавлено новых шаблонов: <b>{added}</b>\n"
+        f"Всего шаблонов: <b>{total}</b>\n"
+        f"Ошибок групп: <b>{errors_count}</b>",
+        reply_markup=group_templates_keyboard(),
+    )
+
+
 @router.callback_query(F.data == "clear_group_templates")
-async def clear_group_templates_callback(callback: CallbackQuery) -> None:
+async def clear_group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
     state = load_state(callback.from_user.id)
     state["group_templates"] = []
     state["template_usage"] = {}
     state["last_template_key"] = None
     save_state(callback.from_user.id, state)
     await callback.answer("Шаблоны очищены")
-    await group_templates_callback(callback)
+    await group_templates_callback(callback, bot)
 
+
+# ============================================================
+# CALLBACK: СТАТУС И РАССЫЛКА
+# ============================================================
 
 @router.callback_query(F.data == "status")
 async def status_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    state = load_state(user_id)
+    accounts = await authorized_accounts(user_id)
+    running = (
+        user_id in broadcast_tasks
+        and not broadcast_tasks[user_id].done()
+    )
+
+    total_individual = sum(
+        len(items) for items in state["individual_recipients"].values()
+    )
+
     await callback.message.edit_text(
-        await full_status(callback.from_user.id),
+        "<b>Статус</b>\n\n"
+        f"Аккаунтов в базе: <b>{len(state['accounts'])}</b>\n"
+        f"Авторизовано: <b>{len(accounts)}</b>\n"
+        f"Основных сообщений: <b>{len(state['messages'])}</b>\n"
+        f"Общих получателей: <b>{len(state['common_recipients'])}</b>\n"
+        f"Индивидуальных получателей: <b>{total_individual}</b>\n"
+        f"Шаблонов: <b>{len(state['group_templates'])}</b>\n"
+        f"Рассылка: <b>{'идёт' if running else 'остановлена'}</b>",
         reply_markup=main_keyboard(),
     )
     await callback.answer()
@@ -1451,13 +1935,14 @@ async def status_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "start_broadcast")
 async def start_broadcast_callback(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
+
     current = broadcast_tasks.get(user_id)
     if current and not current.done():
         await callback.answer("Рассылка уже идёт", show_alert=True)
         return
 
     task = asyncio.create_task(
-        run_broadcast(bot, user_id, callback.message.chat.id, event_user_label(callback))
+        run_broadcast(bot, user_id, callback.message.chat.id)
     )
     broadcast_tasks[user_id] = task
     await callback.answer("Рассылка запущена")
@@ -1467,9 +1952,11 @@ async def start_broadcast_callback(callback: CallbackQuery, bot: Bot) -> None:
 async def stop_broadcast_callback(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
     task = broadcast_tasks.get(user_id)
+
     if not task or task.done():
         await callback.answer("Активной рассылки нет")
         return
+
     stop_events.setdefault(user_id, asyncio.Event()).set()
     await callback.answer("Остановка запрошена")
 
@@ -1481,8 +1968,8 @@ async def stop_broadcast_callback(callback: CallbackQuery) -> None:
 async def main() -> None:
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         raise RuntimeError("Проверьте BOT_TOKEN")
-    if ADMIN_ID <= 0 or API_ID <= 0 or not API_HASH:
-        raise RuntimeError("Проверьте ADMIN_ID, API_ID и API_HASH")
+    if API_ID <= 0 or not API_HASH:
+        raise RuntimeError("Проверьте API_ID и API_HASH")
     if MIN_DELAY_SECONDS < 1 or MAX_DELAY_SECONDS < MIN_DELAY_SECONDS:
         raise RuntimeError("Некорректная задержка")
 
@@ -1497,7 +1984,7 @@ async def main() -> None:
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await admin_log(bot, "Бот запущен. Обработчик шаблонов групп активен.")
+        await admin_log(bot, "Бот запущен.")
         await dp.start_polling(bot)
     finally:
         for task in list(qr_tasks.values()) + list(broadcast_tasks.values()):
