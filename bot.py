@@ -801,7 +801,6 @@ def is_spam_block_error(exc: Exception) -> bool:
     spam_errors = (
         errors.FloodWaitError,
         errors.rpcerrorlist.SlowModeWaitError,
-        errors.rpcerrorlist.SpamWaitError,
     )
     return isinstance(exc, spam_errors)
 
@@ -820,11 +819,6 @@ def is_recipient_error(exc: Exception) -> bool:
         ValueError,
     )
     return isinstance(exc, recipient_errors)
-
-
-def is_other_error(exc: Exception) -> bool:
-    """Проверяет, является ли ошибка другой (не спам и не проблема с получателем)."""
-    return not is_spam_block_error(exc) and not is_recipient_error(exc)
 
 
 def is_running(user_id: int) -> bool:
@@ -1030,23 +1024,6 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                 except errors.rpcerrorlist.SlowModeWaitError as exc:
                     wait_seconds = int(exc.seconds)
                     error_msg = f"SlowMode: {wait_seconds} сек. (спам-блок)"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "⏳ Ожидание {wait_seconds} сек., получатель НЕ удалён"
-                    )
-                    await asyncio.sleep(wait_seconds + 2)
-                    # Повторяем попытку (НЕ удаляем получателя!)
-                    continue
-
-                except errors.rpcerrorlist.SpamWaitError as exc:
-                    wait_seconds = int(exc.seconds)
-                    error_msg = f"SpamWait: {wait_seconds} сек. (спам-блок)"
                     remaining = len(state["common_recipients"]) + sum(
                         len(state["individual_recipients"].get(acc_id, []))
                         for acc_id in state["accounts"]
