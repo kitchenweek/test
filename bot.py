@@ -91,14 +91,12 @@ def replace_letters_random(text: str) -> str:
     """
     Заменяет кириллические буквы на латинские аналоги с вероятностью 50% для каждой буквы.
     """
-    # Словарь замены: кириллица -> латиница
     replacements = {
         'а': 'a', 'с': 'c', 'е': 'e', 'о': 'o', 'р': 'p', 'х': 'x', 'у': 'y',
         'А': 'A', 'С': 'C', 'Е': 'E', 'О': 'O', 'Р': 'P', 'Х': 'X', 'Т': 'T',
         'Н': 'H', 'В': 'B', 'К': 'K'
     }
     
-    # Заменяем каждый символ с вероятностью 50%
     result = ''
     for char in text:
         if char in replacements and random.random() < 0.5:
@@ -147,19 +145,10 @@ def default_state() -> dict[str, Any]:
         "accounts": {},
         "active_account_id": None,
         "next_account_number": 1,
-
         "messages": [],
-
-        # Общий список распределяется между всеми аккаунтами.
         "common_recipients": [],
-
-        # Индивидуальные списки: account_id -> recipients.
         "individual_recipients": {},
-
-        # Получатель закрепляется за аккаунтом после успешной отправки.
-        # Другой аккаунт больше не сможет ему написать.
         "recipient_owners": {},
-
         "bound_groups": [],
         "group_templates": [],
         "template_usage": {},
@@ -170,7 +159,6 @@ def default_state() -> dict[str, Any]:
 def default_daily_stats() -> dict[str, Any]:
     return {
         "date": str(date.today()),
-        # Для каждого аккаунта храним количество отписок
         "accounts": {}
     }
 
@@ -184,7 +172,6 @@ def load_daily_stats(user_id: int) -> dict[str, Any]:
     
     try:
         stats = json.loads(path.read_text(encoding="utf-8"))
-        # Проверяем, не изменилась ли дата
         if stats.get("date") != str(date.today()):
             stats = default_daily_stats()
             save_daily_stats(user_id, stats)
@@ -230,6 +217,56 @@ def increment_unsubscribe_count(user_id: int, account_id: str) -> int:
     stats["accounts"][account_id] = stats["accounts"].get(account_id, 0) + 1
     save_daily_stats(user_id, stats)
     return stats["accounts"][account_id]
+
+
+def migrate_state(loaded: dict[str, Any]) -> dict[str, Any]:
+    state = default_state()
+    state.update(loaded)
+
+    if "recipients" in loaded and not state["common_recipients"]:
+        state["common_recipients"] = loaded.get("recipients", [])
+
+    if not state["accounts"] and loaded.get("proxy"):
+        account_id = "account_1"
+        state["accounts"][account_id] = {
+            "tag": "Аккаунт 1",
+            "proxy": loaded.get("proxy"),
+            "telegram_id": None,
+            "username": None,
+            "first_name": None,
+        }
+        state["active_account_id"] = account_id
+        state["next_account_number"] = 2
+        state["individual_recipients"].setdefault(account_id, [])
+
+    for account_id in state["accounts"]:
+        state["individual_recipients"].setdefault(account_id, [])
+
+    return state
+
+
+def load_state(user_id: int) -> dict[str, Any]:
+    path = state_path(user_id)
+    if not path.exists():
+        state = default_state()
+        save_state(user_id, state)
+        return state
+
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("Повреждён state.json пользователя %s", user_id)
+        loaded = {}
+
+    state = migrate_state(loaded)
+    return state
+
+
+def save_state(user_id: int, state: dict[str, Any]) -> None:
+    state_path(user_id).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 # ============================================================
@@ -759,7 +796,7 @@ async def send_random_template(
 
 
 # ============================================================
-# РАССЫЛКА
+# РАССЫЛКА (ПАРАЛЛЕЛЬНАЯ)
 # ============================================================
 
 def build_recipient_jobs(
@@ -768,10 +805,6 @@ def build_recipient_jobs(
 ) -> list[tuple[str, str | int, str]]:
     """
     Возвращает (account_id, recipient, source).
-
-    Один recipient не попадает к двум аккаунтам.
-    Если получатель уже закреплён за аккаунтом после прошлой успешной
-    отправки, он снова назначается только этому аккаунту.
     """
     if not account_ids:
         return []
@@ -920,7 +953,7 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
 
         await bot.send_message(
             chat_id,
-            "▶️ <b>Рассылка запущена</b>\n\n"
+            "▶️ <b>Рассылка запущена (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)</b>\n\n"
             f"Аккаунтов: <b>{len(account_ids)}</b>\n"
             f"Уникальных получателей: <b>{len(jobs)}</b>\n"
             f"Общих: <b>{len(state['common_recipients'])}</b>\n"
@@ -929,227 +962,166 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
             f"Осталось отписок всего: <b>{total_remaining}</b>",
         )
 
-        for index, (account_id, recipient, source) in enumerate(jobs, 1):
-            if stop_event.is_set():
-                await bot.send_message(chat_id, "⛔ Рассылка остановлена.")
-                break
+        # Создаём очередь заданий для каждого аккаунта
+        account_jobs = {account_id: [] for account_id in account_ids}
+        for job in jobs:
+            account_id, recipient, source = job
+            account_jobs[account_id].append((recipient, source))
 
+        # Функция для обработки заданий одного аккаунта
+        async def process_account_jobs(account_id: str, jobs_list: list) -> tuple[int, int, int]:
+            local_sent = 0
+            local_failed = 0
+            local_skipped = 0
+            
             account, client = account_map[account_id]
             account_name = account_label(account_id, account)
             
-            # Проверяем лимит для конкретного аккаунта
-            if not can_unsubscribe_today(user_id, account_id):
-                account_remaining = get_account_remaining(user_id, account_id)
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", f"Дневной лимит для аккаунта исчерпан (осталось {account_remaining})",
-                    get_total_remaining(user_id), get_total_remaining(user_id), account_remaining
-                )
-                continue
+            for recipient, source in jobs_list:
+                # Проверяем стоп-событие
+                if stop_event.is_set():
+                    break
+                
+                # Проверяем лимит для конкретного аккаунта
+                if not can_unsubscribe_today(user_id, account_id):
+                    account_remaining = get_account_remaining(user_id, account_id)
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", f"Дневной лимит для аккаунта исчерпан (осталось {account_remaining})",
+                        get_total_remaining(user_id), get_total_remaining(user_id), account_remaining
+                    )
+                    continue
 
-            recipient_key = normalize_recipient(recipient)
-            previous_owner = state["recipient_owners"].get(recipient_key)
+                recipient_key = normalize_recipient(recipient)
+                previous_owner = state["recipient_owners"].get(recipient_key)
 
-            if previous_owner and previous_owner != account_id:
-                skipped += 1
-                continue
+                if previous_owner and previous_owner != account_id:
+                    local_skipped += 1
+                    continue
 
-            try:
-                entity = await client.get_entity(recipient)
+                try:
+                    entity = await client.get_entity(recipient)
 
-                # Отправляем все сообщения с задержкой перед каждым
-                for text in state["messages"]:
-                    # Применяем замену букв с вероятностью 50%
-                    modified_text = replace_letters_random(text)
+                    # Отправляем все сообщения с задержкой перед каждым
+                    for text in state["messages"]:
+                        modified_text = replace_letters_random(text)
+                        typing_delay = calculate_typing_delay(modified_text)
+                        
+                        await asyncio.sleep(typing_delay)
+                        await client.send_message(
+                            entity,
+                            modified_text,
+                            link_preview=False,
+                        )
+
+                    if state["group_templates"]:
+                        await send_random_template(client, entity, state)
+
+                    # Успешная отписка
+                    increment_unsubscribe_count(user_id, account_id)
+                    local_sent += 1
+
+                    # Удаляем получателя из списков
+                    if recipient in state["common_recipients"]:
+                        state["common_recipients"].remove(recipient)
                     
-                    # Рассчитываем задержку для имитации печати ПЕРЕД отправкой
-                    typing_delay = calculate_typing_delay(modified_text)
+                    for acc_id in state["individual_recipients"]:
+                        if recipient in state["individual_recipients"][acc_id]:
+                            state["individual_recipients"][acc_id].remove(recipient)
                     
-                    # Ждём, имитируя печать (задержка ПЕРЕД отправкой)
-                    await asyncio.sleep(typing_delay)
-                    
-                    # Отправляем сообщение
-                    await client.send_message(
-                        entity,
-                        modified_text,
-                        link_preview=False,
+                    state["recipient_owners"].pop(recipient_key, None)
+                    save_state(user_id, state)
+
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "success",
+                        "",
+                        get_total_remaining(user_id),
+                        get_total_remaining(user_id),
+                        get_account_remaining(user_id, account_id)
                     )
 
-                if state["group_templates"]:
-                    await send_random_template(client, entity, state)
-
-                # Успешная отписка - увеличиваем счётчик для аккаунта
-                increment_unsubscribe_count(user_id, account_id)
-                unsubscribed += 1
-
-                # Удаляем получателя из списков
-                if recipient in state["common_recipients"]:
-                    state["common_recipients"].remove(recipient)
-                
-                for acc_id in state["individual_recipients"]:
-                    if recipient in state["individual_recipients"][acc_id]:
-                        state["individual_recipients"][acc_id].remove(recipient)
-                
-                state["recipient_owners"].pop(recipient_key, None)
-                save_state(user_id, state)
-                sent += 1
-
-                # Отправляем лог об успешной отписке
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "success",
-                    "",
-                    get_total_remaining(user_id),
-                    get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-
-            except TemplatePoolEmptyError:
-                error_msg = "Закончились доступные шаблоны"
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", error_msg,
-                    get_total_remaining(user_id), get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-                await bot.send_message(
-                    chat_id,
-                    "⚠️ <b>Доступные шаблоны закончились</b>\n\n"
-                    "Пополните базу шаблонов.",
-                    reply_markup=group_templates_keyboard(),
-                )
-                break
-
-            except errors.FloodWaitError as exc:
-                wait_seconds = int(exc.seconds)
-                if wait_seconds > MAX_FLOOD_WAIT_SECONDS:
-                    error_msg = f"FloodWait: {wait_seconds} секунд (превышен лимит)"
+                except TemplatePoolEmptyError:
+                    error_msg = "Закончились доступные шаблоны"
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
                         get_total_remaining(user_id), get_total_remaining(user_id),
                         get_account_remaining(user_id, account_id)
                     )
-                    await bot.send_message(
-                        chat_id,
-                        f"Telegram запросил паузу {wait_seconds} секунд. "
-                        "Рассылка остановлена.",
-                    )
                     break
-                await asyncio.sleep(wait_seconds + 2)
 
-            except errors.UserPrivacyRestrictedError:
-                error_msg = "Пользователь ограничил приватность"
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", error_msg,
-                    get_total_remaining(user_id), get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-                failed += 1
-                remove_failed_recipient(state, account_id, recipient, source)
-                save_state(user_id, state)
+                except errors.FloodWaitError as exc:
+                    wait_seconds = int(exc.seconds)
+                    if wait_seconds > MAX_FLOOD_WAIT_SECONDS:
+                        error_msg = f"FloodWait: {wait_seconds} секунд (превышен лимит)"
+                        await send_log_to_user(
+                            bot, chat_id, account_id, account_name, recipient,
+                            "error", error_msg,
+                            get_total_remaining(user_id), get_total_remaining(user_id),
+                            get_account_remaining(user_id, account_id)
+                        )
+                        break
+                    await asyncio.sleep(wait_seconds + 2)
+                    # Повторяем попытку
+                    continue
 
-            except errors.ChatWriteForbiddenError:
-                error_msg = "Нет прав на отправку"
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", error_msg,
-                    get_total_remaining(user_id), get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-                failed += 1
-                remove_failed_recipient(state, account_id, recipient, source)
-                save_state(user_id, state)
+                except (errors.UserPrivacyRestrictedError, errors.ChatWriteForbiddenError,
+                        errors.UsernameInvalidError, errors.UsernameNotOccupiedError,
+                        errors.UserDeactivatedError, ValueError) as exc:
+                    error_msg = str(exc)
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        get_total_remaining(user_id), get_total_remaining(user_id),
+                        get_account_remaining(user_id, account_id)
+                    )
+                    local_failed += 1
+                    remove_failed_recipient(state, account_id, recipient, source)
+                    save_state(user_id, state)
 
-            except errors.UsernameInvalidError:
-                error_msg = "Неверный username"
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", error_msg,
-                    get_total_remaining(user_id), get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-                failed += 1
-                remove_failed_recipient(state, account_id, recipient, source)
-                save_state(user_id, state)
+                except Exception as exc:
+                    error_msg = f"{type(exc).__name__}: {str(exc)}"
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        get_total_remaining(user_id), get_total_remaining(user_id),
+                        get_account_remaining(user_id, account_id)
+                    )
+                    local_failed += 1
+                    log.exception("Ошибка отправки account=%s recipient=%r", account_id, recipient)
 
-            except errors.UsernameNotOccupiedError:
-                error_msg = "Username не существует"
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", error_msg,
-                    get_total_remaining(user_id), get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-                failed += 1
-                remove_failed_recipient(state, account_id, recipient, source)
-                save_state(user_id, state)
-
-            except errors.UserDeactivatedError:
-                error_msg = "Пользователь деактивирован"
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", error_msg,
-                    get_total_remaining(user_id), get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-                failed += 1
-                remove_failed_recipient(state, account_id, recipient, source)
-                save_state(user_id, state)
-
-            except ValueError as exc:
-                error_msg = f"Ошибка: {str(exc)}"
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", error_msg,
-                    get_total_remaining(user_id), get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-                failed += 1
-                remove_failed_recipient(state, account_id, recipient, source)
-                save_state(user_id, state)
-
-            except Exception as exc:
-                error_msg = f"{type(exc).__name__}: {str(exc)}"
-                await send_log_to_user(
-                    bot, chat_id, account_id, account_name, recipient,
-                    "error", error_msg,
-                    get_total_remaining(user_id), get_total_remaining(user_id),
-                    get_account_remaining(user_id, account_id)
-                )
-                failed += 1
-                log.exception("Ошибка отправки account=%s recipient=%r", account_id, recipient)
-                await admin_log(
-                    bot,
-                    f"Ошибка отправки:\n"
-                    f"Аккаунт: <code>{html.escape(account_label(account_id, account))}</code>\n"
-                    f"Получатель: <code>{html.escape(str(recipient))}</code>\n"
-                    f"Ошибка: <code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>",
-                )
-
-            # Обновляем информацию о прогрессе
-            if index % 10 == 0 or unsubscribed % 5 == 0:
-                total_rem = get_total_remaining(user_id)
-                await bot.send_message(
-                    chat_id,
-                    f"📊 <b>Прогресс</b>\n\n"
-                    f"Обработано: {index}/{len(jobs)}\n"
-                    f"Успешно отписано: <b>{unsubscribed}</b>\n"
-                    f"Ошибок: <b>{failed}</b>\n"
-                    f"Пропущено: <b>{skipped}</b>\n"
-                    f"Осталось всего: <b>{total_rem}</b>",
-                )
-
-            # Задержка МЕЖДУ пользователями (после отправки всех сообщений пользователю)
-            if index < len(jobs):
+                # Задержка МЕЖДУ пользователями для этого аккаунта
                 await asyncio.sleep(random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
+            
+            return local_sent, local_failed, local_skipped
+
+        # Запускаем обработку для всех аккаунтов параллельно
+        tasks = []
+        for account_id in account_ids:
+            if account_jobs[account_id]:  # Если есть задания для аккаунта
+                task = asyncio.create_task(process_account_jobs(account_id, account_jobs[account_id]))
+                tasks.append(task)
+
+        # Ждём завершения всех задач
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Собираем результаты
+        for result in results:
+            if isinstance(result, tuple):
+                s, f, sk = result
+                sent += s
+                failed += f
+                skipped += sk
+                unsubscribed += s
+            elif isinstance(result, Exception):
+                log.error(f"Ошибка в задаче: {result}")
 
         # Итоговый отчёт
         total_rem = get_total_remaining(user_id)
         await bot.send_message(
             chat_id,
-            "✅ <b>Рассылка завершена</b>\n\n"
+            "✅ <b>Рассылка завершена (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)</b>\n\n"
             f"Успешно отписано: <b>{unsubscribed}</b>\n"
             f"Ошибок: <b>{failed}</b>\n"
             f"Пропущено пересечений: <b>{skipped}</b>\n"
@@ -1587,7 +1559,6 @@ async def select_account_callback(callback: CallbackQuery) -> None:
     proxy_name = proxy["type"].upper() if proxy else "не задан"
     individual_count = len(state["individual_recipients"].get(account_id, []))
     
-    # Получаем статистику по аккаунту
     account_remaining = get_account_remaining(user_id, account_id)
     total_remaining = get_total_remaining(user_id)
 
@@ -1728,7 +1699,6 @@ async def delete_account_callback(callback: CallbackQuery) -> None:
     state["accounts"].pop(account_id, None)
     state["individual_recipients"].pop(account_id, None)
 
-    # Удаляем закрепления удалённого аккаунта.
     state["recipient_owners"] = {
         key: owner
         for key, owner in state["recipient_owners"].items()
@@ -2168,7 +2138,6 @@ async def status_callback(callback: CallbackQuery) -> None:
     daily_stats = load_daily_stats(user_id)
     total_remaining = get_total_remaining(user_id)
     
-    # Формируем статистику по каждому аккаунту
     accounts_stats = []
     for account_id, account in state["accounts"].items():
         used = daily_stats["accounts"].get(account_id, 0)
@@ -2186,7 +2155,7 @@ async def status_callback(callback: CallbackQuery) -> None:
         f"Общих получателей: <b>{len(state['common_recipients'])}</b>\n"
         f"Индивидуальных получателей: <b>{total_individual}</b>\n"
         f"Шаблонов: <b>{len(state['group_templates'])}</b>\n"
-        f"Рассылка: <b>{'идёт' if running else 'остановлена'}</b>\n"
+        f"Рассылка: <b>{'идёт (параллельно)' if running else 'остановлена'}</b>\n"
         f"Осталось отписок всего: <b>{total_remaining}</b>\n\n"
         f"<b>Статистика по аккаунтам:</b>\n{stats_text}\n\n"
         f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>",
@@ -2208,7 +2177,7 @@ async def start_broadcast_callback(callback: CallbackQuery, bot: Bot) -> None:
         run_broadcast(bot, user_id, callback.message.chat.id)
     )
     broadcast_tasks[user_id] = task
-    await callback.answer("Рассылка запущена")
+    await callback.answer("Рассылка запущена в параллельном режиме")
 
 
 @router.callback_query(F.data == "stop_broadcast")
