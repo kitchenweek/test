@@ -776,19 +776,55 @@ def build_recipient_jobs(
     return jobs
 
 
-def remove_failed_recipient(
+def remove_recipient_from_all_lists(
     state: dict[str, Any],
-    account_id: str,
     recipient: str | int,
-    source: str,
 ) -> None:
-    if source == "common":
-        target = state["common_recipients"]
-    else:
-        target = state["individual_recipients"].setdefault(account_id, [])
+    """Удаляет получателя из всех списков."""
+    recipient_key = normalize_recipient(recipient)
+    
+    # Удаляем из общего списка
+    if recipient in state["common_recipients"]:
+        state["common_recipients"].remove(recipient)
+    
+    # Удаляем из индивидуальных списков всех аккаунтов
+    for acc_id in state["individual_recipients"]:
+        if recipient in state["individual_recipients"][acc_id]:
+            state["individual_recipients"][acc_id].remove(recipient)
+    
+    # Удаляем закрепление
+    state["recipient_owners"].pop(recipient_key, None)
 
-    while recipient in target:
-        target.remove(recipient)
+
+def is_spam_block_error(exc: Exception) -> bool:
+    """Проверяет, является ли ошибка спам-блоком."""
+    spam_errors = (
+        errors.FloodWaitError,
+        errors.rpcerrorlist.SlowModeWaitError,
+        errors.rpcerrorlist.SpamWaitError,
+    )
+    return isinstance(exc, spam_errors)
+
+
+def is_recipient_error(exc: Exception) -> bool:
+    """Проверяет, является ли ошибка проблемой с получателем."""
+    recipient_errors = (
+        errors.UsernameInvalidError,
+        errors.UsernameNotOccupiedError,
+        errors.UserPrivacyRestrictedError,
+        errors.ChatWriteForbiddenError,
+        errors.UserDeactivatedError,
+        errors.rpcerrorlist.PeerIdInvalidError,
+        errors.rpcerrorlist.MessageEmptyError,
+        errors.rpcerrorlist.MessageTooLongError,
+        ValueError,
+    )
+    return isinstance(exc, recipient_errors)
+
+
+def is_other_error(exc: Exception) -> bool:
+    """Проверяет, является ли ошибка другой (не спам и не проблема с получателем)."""
+    return not is_spam_block_error(exc) and not is_recipient_error(exc)
 
 
 def is_running(user_id: int) -> bool:
@@ -806,6 +842,7 @@ async def send_log_to_user(
     status: str,
     error_reason: str = "",
     total_remaining: int = 0,
+    action: str = "",
 ) -> None:
     """Отправляет лог пользователю о попытке отписки."""
     
@@ -817,10 +854,18 @@ async def send_log_to_user(
     log_text += f"Получатель: <code>{html.escape(str(recipient))}</code>\n"
     
     if status == "success":
-        log_text += f"\n✅ Отписка выполнена успешно!"
+        log_text += f"\n✅ Отписка выполнена успешно!\n"
+        log_text += f"📌 Получатель удалён из списка"
     else:
         log_text += f"\n❌ Причина: <code>{html.escape(error_reason)}</code>\n"
-        log_text += f"⚠️ Получатель НЕ удалён из списка"
+        if "спам" in error_reason.lower() or "flood" in error_reason.lower():
+            log_text += f"⚠️ Получатель НЕ удалён (ошибка спам-блока)\n"
+            log_text += f"🔄 Попытка будет повторена позже"
+        else:
+            log_text += f"⚠️ Получатель удалён из списка"
+    
+    if action:
+        log_text += f"\n\n📌 <b>Действие:</b> {action}"
     
     log_text += f"\n\n📊 <b>Статистика:</b>\n"
     log_text += f"Осталось получателей: <b>{total_remaining}</b>"
@@ -931,15 +976,8 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     # Успешная отписка
                     local_sent += 1
 
-                    # Удаляем получателя из списков
-                    if recipient in state["common_recipients"]:
-                        state["common_recipients"].remove(recipient)
-                    
-                    for acc_id in state["individual_recipients"]:
-                        if recipient in state["individual_recipients"][acc_id]:
-                            state["individual_recipients"][acc_id].remove(recipient)
-                    
-                    state["recipient_owners"].pop(recipient_key, None)
+                    # Удаляем получателя из всех списков
+                    remove_recipient_from_all_lists(state, recipient)
                     save_state(user_id, state)
 
                     # Подсчитываем оставшихся получателей
@@ -952,7 +990,8 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                         bot, chat_id, account_id, account_name, recipient,
                         "success",
                         "",
-                        remaining
+                        remaining,
+                        "✅ Получатель удалён из списка"
                     )
 
                 except TemplatePoolEmptyError:
@@ -964,14 +1003,15 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "⏹ Рассылка остановлена"
                     )
                     break
 
                 except errors.FloodWaitError as exc:
                     wait_seconds = int(exc.seconds)
                     if wait_seconds > MAX_FLOOD_WAIT_SECONDS:
-                        error_msg = f"FloodWait: {wait_seconds} секунд (превышен лимит)"
+                        error_msg = f"FloodWait: {wait_seconds} сек. (превышен лимит)"
                         remaining = len(state["common_recipients"]) + sum(
                             len(state["individual_recipients"].get(acc_id, []))
                             for acc_id in state["accounts"]
@@ -979,11 +1019,46 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                         await send_log_to_user(
                             bot, chat_id, account_id, account_name, recipient,
                             "error", error_msg,
-                            remaining
+                            remaining,
+                            "⏹ Рассылка остановлена из-за спам-блока"
                         )
                         break
                     await asyncio.sleep(wait_seconds + 2)
-                    # Повторяем попытку
+                    # Повторяем попытку (НЕ удаляем получателя!)
+                    continue
+
+                except errors.rpcerrorlist.SlowModeWaitError as exc:
+                    wait_seconds = int(exc.seconds)
+                    error_msg = f"SlowMode: {wait_seconds} сек. (спам-блок)"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining,
+                        "⏳ Ожидание {wait_seconds} сек., получатель НЕ удалён"
+                    )
+                    await asyncio.sleep(wait_seconds + 2)
+                    # Повторяем попытку (НЕ удаляем получателя!)
+                    continue
+
+                except errors.rpcerrorlist.SpamWaitError as exc:
+                    wait_seconds = int(exc.seconds)
+                    error_msg = f"SpamWait: {wait_seconds} сек. (спам-блок)"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining,
+                        f"⏳ Ожидание {wait_seconds} сек., получатель НЕ удалён"
+                    )
+                    await asyncio.sleep(wait_seconds + 2)
+                    # Повторяем попытку (НЕ удаляем получателя!)
                     continue
 
                 except errors.UsernameInvalidError:
@@ -995,10 +1070,11 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "🗑 Получатель удалён из списка"
                     )
                     local_failed += 1
-                    remove_failed_recipient(state, account_id, recipient, source)
+                    remove_recipient_from_all_lists(state, recipient)
                     save_state(user_id, state)
 
                 except errors.UsernameNotOccupiedError:
@@ -1010,10 +1086,11 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "🗑 Получатель удалён из списка"
                     )
                     local_failed += 1
-                    remove_failed_recipient(state, account_id, recipient, source)
+                    remove_recipient_from_all_lists(state, recipient)
                     save_state(user_id, state)
 
                 except errors.UserPrivacyRestrictedError:
@@ -1025,10 +1102,11 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "🗑 Получатель удалён из списка"
                     )
                     local_failed += 1
-                    remove_failed_recipient(state, account_id, recipient, source)
+                    remove_recipient_from_all_lists(state, recipient)
                     save_state(user_id, state)
 
                 except errors.ChatWriteForbiddenError:
@@ -1040,10 +1118,11 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "🗑 Получатель удалён из списка"
                     )
                     local_failed += 1
-                    remove_failed_recipient(state, account_id, recipient, source)
+                    remove_recipient_from_all_lists(state, recipient)
                     save_state(user_id, state)
 
                 except errors.UserDeactivatedError:
@@ -1055,10 +1134,11 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "🗑 Получатель удалён из списка"
                     )
                     local_failed += 1
-                    remove_failed_recipient(state, account_id, recipient, source)
+                    remove_recipient_from_all_lists(state, recipient)
                     save_state(user_id, state)
 
                 except errors.rpcerrorlist.PeerIdInvalidError:
@@ -1070,10 +1150,11 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "🗑 Получатель удалён из списка"
                     )
                     local_failed += 1
-                    remove_failed_recipient(state, account_id, recipient, source)
+                    remove_recipient_from_all_lists(state, recipient)
                     save_state(user_id, state)
 
                 except errors.rpcerrorlist.MessageEmptyError:
@@ -1085,7 +1166,8 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "⚠️ Получатель НЕ удалён (проблема с сообщением)"
                     )
                     local_failed += 1
 
@@ -1098,7 +1180,8 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "⚠️ Получатель НЕ удалён (проблема с сообщением)"
                     )
                     local_failed += 1
 
@@ -1111,13 +1194,15 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "🗑 Получатель удалён из списка"
                     )
                     local_failed += 1
-                    remove_failed_recipient(state, account_id, recipient, source)
+                    remove_recipient_from_all_lists(state, recipient)
                     save_state(user_id, state)
 
                 except Exception as exc:
+                    # Любая другая ошибка - не удаляем получателя
                     error_msg = f"{type(exc).__name__}: {str(exc)}"
                     remaining = len(state["common_recipients"]) + sum(
                         len(state["individual_recipients"].get(acc_id, []))
@@ -1126,7 +1211,8 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        remaining
+                        remaining,
+                        "⚠️ Получатель НЕ удалён (неизвестная ошибка)"
                     )
                     local_failed += 1
                     log.exception("Ошибка отправки account=%s recipient=%r", account_id, recipient)
