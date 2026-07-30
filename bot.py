@@ -1643,8 +1643,8 @@ async def accounts_callback(callback: CallbackQuery) -> None:
 async def add_account_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_account_tag"
     await callback.message.edit_text(
-        "Введите тег нового аккаунта.\n\n"
-        "Например: <code>Основной</code> или <code>Аккаунт 2</code>",
+        "Введите названия нового аккаунта для бота.\n\n"
+        "Например: <code>Аккаунт1</code> или <code>Аккаунт2</code>",
         reply_markup=back_keyboard("accounts"),
     )
     await callback.answer()
