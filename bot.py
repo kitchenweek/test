@@ -537,16 +537,40 @@ def make_template_key(chat_id: int, message_id: int) -> str:
 
 
 def get_template_message_text(message: Message) -> str:
-    """Возвращает текст сообщения или подпись к медиафайлу."""
+    """Возвращает обычный текст или подпись к медиафайлу."""
     return (message.text or message.caption or "").strip()
 
 
-def contains_required_template_phrase(message: Message) -> bool:
-    """Проверяет наличие хотя бы одной разрешённой фразы."""
-    content = get_template_message_text(message).casefold()
+def normalize_template_text(value: str) -> str:
+    """
+    Нормализует текст для поиска ключевых фраз.
+    Удаляет невидимые символы, которые Telegram или копирование
+    иногда вставляют внутрь username и даты.
+    """
+    invisible = {
+        "\u200b",  # zero width space
+        "\u200c",
+        "\u200d",
+        "\u2060",
+        "\ufeff",
+    }
+    return "".join(ch for ch in value if ch not in invisible).casefold()
+
+
+def find_required_template_phrase(message: Message) -> str | None:
+    """Возвращает найденную ключевую фразу либо None."""
+    content = normalize_template_text(get_template_message_text(message))
     if not content:
-        return False
-    return any(phrase.casefold() in content for phrase in TEMPLATE_REQUIRED_PHRASES)
+        return None
+
+    for phrase in TEMPLATE_REQUIRED_PHRASES:
+        if normalize_template_text(phrase) in content:
+            return phrase
+    return None
+
+
+def contains_required_template_phrase(message: Message) -> bool:
+    return find_required_template_phrase(message) is not None
 
 
 def choose_random_template(state: dict[str, Any]) -> dict[str, int]:
@@ -893,31 +917,74 @@ async def bind_group_handler(message: Message, bot: Bot) -> None:
 
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def capture_group_template(message: Message, bot: Bot) -> None:
-    if message.text and message.text.startswith("/bind"):
+    # Команду привязки не сохраняем как шаблон.
+    if message.text and message.text.split()[0].split("@")[0].lower() == "/bind":
         return
 
-    owners = owners_for_group(message.chat.id)
+    log.info(
+        "Получено групповое сообщение: chat=%s message=%s text=%r caption=%r",
+        message.chat.id,
+        message.message_id,
+        message.text,
+        message.caption,
+    )
+
+    owners = owners_for_group(int(message.chat.id))
     if not owners:
+        log.warning(
+            "Сообщение из группы %s получено, но группа не найдена в bound_groups",
+            message.chat.id,
+        )
         return
 
-    # В базу заносятся только сообщения с одной из обязательных фраз.
-    if not contains_required_template_phrase(message):
+    content = get_template_message_text(message)
+    matched_phrase = find_required_template_phrase(message)
+
+    if not content:
+        for owner_id in owners:
+            try:
+                await bot.send_message(
+                    owner_id,
+                    "⚠️ Получено сообщение из привязанной группы, "
+                    "но в нём нет текста или подписи к медиа.",
+                )
+            except Exception:
+                log.exception("Не удалось отправить диагностическое уведомление")
+        return
+
+    if matched_phrase is None:
+        for owner_id in owners:
+            try:
+                await bot.send_message(
+                    owner_id,
+                    "⚠️ <b>Сообщение из группы получено, но не добавлено</b>\n\n"
+                    "Не найдена ключевая фраза:\n"
+                    "• <code>@WorldOfPoizon</code>\n"
+                    "• <code>18.06</code>\n"
+                    "• <code>Egor Sobolev</code>\n\n"
+                    f"Полученный текст: <code>{html.escape(content[:500])}</code>",
+                )
+            except Exception:
+                log.exception("Не удалось отправить диагностическое уведомление")
         return
 
     for owner_id in owners:
         state = load_state(owner_id)
         ref = {
-            "chat_id": message.chat.id,
-            "message_id": message.message_id,
+            "chat_id": int(message.chat.id),
+            "message_id": int(message.message_id),
         }
 
         if ref in state["group_templates"]:
+            try:
+                await bot.send_message(owner_id, "ℹ️ Этот шаблон уже находится в базе.")
+            except Exception:
+                pass
             continue
 
         state["group_templates"].append(ref)
         state["group_templates"] = state["group_templates"][-MAX_GROUP_TEMPLATES:]
 
-        # Удаляем счётчики шаблонов, которые выпали из базы из-за лимита.
         valid_keys = {
             make_template_key(item["chat_id"], item["message_id"])
             for item in state["group_templates"]
@@ -936,6 +1003,9 @@ async def capture_group_template(message: Message, bot: Bot) -> None:
             await bot.send_message(
                 owner_id,
                 "✅ <b>Шаблон добавлен</b>\n\n"
+                f"Ключевая фраза: <code>{html.escape(matched_phrase)}</code>\n"
+                f"Группа: <code>{message.chat.id}</code>\n"
+                f"ID сообщения: <code>{message.message_id}</code>\n"
                 f"Всего шаблонов: <b>{len(state['group_templates'])}</b>",
             )
         except Exception:
