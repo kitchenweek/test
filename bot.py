@@ -6,7 +6,6 @@ import json
 import logging
 import random
 import re
-from datetime import date
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -46,9 +45,6 @@ MAX_TEXT_MESSAGES = 5
 MAX_GROUP_TEMPLATES = 1000
 MAX_TEMPLATE_SENDS = 100
 SCAN_MESSAGE_LIMIT = 2000
-
-# Дневной лимит отписок на аккаунт
-DAILY_UNSUBSCRIBE_LIMIT = 55
 
 # Скорость печати (секунд на символ)
 CHAR_TYPING_SPEED = 0.13
@@ -132,10 +128,6 @@ def state_path(user_id: int) -> Path:
     return user_dir(user_id) / "state.json"
 
 
-def daily_stats_path(user_id: int) -> Path:
-    return user_dir(user_id) / "daily_stats.json"
-
-
 def session_path(user_id: int, account_id: str) -> str:
     return str(user_dir(user_id) / f"telegram_session_{account_id}")
 
@@ -154,69 +146,6 @@ def default_state() -> dict[str, Any]:
         "template_usage": {},
         "last_template_key": None,
     }
-
-
-def default_daily_stats() -> dict[str, Any]:
-    return {
-        "date": str(date.today()),
-        "accounts": {}
-    }
-
-
-def load_daily_stats(user_id: int) -> dict[str, Any]:
-    path = daily_stats_path(user_id)
-    if not path.exists():
-        stats = default_daily_stats()
-        save_daily_stats(user_id, stats)
-        return stats
-    
-    try:
-        stats = json.loads(path.read_text(encoding="utf-8"))
-        if stats.get("date") != str(date.today()):
-            stats = default_daily_stats()
-            save_daily_stats(user_id, stats)
-        return stats
-    except Exception:
-        log.exception("Повреждён daily_stats.json пользователя %s", user_id)
-        stats = default_daily_stats()
-        save_daily_stats(user_id, stats)
-        return stats
-
-
-def save_daily_stats(user_id: int, stats: dict[str, Any]) -> None:
-    daily_stats_path(user_id).write_text(
-        json.dumps(stats, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def can_unsubscribe_today(user_id: int, account_id: str) -> bool:
-    """Проверяет, не превышен ли дневной лимит отписок для аккаунта."""
-    stats = load_daily_stats(user_id)
-    account_stats = stats["accounts"].get(account_id, 0)
-    return account_stats < DAILY_UNSUBSCRIBE_LIMIT
-
-
-def get_account_remaining(user_id: int, account_id: str) -> int:
-    """Возвращает количество оставшихся отписок для аккаунта."""
-    stats = load_daily_stats(user_id)
-    account_stats = stats["accounts"].get(account_id, 0)
-    return max(0, DAILY_UNSUBSCRIBE_LIMIT - account_stats)
-
-
-def get_total_remaining(user_id: int) -> int:
-    """Возвращает общее количество оставшихся отписок по всем аккаунтам."""
-    stats = load_daily_stats(user_id)
-    total_used = sum(stats["accounts"].values())
-    return max(0, DAILY_UNSUBSCRIBE_LIMIT * len(stats["accounts"]) - total_used)
-
-
-def increment_unsubscribe_count(user_id: int, account_id: str) -> int:
-    """Увеличивает счётчик отписок для аккаунта на 1 и возвращает новое значение."""
-    stats = load_daily_stats(user_id)
-    stats["accounts"][account_id] = stats["accounts"].get(account_id, 0) + 1
-    save_daily_stats(user_id, stats)
-    return stats["accounts"][account_id]
 
 
 def migrate_state(loaded: dict[str, Any]) -> dict[str, Any]:
@@ -871,8 +800,6 @@ async def send_log_to_user(
     status: str,
     error_reason: str = "",
     total_remaining: int = 0,
-    today_remaining: int = 0,
-    account_remaining: int = 0,
 ) -> None:
     """Отправляет лог пользователю о попытке отписки."""
     
@@ -890,9 +817,7 @@ async def send_log_to_user(
         log_text += f"⚠️ Получатель НЕ удалён из списка"
     
     log_text += f"\n\n📊 <b>Статистика:</b>\n"
-    log_text += f"Осталось всего отписок: <b>{total_remaining}</b>\n"
-    log_text += f"Осталось сегодня (всего): <b>{today_remaining}</b>\n"
-    log_text += f"Осталось для аккаунта <b>{html.escape(account_name)}</b>: <b>{account_remaining}</b>"
+    log_text += f"Осталось получателей: <b>{total_remaining}</b>"
     
     try:
         await bot.send_message(chat_id, log_text)
@@ -940,26 +865,16 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
             )
             return
 
-        # Проверяем общий дневной лимит
-        total_remaining = get_total_remaining(user_id)
-        if total_remaining <= 0 and len(account_ids) > 0:
-            await bot.send_message(
-                chat_id,
-                f"⛔ <b>Дневной лимит отписок ({DAILY_UNSUBSCRIBE_LIMIT * len(account_ids)}) исчерпан!</b>\n\n"
-                "Рассылка остановлена до завтра.",
-                reply_markup=main_keyboard(),
-            )
-            return
-
+        total_recipients = len(jobs)
+        
         await bot.send_message(
             chat_id,
             "▶️ <b>Рассылка запущена (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)</b>\n\n"
             f"Аккаунтов: <b>{len(account_ids)}</b>\n"
-            f"Уникальных получателей: <b>{len(jobs)}</b>\n"
+            f"Уникальных получателей: <b>{total_recipients}</b>\n"
             f"Общих: <b>{len(state['common_recipients'])}</b>\n"
             f"Пауза между пользователями: <b>{MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} сек.</b>\n"
-            f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>\n"
-            f"Осталось отписок всего: <b>{total_remaining}</b>",
+            f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>",
         )
 
         # Создаём очередь заданий для каждого аккаунта
@@ -981,16 +896,6 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                 # Проверяем стоп-событие
                 if stop_event.is_set():
                     break
-                
-                # Проверяем лимит для конкретного аккаунта
-                if not can_unsubscribe_today(user_id, account_id):
-                    account_remaining = get_account_remaining(user_id, account_id)
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", f"Дневной лимит для аккаунта исчерпан (осталось {account_remaining})",
-                        get_total_remaining(user_id), get_total_remaining(user_id), account_remaining
-                    )
-                    continue
 
                 recipient_key = normalize_recipient(recipient)
                 previous_owner = state["recipient_owners"].get(recipient_key)
@@ -1018,7 +923,6 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                         await send_random_template(client, entity, state)
 
                     # Успешная отписка
-                    increment_unsubscribe_count(user_id, account_id)
                     local_sent += 1
 
                     # Удаляем получателя из списков
@@ -1032,22 +936,29 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     state["recipient_owners"].pop(recipient_key, None)
                     save_state(user_id, state)
 
+                    # Подсчитываем оставшихся получателей
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "success",
                         "",
-                        get_total_remaining(user_id),
-                        get_total_remaining(user_id),
-                        get_account_remaining(user_id, account_id)
+                        remaining
                     )
 
                 except TemplatePoolEmptyError:
                     error_msg = "Закончились доступные шаблоны"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        get_total_remaining(user_id), get_total_remaining(user_id),
-                        get_account_remaining(user_id, account_id)
+                        remaining
                     )
                     break
 
@@ -1055,11 +966,14 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     wait_seconds = int(exc.seconds)
                     if wait_seconds > MAX_FLOOD_WAIT_SECONDS:
                         error_msg = f"FloodWait: {wait_seconds} секунд (превышен лимит)"
+                        remaining = len(state["common_recipients"]) + sum(
+                            len(state["individual_recipients"].get(acc_id, []))
+                            for acc_id in state["accounts"]
+                        )
                         await send_log_to_user(
                             bot, chat_id, account_id, account_name, recipient,
                             "error", error_msg,
-                            get_total_remaining(user_id), get_total_remaining(user_id),
-                            get_account_remaining(user_id, account_id)
+                            remaining
                         )
                         break
                     await asyncio.sleep(wait_seconds + 2)
@@ -1070,11 +984,14 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                         errors.UsernameInvalidError, errors.UsernameNotOccupiedError,
                         errors.UserDeactivatedError, ValueError) as exc:
                     error_msg = str(exc)
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        get_total_remaining(user_id), get_total_remaining(user_id),
-                        get_account_remaining(user_id, account_id)
+                        remaining
                     )
                     local_failed += 1
                     remove_failed_recipient(state, account_id, recipient, source)
@@ -1082,11 +999,14 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
 
                 except Exception as exc:
                     error_msg = f"{type(exc).__name__}: {str(exc)}"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
                     await send_log_to_user(
                         bot, chat_id, account_id, account_name, recipient,
                         "error", error_msg,
-                        get_total_remaining(user_id), get_total_remaining(user_id),
-                        get_account_remaining(user_id, account_id)
+                        remaining
                     )
                     local_failed += 1
                     log.exception("Ошибка отправки account=%s recipient=%r", account_id, recipient)
@@ -1118,14 +1038,18 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                 log.error(f"Ошибка в задаче: {result}")
 
         # Итоговый отчёт
-        total_rem = get_total_remaining(user_id)
+        remaining = len(state["common_recipients"]) + sum(
+            len(state["individual_recipients"].get(acc_id, []))
+            for acc_id in state["accounts"]
+        )
+        
         await bot.send_message(
             chat_id,
             "✅ <b>Рассылка завершена (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)</b>\n\n"
             f"Успешно отписано: <b>{unsubscribed}</b>\n"
             f"Ошибок: <b>{failed}</b>\n"
             f"Пропущено пересечений: <b>{skipped}</b>\n"
-            f"Осталось отписок всего: <b>{total_rem}</b>",
+            f"Осталось получателей: <b>{remaining}</b>",
             reply_markup=main_keyboard(),
         )
 
@@ -1558,9 +1482,6 @@ async def select_account_callback(callback: CallbackQuery) -> None:
     proxy = account.get("proxy")
     proxy_name = proxy["type"].upper() if proxy else "не задан"
     individual_count = len(state["individual_recipients"].get(account_id, []))
-    
-    account_remaining = get_account_remaining(user_id, account_id)
-    total_remaining = get_total_remaining(user_id)
 
     await callback.message.edit_text(
         "<b>Аккаунт</b>\n\n"
@@ -1569,9 +1490,7 @@ async def select_account_callback(callback: CallbackQuery) -> None:
         f"Username: "
         f"{'@' + account['username'] if account.get('username') else 'нет'}\n"
         f"Прокси: <b>{proxy_name}</b>\n"
-        f"Индивидуальных получателей: <b>{individual_count}</b>\n"
-        f"Осталось отписок для аккаунта сегодня: <b>{account_remaining}</b>\n"
-        f"Осталось отписок всего: <b>{total_remaining}</b>",
+        f"Индивидуальных получателей: <b>{individual_count}</b>",
         reply_markup=account_actions_keyboard(account_id),
     )
     await callback.answer()
@@ -2135,17 +2054,7 @@ async def status_callback(callback: CallbackQuery) -> None:
         len(items) for items in state["individual_recipients"].values()
     )
     
-    daily_stats = load_daily_stats(user_id)
-    total_remaining = get_total_remaining(user_id)
-    
-    accounts_stats = []
-    for account_id, account in state["accounts"].items():
-        used = daily_stats["accounts"].get(account_id, 0)
-        remaining = max(0, DAILY_UNSUBSCRIBE_LIMIT - used)
-        tag = account.get("tag") or account_id
-        accounts_stats.append(f"• {html.escape(tag)}: {used}/{DAILY_UNSUBSCRIBE_LIMIT} (осталось {remaining})")
-
-    stats_text = "\n".join(accounts_stats) if accounts_stats else "Нет аккаунтов"
+    total_recipients = len(state["common_recipients"]) + total_individual
 
     await callback.message.edit_text(
         "<b>Статус</b>\n\n"
@@ -2154,10 +2063,9 @@ async def status_callback(callback: CallbackQuery) -> None:
         f"Основных сообщений: <b>{len(state['messages'])}</b>\n"
         f"Общих получателей: <b>{len(state['common_recipients'])}</b>\n"
         f"Индивидуальных получателей: <b>{total_individual}</b>\n"
+        f"Всего получателей: <b>{total_recipients}</b>\n"
         f"Шаблонов: <b>{len(state['group_templates'])}</b>\n"
-        f"Рассылка: <b>{'идёт (параллельно)' if running else 'остановлена'}</b>\n"
-        f"Осталось отписок всего: <b>{total_remaining}</b>\n\n"
-        f"<b>Статистика по аккаунтам:</b>\n{stats_text}\n\n"
+        f"Рассылка: <b>{'идёт (параллельно)' if running else 'остановлена'}</b>\n\n"
         f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>",
         reply_markup=main_keyboard(),
     )
