@@ -1735,7 +1735,7 @@ async def login_phone_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_phone"
 
     await callback.message.edit_text(
-        "Введите номер телефона (с +7):\nПример <code>+79991234567</code>",
+        "Введите номер телефона (с +7):\nПример: <code>+79991234567</code>",
         reply_markup=back_keyboard(f"select_account:{account_id}"),
     )
     await callback.answer()
