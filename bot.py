@@ -791,6 +791,12 @@ def remove_failed_recipient(
         target.remove(recipient)
 
 
+def is_running(user_id: int) -> bool:
+    """Проверяет, запущена ли рассылка для пользователя."""
+    task = broadcast_tasks.get(user_id)
+    return task is not None and not task.done()
+
+
 async def send_log_to_user(
     bot: Bot,
     chat_id: int,
@@ -826,6 +832,7 @@ async def send_log_to_user(
 
 
 async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
+    # Создаём событие остановки
     stop_event = stop_events.setdefault(user_id, asyncio.Event())
     stop_event.clear()
 
@@ -839,7 +846,7 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
         available_accounts = await authorized_accounts(user_id)
 
         if not available_accounts:
-            await bot.send_message(chat_id, "Нет ни одного подключённого аккаунта.")
+            await bot.send_message(chat_id, "❌ Нет ни одного подключённого аккаунта.")
             return
 
         account_map = {
@@ -850,11 +857,11 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
 
         jobs = build_recipient_jobs(state, account_ids)
         if not jobs:
-            await bot.send_message(chat_id, "Списки получателей пусты.")
+            await bot.send_message(chat_id, "❌ Списки получателей пусты.")
             return
 
         if not state["messages"] and not state["group_templates"]:
-            await bot.send_message(chat_id, "Нет сообщений или шаблонов.")
+            await bot.send_message(chat_id, "❌ Нет сообщений или шаблонов.")
             return
 
         if state["group_templates"] and len(state["group_templates"]) < 2:
@@ -872,7 +879,6 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
             "▶️ <b>Рассылка запущена (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)</b>\n\n"
             f"Аккаунтов: <b>{len(account_ids)}</b>\n"
             f"Уникальных получателей: <b>{total_recipients}</b>\n"
-            f"Общих: <b>{len(state['common_recipients'])}</b>\n"
             f"Пауза между пользователями: <b>{MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} сек.</b>\n"
             f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>",
         )
@@ -980,10 +986,124 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     # Повторяем попытку
                     continue
 
-                except (errors.UserPrivacyRestrictedError, errors.ChatWriteForbiddenError,
-                        errors.UsernameInvalidError, errors.UsernameNotOccupiedError,
-                        errors.UserDeactivatedError, ValueError) as exc:
-                    error_msg = str(exc)
+                except errors.UsernameInvalidError:
+                    error_msg = "Неверный username (такого пользователя не существует)"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining
+                    )
+                    local_failed += 1
+                    remove_failed_recipient(state, account_id, recipient, source)
+                    save_state(user_id, state)
+
+                except errors.UsernameNotOccupiedError:
+                    error_msg = "Username не существует"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining
+                    )
+                    local_failed += 1
+                    remove_failed_recipient(state, account_id, recipient, source)
+                    save_state(user_id, state)
+
+                except errors.UserPrivacyRestrictedError:
+                    error_msg = "Пользователь ограничил приватность (нельзя писать)"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining
+                    )
+                    local_failed += 1
+                    remove_failed_recipient(state, account_id, recipient, source)
+                    save_state(user_id, state)
+
+                except errors.ChatWriteForbiddenError:
+                    error_msg = "Нет прав на отправку сообщений этому пользователю"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining
+                    )
+                    local_failed += 1
+                    remove_failed_recipient(state, account_id, recipient, source)
+                    save_state(user_id, state)
+
+                except errors.UserDeactivatedError:
+                    error_msg = "Пользователь деактивирован"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining
+                    )
+                    local_failed += 1
+                    remove_failed_recipient(state, account_id, recipient, source)
+                    save_state(user_id, state)
+
+                except errors.rpcerrorlist.PeerIdInvalidError:
+                    error_msg = "Неверный ID получателя (возможно, пользователь удалён)"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining
+                    )
+                    local_failed += 1
+                    remove_failed_recipient(state, account_id, recipient, source)
+                    save_state(user_id, state)
+
+                except errors.rpcerrorlist.MessageEmptyError:
+                    error_msg = "Сообщение пустое (ошибка отправки)"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining
+                    )
+                    local_failed += 1
+
+                except errors.rpcerrorlist.MessageTooLongError:
+                    error_msg = "Сообщение слишком длинное"
+                    remaining = len(state["common_recipients"]) + sum(
+                        len(state["individual_recipients"].get(acc_id, []))
+                        for acc_id in state["accounts"]
+                    )
+                    await send_log_to_user(
+                        bot, chat_id, account_id, account_name, recipient,
+                        "error", error_msg,
+                        remaining
+                    )
+                    local_failed += 1
+
+                except ValueError as exc:
+                    error_msg = f"Ошибка: {str(exc)}"
                     remaining = len(state["common_recipients"]) + sum(
                         len(state["individual_recipients"].get(acc_id, []))
                         for acc_id in state["accounts"]
@@ -1061,8 +1181,10 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
             reply_markup=main_keyboard(),
         )
     finally:
+        # Удаляем задачу из словаря
         broadcast_tasks.pop(user_id, None)
-        stop_event.clear()
+        # Удаляем событие остановки
+        stop_events.pop(user_id, None)
 
 
 # ============================================================
@@ -2045,10 +2167,7 @@ async def status_callback(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
     state = load_state(user_id)
     accounts = await authorized_accounts(user_id)
-    running = (
-        user_id in broadcast_tasks
-        and not broadcast_tasks[user_id].done()
-    )
+    running = is_running(user_id)
 
     total_individual = sum(
         len(items) for items in state["individual_recipients"].values()
@@ -2076,29 +2195,38 @@ async def status_callback(callback: CallbackQuery) -> None:
 async def start_broadcast_callback(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
 
-    current = broadcast_tasks.get(user_id)
-    if current and not current.done():
-        await callback.answer("Рассылка уже идёт", show_alert=True)
+    # Проверяем, не запущена ли уже рассылка
+    if is_running(user_id):
+        await callback.answer("❌ Рассылка уже идёт!", show_alert=True)
         return
+
+    # Очищаем старые события остановки
+    stop_events.pop(user_id, None)
 
     task = asyncio.create_task(
         run_broadcast(bot, user_id, callback.message.chat.id)
     )
     broadcast_tasks[user_id] = task
-    await callback.answer("Рассылка запущена в параллельном режиме")
+    await callback.answer("✅ Рассылка запущена в параллельном режиме")
 
 
 @router.callback_query(F.data == "stop_broadcast")
 async def stop_broadcast_callback(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
-    task = broadcast_tasks.get(user_id)
 
-    if not task or task.done():
-        await callback.answer("Активной рассылки нет")
+    if not is_running(user_id):
+        await callback.answer("❌ Активной рассылки нет", show_alert=True)
         return
 
+    # Устанавливаем событие остановки
     stop_events.setdefault(user_id, asyncio.Event()).set()
-    await callback.answer("Остановка запрошена")
+    
+    # Отменяем задачу
+    task = broadcast_tasks.get(user_id)
+    if task and not task.done():
+        task.cancel()
+    
+    await callback.answer("⏹ Остановка запрошена", show_alert=True)
 
 
 # ============================================================
