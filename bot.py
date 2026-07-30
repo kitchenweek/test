@@ -1494,7 +1494,7 @@ async def private_input(message: Message, bot: Bot) -> None:
             await client.send_code_request(text)
             data["phone"] = text
             user_steps[user_id] = "await_code"
-            await message.answer("Код отправлен. Введите его цифрами через пробел (1 2 3 4 5)..")
+            await message.answer("Код отправлен. Введите его цифрами через пробел (1 2 3 4 5).")
         except Exception as exc:
             await message.answer(
                 f"Не удалось отправить код:\n<code>{html.escape(str(exc))}</code>"
@@ -1735,7 +1735,7 @@ async def login_phone_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_phone"
 
     await callback.message.edit_text(
-        "Введите номер телефона:\n<code>+79991234567</code>",
+        "Введите номер телефона (с +7):\nПример <code>+79991234567</code>",
         reply_markup=back_keyboard(f"select_account:{account_id}"),
     )
     await callback.answer()
@@ -2087,14 +2087,14 @@ async def group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
         groups_text = names
         instruction_text = ""
     else:
-        groups_text = "<b>=отсутствуют=</b>"
+        groups_text = "<b>отсутствуют</b>"
         instruction_text = (
-            "\n\n<b>=1. Создайте группу\n"
+            "\n\n<b>1. Создайте группу\n"
             "2. Добавьте туда бота\n"
             "3. Выдайте боту администратора\n"
             "4. Добавьте шаблоны (минимум 2)\n"
             "5. Пропишите /bind\n"
-            "6. Просканируйте шаблоны=</b>"
+            "6. Просканируйте шаблоны</b>"
         )
 
     await callback.message.edit_text(
