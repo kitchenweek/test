@@ -915,7 +915,8 @@ async def bind_group_handler(message: Message, bot: Bot) -> None:
     )
 
 
-@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+@router.message(F.chat.type == ChatType.GROUP)
+@router.message(F.chat.type == ChatType.SUPERGROUP)
 async def capture_group_template(message: Message, bot: Bot) -> None:
     # Команду привязки не сохраняем как шаблон.
     if message.text and message.text.split()[0].split("@")[0].lower() == "/bind":
@@ -1496,7 +1497,7 @@ async def main() -> None:
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await admin_log(bot, "Бот запущен.")
+        await admin_log(bot, "Бот запущен. Обработчик шаблонов групп активен.")
         await dp.start_polling(bot)
     finally:
         for task in list(qr_tasks.values()) + list(broadcast_tasks.values()):
