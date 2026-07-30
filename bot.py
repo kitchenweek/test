@@ -6,7 +6,7 @@ import json
 import logging
 import random
 import re
-from datetime import datetime, date
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -50,8 +50,8 @@ SCAN_MESSAGE_LIMIT = 2000
 # Дневной лимит отписок
 DAILY_UNSUBSCRIBE_LIMIT = 55
 
-# Скорость печати (секунд на символ)
-CHAR_TYPING_SPEED = 0.09
+# Скорость печати (секунд на символ) - изменено на 0.13
+CHAR_TYPING_SPEED = 0.13
 
 TEMPLATE_REQUIRED_PHRASES = [
     "@WorldOfPoizon",
@@ -924,7 +924,8 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
             f"Аккаунтов: <b>{len(account_ids)}</b>\n"
             f"Уникальных получателей: <b>{len(jobs)}</b>\n"
             f"Общих: <b>{len(state['common_recipients'])}</b>\n"
-            f"Пауза: <b>{MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} сек.</b>\n"
+            f"Пауза между пользователями: <b>{MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} сек.</b>\n"
+            f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>\n"
             f"Осталось отписок сегодня: <b>{remaining_today}</b>",
         )
 
@@ -954,13 +955,16 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
             try:
                 entity = await client.get_entity(recipient)
 
-                # Отправляем все сообщения с задержкой на печать
+                # Отправляем все сообщения с задержкой перед каждым
                 for text in state["messages"]:
                     # Применяем замену букв с вероятностью 50%
                     modified_text = replace_letters_random(text)
                     
-                    # Рассчитываем задержку для имитации печати
+                    # Рассчитываем задержку для имитации печати ПЕРЕД отправкой
                     typing_delay = calculate_typing_delay(modified_text)
+                    
+                    # Ждём, имитируя печать (задержка ПЕРЕД отправкой)
+                    await asyncio.sleep(typing_delay)
                     
                     # Отправляем сообщение
                     await client.send_message(
@@ -968,9 +972,6 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                         modified_text,
                         link_preview=False,
                     )
-                    
-                    # Ждём, имитируя печать
-                    await asyncio.sleep(typing_delay)
 
                 if state["group_templates"]:
                     await send_random_template(client, entity, state)
@@ -1050,6 +1051,7 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     f"Осталось сегодня: {remaining}",
                 )
 
+            # Задержка МЕЖДУ пользователями (после отправки всех сообщений пользователю)
             if index < len(jobs):
                 await asyncio.sleep(random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
 
@@ -2084,7 +2086,8 @@ async def status_callback(callback: CallbackQuery) -> None:
         f"Шаблонов: <b>{len(state['group_templates'])}</b>\n"
         f"Рассылка: <b>{'идёт' if running else 'остановлена'}</b>\n"
         f"Отписок сегодня: <b>{daily_stats['count']}/{DAILY_UNSUBSCRIBE_LIMIT}</b>\n"
-        f"Осталось сегодня: <b>{remaining_today}</b>",
+        f"Осталось сегодня: <b>{remaining_today}</b>\n"
+        f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>",
         reply_markup=main_keyboard(),
     )
     await callback.answer()
