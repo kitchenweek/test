@@ -848,7 +848,8 @@ async def send_log_to_user(
     log_text += f"Получатель: <code>{html.escape(str(recipient))}</code>\n"
     
     if status == "success":
-        log_text += f"\n✅ Отписка выполнена успешно!
+        log_text += f"\n✅ Отписка выполнена успешно!\n"
+        log_text += f"📌 Получатель удалён из списка"
     else:
         log_text += f"\n❌ Причина: <code>{html.escape(error_reason)}</code>\n"
         if "спам" in error_reason.lower() or "flood" in error_reason.lower():
@@ -984,7 +985,7 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                         "success",
                         "",
                         remaining,
-                        "✅ Получатель удалён из списка"
+                        "Отправить сообщение"
                     )
 
                 except TemplatePoolEmptyError:
@@ -1493,7 +1494,7 @@ async def private_input(message: Message, bot: Bot) -> None:
             await client.send_code_request(text)
             data["phone"] = text
             user_steps[user_id] = "await_code"
-            await message.answer("Код отправлен. Введите его цифрами через пробел (1 2 3 4 5).")
+            await message.answer("Код отправлен. Введите его цифрами через пробел (1 2 3 4 5)..")
         except Exception as exc:
             await message.answer(
                 f"Не удалось отправить код:\n<code>{html.escape(str(exc))}</code>"
@@ -1643,7 +1644,7 @@ async def add_account_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_account_tag"
     await callback.message.edit_text(
         "Введите тег нового аккаунта.\n\n"
-        "Например: <code>Аккаунт1</code> или <code>Аккаунт2</code>",
+        "Например: <code>Основной</code> или <code>Аккаунт 2</code>",
         reply_markup=back_keyboard("accounts"),
     )
     await callback.answer()
@@ -2081,21 +2082,31 @@ async def group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
         )) >= MAX_TEMPLATE_SENDS
     )
 
+    # Формируем текст с учётом наличия привязанных групп
+    if state["bound_groups"]:
+        groups_text = names
+        instruction_text = ""
+    else:
+        groups_text = "<b>=отсутствуют=</b>"
+        instruction_text = (
+            "\n\n<b>=1. Создайте группу\n"
+            "2. Добавьте туда бота\n"
+            "3. Выдайте боту администратора\n"
+            "4. Добавьте шаблоны (минимум 2)\n"
+            "5. Пропишите /bind\n"
+            "6. Просканируйте шаблоны=</b>"
+        )
+
     await callback.message.edit_text(
         "<b>Шаблоны из групп</b>\n\n"
-        f"Привязанные группы:\n{names}\n\n"
+        f"Привязанные группы:\n{groups_text}\n\n"
         f"Сохранено шаблонов: <b>{len(state['group_templates'])}</b>\n"
         f"Всего отправок шаблонов: <b>{total_sends}</b>\n"
-        f"Исчерпали лимит: <b>{exhausted}</b>\n\n"
-        "В базу попадают только сообщения, содержащие хотя бы одну из этих фраз:\n"
-        "• <code>@WorldOfPoizon</code>\n"
-        "• <code>18.06</code>\n"
-        "• <code>Egor Sobolev</code>\n\n"
+        f"Исчерпали лимит: <b>{exhausted}</b>"
+        f"{instruction_text}\n\n"
         "Каждому получателю пересылается один случайный шаблон. "
         "Он не повторяется два раза подряд и может быть использован "
-        f"не более {MAX_TEMPLATE_SENDS} раз.\n\n"
-        "Одинаковые по содержанию сообщения разрешены. "
-        "Повторно не добавляется только то же сообщение группы.",
+        f"не более {MAX_TEMPLATE_SENDS} раз.",
         reply_markup=group_templates_keyboard(),
     )
     await callback.answer()
