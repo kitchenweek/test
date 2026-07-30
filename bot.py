@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import re
+from datetime import datetime, date
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,12 @@ MAX_TEXT_MESSAGES = 5
 MAX_GROUP_TEMPLATES = 1000
 MAX_TEMPLATE_SENDS = 100
 SCAN_MESSAGE_LIMIT = 2000
+
+# Дневной лимит отписок
+DAILY_UNSUBSCRIBE_LIMIT = 55
+
+# Скорость печати (секунд на символ)
+CHAR_TYPING_SPEED = 0.09
 
 TEMPLATE_REQUIRED_PHRASES = [
     "@WorldOfPoizon",
@@ -103,6 +110,17 @@ def replace_letters_random(text: str) -> str:
 
 
 # ============================================================
+# ФУНКЦИЯ ДЛЯ РАСЧЁТА ЗАДЕРЖКИ ПЕЧАТИ
+# ============================================================
+
+def calculate_typing_delay(text: str) -> float:
+    """
+    Рассчитывает задержку для имитации печати текста.
+    """
+    return len(text) * CHAR_TYPING_SPEED
+
+
+# ============================================================
 # СОСТОЯНИЕ
 # ============================================================
 
@@ -114,6 +132,10 @@ def user_dir(user_id: int) -> Path:
 
 def state_path(user_id: int) -> Path:
     return user_dir(user_id) / "state.json"
+
+
+def daily_stats_path(user_id: int) -> Path:
+    return user_dir(user_id) / "daily_stats.json"
 
 
 def session_path(user_id: int, account_id: str) -> str:
@@ -143,6 +165,55 @@ def default_state() -> dict[str, Any]:
         "template_usage": {},
         "last_template_key": None,
     }
+
+
+def default_daily_stats() -> dict[str, Any]:
+    return {
+        "date": str(date.today()),
+        "count": 0,
+    }
+
+
+def load_daily_stats(user_id: int) -> dict[str, Any]:
+    path = daily_stats_path(user_id)
+    if not path.exists():
+        stats = default_daily_stats()
+        save_daily_stats(user_id, stats)
+        return stats
+    
+    try:
+        stats = json.loads(path.read_text(encoding="utf-8"))
+        # Проверяем, не изменилась ли дата
+        if stats.get("date") != str(date.today()):
+            stats = default_daily_stats()
+            save_daily_stats(user_id, stats)
+        return stats
+    except Exception:
+        log.exception("Повреждён daily_stats.json пользователя %s", user_id)
+        stats = default_daily_stats()
+        save_daily_stats(user_id, stats)
+        return stats
+
+
+def save_daily_stats(user_id: int, stats: dict[str, Any]) -> None:
+    daily_stats_path(user_id).write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def can_unsubscribe_today(user_id: int) -> bool:
+    """Проверяет, не превышен ли дневной лимит отписок."""
+    stats = load_daily_stats(user_id)
+    return stats["count"] < DAILY_UNSUBSCRIBE_LIMIT
+
+
+def increment_unsubscribe_count(user_id: int) -> int:
+    """Увеличивает счётчик отписок на 1 и возвращает новое значение."""
+    stats = load_daily_stats(user_id)
+    stats["count"] += 1
+    save_daily_stats(user_id, stats)
+    return stats["count"]
 
 
 def migrate_state(loaded: dict[str, Any]) -> dict[str, Any]:
@@ -801,6 +872,7 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
     sent = 0
     failed = 0
     skipped = 0
+    unsubscribed = 0
 
     try:
         state = load_state(user_id)
@@ -833,18 +905,42 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
             )
             return
 
+        # Проверяем дневной лимит
+        daily_stats = load_daily_stats(user_id)
+        remaining_today = DAILY_UNSUBSCRIBE_LIMIT - daily_stats["count"]
+        
+        if remaining_today <= 0:
+            await bot.send_message(
+                chat_id,
+                f"⛔ <b>Дневной лимит отписок ({DAILY_UNSUBSCRIBE_LIMIT}) исчерпан!</b>\n\n"
+                "Рассылка остановлена до завтра.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
         await bot.send_message(
             chat_id,
             "▶️ <b>Рассылка запущена</b>\n\n"
             f"Аккаунтов: <b>{len(account_ids)}</b>\n"
             f"Уникальных получателей: <b>{len(jobs)}</b>\n"
             f"Общих: <b>{len(state['common_recipients'])}</b>\n"
-            f"Пауза: <b>{MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} сек.</b>",
+            f"Пауза: <b>{MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} сек.</b>\n"
+            f"Осталось отписок сегодня: <b>{remaining_today}</b>",
         )
 
         for index, (account_id, recipient, source) in enumerate(jobs, 1):
             if stop_event.is_set():
                 await bot.send_message(chat_id, "⛔ Рассылка остановлена.")
+                break
+
+            # Проверяем лимит перед каждой отправкой
+            if not can_unsubscribe_today(user_id):
+                await bot.send_message(
+                    chat_id,
+                    f"⛔ <b>Дневной лимит отписок ({DAILY_UNSUBSCRIBE_LIMIT}) достигнут!</b>\n\n"
+                    "Рассылка остановлена. Продолжение завтра.",
+                    reply_markup=main_keyboard(),
+                )
                 break
 
             account, client = account_map[account_id]
@@ -858,21 +954,44 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
             try:
                 entity = await client.get_entity(recipient)
 
+                # Отправляем все сообщения с задержкой на печать
                 for text in state["messages"]:
                     # Применяем замену букв с вероятностью 50%
                     modified_text = replace_letters_random(text)
+                    
+                    # Рассчитываем задержку для имитации печати
+                    typing_delay = calculate_typing_delay(modified_text)
+                    
+                    # Отправляем сообщение
                     await client.send_message(
                         entity,
                         modified_text,
                         link_preview=False,
                     )
-                    await asyncio.sleep(1)
+                    
+                    # Ждём, имитируя печать
+                    await asyncio.sleep(typing_delay)
 
                 if state["group_templates"]:
                     await send_random_template(client, entity, state)
 
-                # Только после успешной отправки закрепляем адресата.
-                state["recipient_owners"][recipient_key] = account_id
+                # Успешная отписка - увеличиваем счётчик
+                increment_unsubscribe_count(user_id)
+                unsubscribed += 1
+
+                # Удаляем получателя из списков
+                # Удаляем из общего списка
+                if recipient in state["common_recipients"]:
+                    state["common_recipients"].remove(recipient)
+                
+                # Удаляем из индивидуальных списков всех аккаунтов
+                for acc_id in state["individual_recipients"]:
+                    if recipient in state["individual_recipients"][acc_id]:
+                        state["individual_recipients"][acc_id].remove(recipient)
+                
+                # Удаляем закрепление
+                state["recipient_owners"].pop(recipient_key, None)
+                
                 save_state(user_id, state)
                 sent += 1
 
@@ -919,24 +1038,30 @@ async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
                     f"Ошибка: <code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>",
                 )
 
-            if index % 10 == 0:
+            # Обновляем информацию о прогрессе
+            if index % 10 == 0 or unsubscribed % 5 == 0:
+                remaining = DAILY_UNSUBSCRIBE_LIMIT - load_daily_stats(user_id)["count"]
                 await bot.send_message(
                     chat_id,
                     f"Прогресс: {index}/{len(jobs)}\n"
-                    f"Успешно: {sent}\n"
+                    f"Успешно отписано: {unsubscribed}\n"
                     f"Ошибок: {failed}\n"
-                    f"Пропущено: {skipped}",
+                    f"Пропущено: {skipped}\n"
+                    f"Осталось сегодня: {remaining}",
                 )
 
             if index < len(jobs):
                 await asyncio.sleep(random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
 
+        # Итоговый отчёт
+        remaining = DAILY_UNSUBSCRIBE_LIMIT - load_daily_stats(user_id)["count"]
         await bot.send_message(
             chat_id,
             "✅ <b>Готово</b>\n\n"
-            f"Успешно: <b>{sent}</b>\n"
+            f"Успешно отписано: <b>{unsubscribed}</b>\n"
             f"Ошибок: <b>{failed}</b>\n"
-            f"Пропущено пересечений: <b>{skipped}</b>",
+            f"Пропущено пересечений: <b>{skipped}</b>\n"
+            f"Осталось отписок сегодня: <b>{remaining}</b>",
             reply_markup=main_keyboard(),
         )
 
@@ -1945,6 +2070,9 @@ async def status_callback(callback: CallbackQuery) -> None:
     total_individual = sum(
         len(items) for items in state["individual_recipients"].values()
     )
+    
+    daily_stats = load_daily_stats(user_id)
+    remaining_today = DAILY_UNSUBSCRIBE_LIMIT - daily_stats["count"]
 
     await callback.message.edit_text(
         "<b>Статус</b>\n\n"
@@ -1954,7 +2082,9 @@ async def status_callback(callback: CallbackQuery) -> None:
         f"Общих получателей: <b>{len(state['common_recipients'])}</b>\n"
         f"Индивидуальных получателей: <b>{total_individual}</b>\n"
         f"Шаблонов: <b>{len(state['group_templates'])}</b>\n"
-        f"Рассылка: <b>{'идёт' if running else 'остановлена'}</b>",
+        f"Рассылка: <b>{'идёт' if running else 'остановлена'}</b>\n"
+        f"Отписок сегодня: <b>{daily_stats['count']}/{DAILY_UNSUBSCRIBE_LIMIT}</b>\n"
+        f"Осталось сегодня: <b>{remaining_today}</b>",
         reply_markup=main_keyboard(),
     )
     await callback.answer()
