@@ -1493,7 +1493,7 @@ async def private_input(message: Message, bot: Bot) -> None:
             await client.send_code_request(text)
             data["phone"] = text
             user_steps[user_id] = "await_code"
-            await message.answer("Код отправлен. Введите его цифрами.")
+            await message.answer("Код отправлен. Введите его цифрами через пробел (1 2 3 4 5).")
         except Exception as exc:
             await message.answer(
                 f"Не удалось отправить код:\n<code>{html.escape(str(exc))}</code>"
@@ -1643,7 +1643,7 @@ async def add_account_callback(callback: CallbackQuery) -> None:
     user_steps[callback.from_user.id] = "await_account_tag"
     await callback.message.edit_text(
         "Введите тег нового аккаунта.\n\n"
-        "Например: <code>Основной</code> или <code>Аккаунт 2</code>",
+        "Например: <code>Аккаунт1</code> или <code>Аккаунт2</code>",
         reply_markup=back_keyboard("accounts"),
     )
     await callback.answer()
