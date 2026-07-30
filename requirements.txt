@@ -1,4 +1,1 @@
-aiogram>=3.7,<4.0
-Telethon>=1.36,<2.0
-qrcode[pil]>=7.4
-python-socks[asyncio]>=2.5
+python-telegram-bot==22.7
