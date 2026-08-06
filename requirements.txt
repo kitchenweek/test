@@ -1,4 +1,6 @@
-aiogram>=3.7,<4.0
-Telethon>=1.36,<2.0
-qrcode[pil]>=7.4
-python-socks[asyncio]>=2.5
+aiogram==3.22.0
+telethon==1.41.2
+aiohttp>=3.9
+aiofiles>=24.1.0
+pydantic>=2.11
+typing-extensions>=4.12
