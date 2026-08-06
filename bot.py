@@ -1,2345 +1,1512 @@
-# -*- coding: utf-8 -*-
-
 import asyncio
 import html
-import json
 import logging
-import random
 import re
-from io import BytesIO
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
-import qrcode
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatType, ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
-from telethon import TelegramClient, errors
-from telethon.network.connection import ConnectionTcpMTProxyAbridged
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
+from telethon import TelegramClient, errors, types
+from telethon.sessions import StringSession
 
 
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = "8925857176:AAEAAlJVQXWvevidnUJxkGsIderHqbyMYRM"
-ADMIN_ID = 7517164478
-
 API_ID = 32200104
 API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
+BOT_TOKEN = "8961878352:AAGcRX9m6VHWTjdzf9R0NZmfi5f8uCIMVGQ"
 
-MIN_DELAY_SECONDS = 180
-MAX_DELAY_SECONDS = 420
-MAX_FLOOD_WAIT_SECONDS = 900
+# Укажите свой Telegram ID
+ADMIN_ID = 123456789
 
-MAX_TEXT_MESSAGES = 5
-MAX_GROUP_TEMPLATES = 1000
-MAX_TEMPLATE_SENDS = 100
-SCAN_MESSAGE_LIMIT = 2000
+BASE_DIR = Path(__file__).resolve().parent
+SESSION_FILE = BASE_DIR / "telethon_session.txt"
 
-# Скорость печати (секунд на символ)
-CHAR_TYPING_SPEED = 0.13
-
-TEMPLATE_REQUIRED_PHRASES = [
-    "@WorldOfPoizon",
-    "18.06",
-    "Egor Sobolev",
-]
-
-DATA_DIR = Path("users_data")
-
-
-# ============================================================
-# ЛОГИРОВАНИЕ И ПАМЯТЬ ПРОЦЕССА
-# ============================================================
+MAX_POSTS = 100
+CHANNELS_PER_PAGE = 8
+CHANNEL_TIMEZONE = ZoneInfo("Europe/Moscow")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("multi-account-broadcast")
+
+logger = logging.getLogger(__name__)
 
 router = Router()
+storage = MemoryStorage()
 
-user_steps: dict[int, str] = {}
-flow_data: dict[int, dict[str, Any]] = {}
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 
-user_clients: dict[tuple[int, str], TelegramClient] = {}
-qr_tasks: dict[int, asyncio.Task] = {}
-broadcast_tasks: dict[int, asyncio.Task] = {}
-stop_events: dict[int, asyncio.Event] = {}
+dp = Dispatcher(storage=storage)
+dp.include_router(router)
 
-
-# ============================================================
-# ФУНКЦИЯ ЗАМЕНЫ БУКВ С ВЕРОЯТНОСТЬЮ 50%
-# ============================================================
-
-def replace_letters_random(text: str) -> str:
-    """
-    Заменяет кириллические буквы на латинские аналоги с вероятностью 50% для каждой буквы.
-    """
-    replacements = {
-        'а': 'a', 'с': 'c', 'е': 'e', 'о': 'o', 'р': 'p', 'х': 'x', 'у': 'y',
-        'А': 'A', 'С': 'C', 'Е': 'E', 'О': 'O', 'Р': 'P', 'Х': 'X', 'Т': 'T',
-        'Н': 'H', 'В': 'B', 'К': 'K'
-    }
-    
-    result = ''
-    for char in text:
-        if char in replacements and random.random() < 0.5:
-            result += replacements[char]
-        else:
-            result += char
-    
-    return result
+telethon_client: TelegramClient | None = None
+telethon_lock = asyncio.Lock()
 
 
 # ============================================================
-# ФУНКЦИЯ ДЛЯ РАСЧЁТА ЗАДЕРЖКИ ПЕЧАТИ
+# СОСТОЯНИЯ
 # ============================================================
 
-def calculate_typing_delay(text: str) -> float:
-    """
-    Рассчитывает задержку для имитации печати текста.
-    """
-    return len(text) * CHAR_TYPING_SPEED
+class AuthorizationStates(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
 
 
-# ============================================================
-# СОСТОЯНИЕ
-# ============================================================
-
-def user_dir(user_id: int) -> Path:
-    path = DATA_DIR / str(user_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def state_path(user_id: int) -> Path:
-    return user_dir(user_id) / "state.json"
-
-
-def session_path(user_id: int, account_id: str) -> str:
-    return str(user_dir(user_id) / f"telegram_session_{account_id}")
-
-
-def default_state() -> dict[str, Any]:
-    return {
-        "accounts": {},
-        "active_account_id": None,
-        "next_account_number": 1,
-        "messages": [],
-        "common_recipients": [],
-        "individual_recipients": {},
-        "recipient_owners": {},
-        "bound_groups": [],
-        "group_templates": [],
-        "template_usage": {},
-        "last_template_key": None,
-    }
-
-
-def migrate_state(loaded: dict[str, Any]) -> dict[str, Any]:
-    state = default_state()
-    state.update(loaded)
-
-    if "recipients" in loaded and not state["common_recipients"]:
-        state["common_recipients"] = loaded.get("recipients", [])
-
-    if not state["accounts"] and loaded.get("proxy"):
-        account_id = "account_1"
-        state["accounts"][account_id] = {
-            "tag": "Аккаунт 1",
-            "proxy": loaded.get("proxy"),
-            "telegram_id": None,
-            "username": None,
-            "first_name": None,
-        }
-        state["active_account_id"] = account_id
-        state["next_account_number"] = 2
-        state["individual_recipients"].setdefault(account_id, [])
-
-    for account_id in state["accounts"]:
-        state["individual_recipients"].setdefault(account_id, [])
-
-    return state
-
-
-def load_state(user_id: int) -> dict[str, Any]:
-    path = state_path(user_id)
-    if not path.exists():
-        state = default_state()
-        save_state(user_id, state)
-        return state
-
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        log.exception("Повреждён state.json пользователя %s", user_id)
-        loaded = {}
-
-    state = migrate_state(loaded)
-    return state
-
-
-def save_state(user_id: int, state: dict[str, Any]) -> None:
-    state_path(user_id).write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-# ============================================================
-# ОБЩИЕ ФУНКЦИИ
-# ============================================================
-
-def event_user_label(event: Message | CallbackQuery) -> str:
-    user = event.from_user
-    if user is None:
-        return "неизвестный пользователь"
-    username = f"@{user.username}" if user.username else "без username"
-    return f"{html.escape(user.full_name)} | {username} | <code>{user.id}</code>"
-
-
-async def admin_log(bot: Bot, text: str) -> None:
-    try:
-        await bot.send_message(ADMIN_ID, f"<b>Лог</b>\n{text}")
-    except Exception:
-        log.exception("Не удалось отправить лог администратору")
-
-
-def normalize_recipient(value: str | int) -> str:
-    text = str(value).strip()
-    text = re.sub(
-        r"^https?://(?:www\.)?t\.me/",
-        "@",
-        text,
-        flags=re.IGNORECASE,
-    ).rstrip("/")
-
-    if text.lstrip("-").isdigit():
-        return str(int(text))
-
-    if text and not text.startswith("@") and re.fullmatch(r"[A-Za-z0-9_]{5,}", text):
-        text = "@" + text
-
-    return text.casefold()
-
-
-def parse_recipients(text: str) -> list[str | int]:
-    result: list[str | int] = []
-    seen: set[str] = set()
-
-    for raw in re.split(r"[\s,;]+", text):
-        value = raw.strip()
-        if not value:
-            continue
-
-        value = re.sub(
-            r"^https?://(?:www\.)?t\.me/",
-            "@",
-            value,
-            flags=re.IGNORECASE,
-        ).rstrip("/")
-
-        parsed: str | int
-        if value.lstrip("-").isdigit():
-            parsed = int(value)
-        else:
-            if not value.startswith("@") and re.fullmatch(r"[A-Za-z0-9_]{5,}", value):
-                value = "@" + value
-            parsed = value
-
-        key = normalize_recipient(parsed)
-        if key and key not in seen:
-            seen.add(key)
-            result.append(parsed)
-
-    return result
-
-
-def make_template_key(chat_id: int, message_id: int) -> str:
-    return f"{int(chat_id)}:{int(message_id)}"
-
-
-def normalize_template_text(value: str) -> str:
-    invisible = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"}
-    return "".join(ch for ch in value if ch not in invisible).casefold()
-
-
-def contains_required_phrase(text: str) -> bool:
-    normalized = normalize_template_text(text or "")
-    return any(
-        normalize_template_text(phrase) in normalized
-        for phrase in TEMPLATE_REQUIRED_PHRASES
-    )
-
-
-def account_label(account_id: str, account: dict[str, Any]) -> str:
-    tag = account.get("tag") or account_id
-    tg_id = account.get("telegram_id")
-    username = account.get("username")
-    suffix = f" | {tg_id}" if tg_id else ""
-    if username:
-        suffix += f" | @{username}"
-    return f"{tag}{suffix}"
+class ReplacementStates(StatesGroup):
+    choosing_channel = State()
+    waiting_dates = State()
+    collecting_posts = State()
+    confirmation = State()
+    processing = State()
 
 
 # ============================================================
 # КЛАВИАТУРЫ
 # ============================================================
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Аккаунты", callback_data="accounts")],
-            [
-                InlineKeyboardButton(text="📝 Сообщения", callback_data="messages"),
-                InlineKeyboardButton(text="👥 Получатели", callback_data="recipients"),
-            ],
-            [
-                InlineKeyboardButton(text="📚 Шаблоны группы", callback_data="group_templates"),
-                InlineKeyboardButton(text="📊 Статус", callback_data="status"),
-            ],
-            [
-                InlineKeyboardButton(text="▶️ Запустить", callback_data="start_broadcast"),
-                InlineKeyboardButton(text="⛔ Остановить", callback_data="stop_broadcast"),
-            ],
-        ]
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔐 Авторизация")],
+            [KeyboardButton(text="📝 Заменить посты")],
+            [KeyboardButton(text="👤 Статус аккаунта")],
+            [KeyboardButton(text="🚪 Выйти из аккаунта")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие",
     )
 
 
-def back_keyboard(callback_data: str = "menu") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_data)]
-        ]
+def phone_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Отправить номер", request_contact=True)],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
 
 
-def accounts_keyboard(state: dict[str, Any]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-
-    for account_id, account in state["accounts"].items():
-        tag = account.get("tag") or account_id
-        tg_id = account.get("telegram_id") or "не подключён"
-        rows.append([
-            InlineKeyboardButton(
-                text=f"👤 {tag} | {tg_id}",
-                callback_data=f"select_account:{account_id}",
-            )
-        ])
-
-    rows.append([
-        InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="add_account")
-    ])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def collection_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Готово")],
+            [KeyboardButton(text="🗑 Очистить посты")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True,
+    )
 
 
-def account_actions_keyboard(account_id: str) -> InlineKeyboardMarkup:
+def confirmation_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔄 Подключить / переподключить",
-                    callback_data=f"account_proxy:{account_id}",
+                    text="✅ Начать замену",
+                    callback_data="replace:confirm",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🏷 Изменить тег",
-                    callback_data=f"rename_account:{account_id}",
+                    text="❌ Отмена",
+                    callback_data="replace:cancel",
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    text="🚪 Выйти",
-                    callback_data=f"logout_account:{account_id}",
-                ),
-                InlineKeyboardButton(
-                    text="🗑 Удалить",
-                    callback_data=f"delete_account:{account_id}",
-                ),
-            ],
-            [InlineKeyboardButton(text="⬅️ К аккаунтам", callback_data="accounts")],
-        ]
-    )
-
-
-def proxy_protocol_keyboard(account_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="SOCKS5",
-                    callback_data=f"proxy_protocol:{account_id}:socks5",
-                ),
-                InlineKeyboardButton(
-                    text="SOCKS4",
-                    callback_data=f"proxy_protocol:{account_id}:socks4",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="HTTP",
-                    callback_data=f"proxy_protocol:{account_id}:http",
-                ),
-                InlineKeyboardButton(
-                    text="MTProto",
-                    callback_data=f"proxy_protocol:{account_id}:mtproto",
-                ),
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"select_account:{account_id}")],
-        ]
-    )
-
-
-def login_method_keyboard(account_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📱 По номеру",
-                    callback_data=f"login_phone:{account_id}",
-                ),
-                InlineKeyboardButton(
-                    text="📷 По QR-коду",
-                    callback_data=f"login_qr:{account_id}",
-                ),
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"select_account:{account_id}")],
-        ]
-    )
-
-
-def messages_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить сообщения", callback_data="add_messages")],
-            [InlineKeyboardButton(text="🗑 Удалить сообщение", callback_data="delete_message")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-        ]
-    )
-
-
-def adding_messages_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Завершить", callback_data="finish_messages")]
-        ]
-    )
-
-
-def recipients_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить получателей", callback_data="recipient_mode")],
-            [InlineKeyboardButton(text="🗑 Очистить списки", callback_data="clear_recipients_menu")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-        ]
-    )
-
-
-def recipient_mode_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="👤 Индивидуальный", callback_data="recipient_mode:individual"),
-                InlineKeyboardButton(text="🌐 Общий", callback_data="recipient_mode:common"),
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="recipients")],
-        ]
-    )
-
-
-def account_choice_keyboard(
-    state: dict[str, Any],
-    action_prefix: str,
-    back: str = "recipients",
-) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for account_id, account in state["accounts"].items():
-        rows.append([
-            InlineKeyboardButton(
-                text=account_label(account_id, account)[:60],
-                callback_data=f"{action_prefix}:{account_id}",
-            )
-        ])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def clear_recipients_keyboard(state: dict[str, Any]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="🗑 Очистить общий список", callback_data="clear_common_recipients")],
-        [InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all_recipients")],
-    ]
-    if state["accounts"]:
-        rows.append([
-            InlineKeyboardButton(
-                text="👤 Очистить индивидуальный",
-                callback_data="choose_clear_individual",
-            )
-        ])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="recipients")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def group_templates_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔎 Просканировать шаблоны", callback_data="scan_group_templates")],
-            [InlineKeyboardButton(text="🗑 Очистить шаблоны", callback_data="clear_group_templates")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
         ]
     )
 
 
 # ============================================================
-# ПРОКСИ И TELETHON
+# ПРОВЕРКА ДОСТУПА
 # ============================================================
 
-def parse_proxy(value: str, protocol: str) -> dict[str, Any]:
-    value = value.strip()
-
-    if "://" in value:
-        if value.lower().startswith("tg://proxy"):
-            parsed = urlparse(value)
-            query = parse_qs(parsed.query)
-            host = (query.get("server") or [""])[0]
-            port = int((query.get("port") or ["0"])[0])
-            secret = (query.get("secret") or [""])[0]
-            if not host or not port or not secret:
-                raise ValueError("В MTProto-ссылке нужны server, port и secret")
-            return {"type": "mtproto", "host": host, "port": port, "secret": secret}
-
-        parsed = urlparse(value)
-        scheme = parsed.scheme.lower()
-        if scheme in {"socks5", "socks4", "http"}:
-            if not parsed.hostname or not parsed.port:
-                raise ValueError("Не найдены IP или порт")
-            return {
-                "type": scheme,
-                "host": parsed.hostname,
-                "port": parsed.port,
-                "username": parsed.username or "",
-                "password": parsed.password or "",
-                "rdns": True,
-            }
-
-    parts = value.split(":")
-    protocol = protocol.lower()
-
-    if protocol in {"socks5", "socks4", "http"}:
-        if len(parts) not in {2, 4}:
-            raise ValueError("Формат: IP:ПОРТ:ЛОГИН:ПАРОЛЬ")
-        host = parts[0].strip()
-        port = int(parts[1].strip())
-        username = parts[2].strip() if len(parts) == 4 else ""
-        password = parts[3].strip() if len(parts) == 4 else ""
-        return {
-            "type": protocol,
-            "host": host,
-            "port": port,
-            "username": username,
-            "password": password,
-            "rdns": True,
-        }
-
-    if protocol == "mtproto":
-        if len(parts) != 3:
-            raise ValueError("Формат MTProto: IP:ПОРТ:SECRET")
-        return {
-            "type": "mtproto",
-            "host": parts[0].strip(),
-            "port": int(parts[1].strip()),
-            "secret": parts[2].strip(),
-        }
-
-    raise ValueError("Неизвестный протокол")
+def is_admin(user_id: int | None) -> bool:
+    return user_id == ADMIN_ID
 
 
-def client_options(account: dict[str, Any]) -> dict[str, Any]:
-    proxy = account.get("proxy")
-    if not proxy:
-        raise ValueError("Для аккаунта не задан прокси")
+async def reject_non_admin_message(message: Message) -> bool:
+    if is_admin(message.from_user.id if message.from_user else None):
+        return False
 
-    options: dict[str, Any] = {
-        "device_model": "Desktop",
-        "system_version": "Windows 11",
-        "app_version": "1.0",
-        "lang_code": "ru",
-        "system_lang_code": "ru-RU",
-    }
-
-    if proxy["type"] == "mtproto":
-        options["connection"] = ConnectionTcpMTProxyAbridged
-        options["proxy"] = (
-            proxy["host"],
-            int(proxy["port"]),
-            proxy["secret"],
-        )
-    else:
-        options["proxy"] = (
-            proxy["type"],
-            proxy["host"],
-            int(proxy["port"]),
-            bool(proxy.get("rdns", True)),
-            proxy.get("username") or None,
-            proxy.get("password") or None,
-        )
-
-    return options
+    await message.answer("⛔ У вас нет доступа к этому боту.")
+    return True
 
 
-async def rebuild_client(user_id: int, account_id: str) -> TelegramClient:
-    key = (user_id, account_id)
-    old = user_clients.pop(key, None)
-    if old:
-        try:
-            await old.disconnect()
-        except Exception:
-            pass
+async def reject_non_admin_callback(callback: CallbackQuery) -> bool:
+    if is_admin(callback.from_user.id):
+        return False
 
-    state = load_state(user_id)
-    account = state["accounts"].get(account_id)
-    if not account:
-        raise ValueError("Аккаунт не найден")
+    await callback.answer("У вас нет доступа.", show_alert=True)
+    return True
+
+
+# ============================================================
+# TELETHON
+# ============================================================
+
+def load_string_session() -> str:
+    if not SESSION_FILE.exists():
+        return ""
+
+    try:
+        return SESSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        logger.exception("Не удалось прочитать файл сессии")
+        return ""
+
+
+def save_string_session(session_string: str) -> None:
+    SESSION_FILE.write_text(session_string, encoding="utf-8")
+
+
+def delete_session_file() -> None:
+    try:
+        SESSION_FILE.unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Не удалось удалить файл сессии")
+
+
+async def create_telethon_client() -> TelegramClient:
+    session_string = load_string_session()
 
     client = TelegramClient(
-        session_path(user_id, account_id),
+        StringSession(session_string),
         API_ID,
         API_HASH,
-        **client_options(account),
+        device_model="Channel Post Editor",
+        system_version="Python",
+        app_version="1.0",
+        lang_code="ru",
+        system_lang_code="ru-RU",
     )
+
     await client.connect()
-    user_clients[key] = client
     return client
 
 
-async def get_client(user_id: int, account_id: str) -> TelegramClient:
-    key = (user_id, account_id)
-    client = user_clients.get(key)
-    if client is None:
-        return await rebuild_client(user_id, account_id)
-    if not client.is_connected():
-        await client.connect()
-    return client
+async def get_telethon_client() -> TelegramClient:
+    global telethon_client
+
+    async with telethon_lock:
+        if telethon_client is None:
+            telethon_client = await create_telethon_client()
+        elif not telethon_client.is_connected():
+            await telethon_client.connect()
+
+        return telethon_client
 
 
-async def update_account_identity(user_id: int, account_id: str, client: TelegramClient) -> None:
-    me = await client.get_me()
-    state = load_state(user_id)
-    account = state["accounts"].get(account_id)
-    if not account:
-        return
+async def recreate_telethon_client() -> TelegramClient:
+    global telethon_client
 
-    account["telegram_id"] = int(me.id)
-    account["username"] = me.username
-    account["first_name"] = me.first_name
-    save_state(user_id, state)
+    async with telethon_lock:
+        if telethon_client is not None:
+            try:
+                await telethon_client.disconnect()
+            except Exception:
+                logger.exception("Ошибка отключения Telethon")
+
+        telethon_client = await create_telethon_client()
+        return telethon_client
 
 
-async def authorized_accounts(user_id: int) -> list[tuple[str, dict[str, Any], TelegramClient]]:
-    state = load_state(user_id)
-    result = []
+async def save_current_telethon_session(client: TelegramClient) -> None:
+    session_string = client.session.save()
 
-    for account_id, account in state["accounts"].items():
+    if not isinstance(session_string, str) or not session_string:
+        raise RuntimeError("Не удалось получить строку сессии Telethon")
+
+    save_string_session(session_string)
+
+
+# ============================================================
+# ДАТЫ
+# ============================================================
+
+DATE_PATTERN = re.compile(r"(?<!\d)(\d{2}\.\d{2}\.\d{4})(?!\d)")
+
+
+def parse_dates(text: str) -> list[datetime]:
+    found_dates: set[datetime] = set()
+    invalid_dates: list[str] = []
+
+    for value in DATE_PATTERN.findall(text):
         try:
-            client = await get_client(user_id, account_id)
-            if await client.is_user_authorized():
-                await update_account_identity(user_id, account_id, client)
-                result.append((account_id, account, client))
-        except Exception:
-            log.exception("Аккаунт %s недоступен", account_id)
+            parsed = datetime.strptime(value, "%d.%m.%Y")
+            found_dates.add(parsed)
+        except ValueError:
+            invalid_dates.append(value)
 
-    return result
+    if invalid_dates:
+        raise ValueError(
+            "Некорректные даты: " + ", ".join(sorted(set(invalid_dates)))
+        )
 
+    if not found_dates:
+        raise ValueError(
+            "Даты не найдены. Используйте формат ДД.ММ.ГГГГ."
+        )
 
-async def resolve_dialog_entity(client: TelegramClient, chat_id: int) -> Any:
-    try:
-        return await client.get_entity(chat_id)
-    except Exception:
-        async for dialog in client.iter_dialogs():
-            if int(dialog.id) == int(chat_id):
-                return dialog.entity
-        raise ValueError(f"Группа {chat_id} не найдена в диалогах аккаунта")
+    return sorted(found_dates)
 
 
-# ============================================================
-# ШАБЛОНЫ
-# ============================================================
+def format_dates(dates: list[str] | list[datetime]) -> str:
+    result: list[str] = []
 
-class TemplatePoolEmptyError(Exception):
-    pass
-
-
-def choose_random_template(state: dict[str, Any]) -> dict[str, int]:
-    usage = state.setdefault("template_usage", {})
-    last_key = state.get("last_template_key")
-
-    available = []
-    for template in state["group_templates"]:
-        key = make_template_key(template["chat_id"], template["message_id"])
-        if int(usage.get(key, 0)) >= MAX_TEMPLATE_SENDS:
-            continue
-        if key == last_key:
-            continue
-        available.append(template)
-
-    if not available:
-        raise TemplatePoolEmptyError
-
-    return random.choice(available)
-
-
-async def send_random_template(
-    client: TelegramClient,
-    recipient_entity: Any,
-    state: dict[str, Any],
-) -> None:
-    template = choose_random_template(state)
-    source = await resolve_dialog_entity(client, int(template["chat_id"]))
-
-    sent = await client.forward_messages(
-        recipient_entity,
-        int(template["message_id"]),
-        from_peer=source,
-    )
-    if not sent:
-        raise RuntimeError("Шаблон не был переслан")
-
-    key = make_template_key(template["chat_id"], template["message_id"])
-    state["template_usage"][key] = int(state["template_usage"].get(key, 0)) + 1
-    state["last_template_key"] = key
-
-
-# ============================================================
-# РАССЫЛКА (ПАРАЛЛЕЛЬНАЯ)
-# ============================================================
-
-def build_recipient_jobs(
-    state: dict[str, Any],
-    account_ids: list[str],
-) -> list[tuple[str, str | int, str]]:
-    """
-    Возвращает (account_id, recipient, source).
-    """
-    if not account_ids:
-        return []
-
-    jobs: list[tuple[str, str | int, str]] = []
-    seen: set[str] = set()
-    owners = state.setdefault("recipient_owners", {})
-
-    # Сначала индивидуальные списки.
-    for account_id in account_ids:
-        for recipient in state["individual_recipients"].get(account_id, []):
-            key = normalize_recipient(recipient)
-            if not key or key in seen:
-                continue
-
-            previous_owner = owners.get(key)
-            if previous_owner and previous_owner != account_id:
-                continue
-
-            seen.add(key)
-            jobs.append((account_id, recipient, "individual"))
-
-    # Затем общий список.
-    rr_index = 0
-    for recipient in state["common_recipients"]:
-        key = normalize_recipient(recipient)
-        if not key or key in seen:
-            continue
-
-        previous_owner = owners.get(key)
-        if previous_owner in account_ids:
-            account_id = previous_owner
+    for item in dates:
+        if isinstance(item, datetime):
+            result.append(item.strftime("%d.%m.%Y"))
         else:
-            account_id = account_ids[rr_index % len(account_ids)]
-            rr_index += 1
+            result.append(item)
 
-        seen.add(key)
-        jobs.append((account_id, recipient, "common"))
-
-    return jobs
-
-
-def remove_recipient_from_all_lists(
-    state: dict[str, Any],
-    recipient: str | int,
-) -> None:
-    """Удаляет получателя из всех списков."""
-    recipient_key = normalize_recipient(recipient)
-    
-    # Удаляем из общего списка
-    if recipient in state["common_recipients"]:
-        state["common_recipients"].remove(recipient)
-    
-    # Удаляем из индивидуальных списков всех аккаунтов
-    for acc_id in state["individual_recipients"]:
-        if recipient in state["individual_recipients"][acc_id]:
-            state["individual_recipients"][acc_id].remove(recipient)
-    
-    # Удаляем закрепление
-    state["recipient_owners"].pop(recipient_key, None)
-
-
-def is_spam_block_error(exc: Exception) -> bool:
-    """Проверяет, является ли ошибка спам-блоком."""
-    spam_errors = (
-        errors.FloodWaitError,
-        errors.rpcerrorlist.SlowModeWaitError,
-    )
-    return isinstance(exc, spam_errors)
-
-
-def is_recipient_error(exc: Exception) -> bool:
-    """Проверяет, является ли ошибка проблемой с получателем."""
-    recipient_errors = (
-        errors.UsernameInvalidError,
-        errors.UsernameNotOccupiedError,
-        errors.UserPrivacyRestrictedError,
-        errors.ChatWriteForbiddenError,
-        errors.UserDeactivatedError,
-        errors.rpcerrorlist.PeerIdInvalidError,
-        errors.rpcerrorlist.MessageEmptyError,
-        errors.rpcerrorlist.MessageTooLongError,
-        ValueError,
-    )
-    return isinstance(exc, recipient_errors)
-
-
-def is_running(user_id: int) -> bool:
-    """Проверяет, запущена ли рассылка для пользователя."""
-    task = broadcast_tasks.get(user_id)
-    return task is not None and not task.done()
-
-
-async def send_log_to_user(
-    bot: Bot,
-    chat_id: int,
-    account_id: str,
-    account_name: str,
-    recipient: str | int,
-    status: str,
-    error_reason: str = "",
-    total_remaining: int = 0,
-    action: str = "",
-) -> None:
-    """Отправляет лог пользователю о попытке отписки."""
-    
-    status_emoji = "✅" if status == "success" else "❌"
-    status_text = "УСПЕШНО" if status == "success" else "ОШИБКА"
-    
-    log_text = f"{status_emoji} <b>{status_text}</b>\n\n"
-    log_text += f"Аккаунт: <b>{html.escape(account_name)}</b>\n"
-    log_text += f"Получатель: <code>{html.escape(str(recipient))}</code>\n"
-    
-    if status == "success":
-        log_text += f"\n✅ Отписка выполнена успешно!\n"
-        log_text += f"📌 Получатель удалён из списка"
-    else:
-        log_text += f"\n❌ Причина: <code>{html.escape(error_reason)}</code>\n"
-        if "спам" in error_reason.lower() or "flood" in error_reason.lower():
-            log_text += f"⚠️ Получатель НЕ удалён (ошибка спам-блока)\n"
-            log_text += f"🔄 Попытка будет повторена позже"
-        else:
-            log_text += f"⚠️ Получатель удалён из списка"
-    
-    if action:
-        log_text += f"\n\n📌 <b>Действие:</b> {action}"
-    
-    log_text += f"\n\n📊 <b>Статистика:</b>\n"
-    log_text += f"Осталось получателей: <b>{total_remaining}</b>"
-    
-    try:
-        await bot.send_message(chat_id, log_text)
-    except Exception as e:
-        log.error(f"Не удалось отправить лог пользователю: {e}")
-
-
-async def run_broadcast(bot: Bot, user_id: int, chat_id: int) -> None:
-    # Создаём событие остановки
-    stop_event = stop_events.setdefault(user_id, asyncio.Event())
-    stop_event.clear()
-
-    sent = 0
-    failed = 0
-    skipped = 0
-    unsubscribed = 0
-
-    try:
-        state = load_state(user_id)
-        available_accounts = await authorized_accounts(user_id)
-
-        if not available_accounts:
-            await bot.send_message(chat_id, "❌ Нет ни одного подключённого аккаунта.")
-            return
-
-        account_map = {
-            account_id: (account, client)
-            for account_id, account, client in available_accounts
-        }
-        account_ids = list(account_map)
-
-        jobs = build_recipient_jobs(state, account_ids)
-        if not jobs:
-            await bot.send_message(chat_id, "❌ Списки получателей пусты.")
-            return
-
-        if not state["messages"] and not state["group_templates"]:
-            await bot.send_message(chat_id, "❌ Нет сообщений или шаблонов.")
-            return
-
-        if state["group_templates"] and len(state["group_templates"]) < 2:
-            await bot.send_message(
-                chat_id,
-                "❌ Для случайной пересылки нужно минимум 2 шаблона.",
-                reply_markup=group_templates_keyboard(),
-            )
-            return
-
-        total_recipients = len(jobs)
-        
-        await bot.send_message(
-            chat_id,
-            "▶️ <b>Рассылка запущена (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)</b>\n\n"
-            f"Аккаунтов: <b>{len(account_ids)}</b>\n"
-            f"Уникальных получателей: <b>{total_recipients}</b>\n"
-            f"Пауза между пользователями: <b>{MIN_DELAY_SECONDS}–{MAX_DELAY_SECONDS} сек.</b>\n"
-            f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>",
-        )
-
-        # Создаём очередь заданий для каждого аккаунта
-        account_jobs = {account_id: [] for account_id in account_ids}
-        for job in jobs:
-            account_id, recipient, source = job
-            account_jobs[account_id].append((recipient, source))
-
-        # Функция для обработки заданий одного аккаунта
-        async def process_account_jobs(account_id: str, jobs_list: list) -> tuple[int, int, int]:
-            local_sent = 0
-            local_failed = 0
-            local_skipped = 0
-            
-            account, client = account_map[account_id]
-            account_name = account_label(account_id, account)
-            
-            for recipient, source in jobs_list:
-                # Проверяем стоп-событие
-                if stop_event.is_set():
-                    break
-
-                recipient_key = normalize_recipient(recipient)
-                previous_owner = state["recipient_owners"].get(recipient_key)
-
-                if previous_owner and previous_owner != account_id:
-                    local_skipped += 1
-                    continue
-
-                try:
-                    entity = await client.get_entity(recipient)
-
-                    # Отправляем все сообщения с задержкой перед каждым
-                    for text in state["messages"]:
-                        modified_text = replace_letters_random(text)
-                        typing_delay = calculate_typing_delay(modified_text)
-                        
-                        await asyncio.sleep(typing_delay)
-                        await client.send_message(
-                            entity,
-                            modified_text,
-                            link_preview=False,
-                        )
-
-                    if state["group_templates"]:
-                        await send_random_template(client, entity, state)
-
-                    # Успешная отписка
-                    local_sent += 1
-
-                    # Удаляем получателя из всех списков
-                    remove_recipient_from_all_lists(state, recipient)
-                    save_state(user_id, state)
-
-                    # Подсчитываем оставшихся получателей
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "success",
-                        "",
-                        remaining,
-                        "Отправить сообщение"
-                    )
-
-                except TemplatePoolEmptyError:
-                    error_msg = "Закончились доступные шаблоны"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "⏹ Рассылка остановлена"
-                    )
-                    break
-
-                except errors.FloodWaitError as exc:
-                    wait_seconds = int(exc.seconds)
-                    if wait_seconds > MAX_FLOOD_WAIT_SECONDS:
-                        error_msg = f"FloodWait: {wait_seconds} сек. (превышен лимит)"
-                        remaining = len(state["common_recipients"]) + sum(
-                            len(state["individual_recipients"].get(acc_id, []))
-                            for acc_id in state["accounts"]
-                        )
-                        await send_log_to_user(
-                            bot, chat_id, account_id, account_name, recipient,
-                            "error", error_msg,
-                            remaining,
-                            "⏹ Рассылка остановлена из-за спам-блока"
-                        )
-                        break
-                    await asyncio.sleep(wait_seconds + 2)
-                    # Повторяем попытку (НЕ удаляем получателя!)
-                    continue
-
-                except errors.rpcerrorlist.SlowModeWaitError as exc:
-                    wait_seconds = int(exc.seconds)
-                    error_msg = f"SlowMode: {wait_seconds} сек. (спам-блок)"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        f"⏳ Ожидание {wait_seconds} сек., получатель НЕ удалён"
-                    )
-                    await asyncio.sleep(wait_seconds + 2)
-                    # Повторяем попытку (НЕ удаляем получателя!)
-                    continue
-
-                except errors.UsernameInvalidError:
-                    error_msg = "Неверный username (такого пользователя не существует)"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "🗑 Получатель удалён из списка"
-                    )
-                    local_failed += 1
-                    remove_recipient_from_all_lists(state, recipient)
-                    save_state(user_id, state)
-
-                except errors.UsernameNotOccupiedError:
-                    error_msg = "Username не существует"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "🗑 Получатель удалён из списка"
-                    )
-                    local_failed += 1
-                    remove_recipient_from_all_lists(state, recipient)
-                    save_state(user_id, state)
-
-                except errors.UserPrivacyRestrictedError:
-                    error_msg = "Пользователь ограничил приватность (нельзя писать)"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "🗑 Получатель удалён из списка"
-                    )
-                    local_failed += 1
-                    remove_recipient_from_all_lists(state, recipient)
-                    save_state(user_id, state)
-
-                except errors.ChatWriteForbiddenError:
-                    error_msg = "Нет прав на отправку сообщений этому пользователю"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "🗑 Получатель удалён из списка"
-                    )
-                    local_failed += 1
-                    remove_recipient_from_all_lists(state, recipient)
-                    save_state(user_id, state)
-
-                except errors.UserDeactivatedError:
-                    error_msg = "Пользователь деактивирован"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "🗑 Получатель удалён из списка"
-                    )
-                    local_failed += 1
-                    remove_recipient_from_all_lists(state, recipient)
-                    save_state(user_id, state)
-
-                except errors.rpcerrorlist.PeerIdInvalidError:
-                    error_msg = "Неверный ID получателя (возможно, пользователь удалён)"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "🗑 Получатель удалён из списка"
-                    )
-                    local_failed += 1
-                    remove_recipient_from_all_lists(state, recipient)
-                    save_state(user_id, state)
-
-                except errors.rpcerrorlist.MessageEmptyError:
-                    error_msg = "Сообщение пустое (ошибка отправки)"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "⚠️ Получатель НЕ удалён (проблема с сообщением)"
-                    )
-                    local_failed += 1
-
-                except errors.rpcerrorlist.MessageTooLongError:
-                    error_msg = "Сообщение слишком длинное"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "⚠️ Получатель НЕ удалён (проблема с сообщением)"
-                    )
-                    local_failed += 1
-
-                except ValueError as exc:
-                    error_msg = f"Ошибка: {str(exc)}"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "🗑 Получатель удалён из списка"
-                    )
-                    local_failed += 1
-                    remove_recipient_from_all_lists(state, recipient)
-                    save_state(user_id, state)
-
-                except Exception as exc:
-                    # Любая другая ошибка - не удаляем получателя
-                    error_msg = f"{type(exc).__name__}: {str(exc)}"
-                    remaining = len(state["common_recipients"]) + sum(
-                        len(state["individual_recipients"].get(acc_id, []))
-                        for acc_id in state["accounts"]
-                    )
-                    await send_log_to_user(
-                        bot, chat_id, account_id, account_name, recipient,
-                        "error", error_msg,
-                        remaining,
-                        "⚠️ Получатель НЕ удалён (неизвестная ошибка)"
-                    )
-                    local_failed += 1
-                    log.exception("Ошибка отправки account=%s recipient=%r", account_id, recipient)
-
-                # Задержка МЕЖДУ пользователями для этого аккаунта
-                await asyncio.sleep(random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
-            
-            return local_sent, local_failed, local_skipped
-
-        # Запускаем обработку для всех аккаунтов параллельно
-        tasks = []
-        for account_id in account_ids:
-            if account_jobs[account_id]:  # Если есть задания для аккаунта
-                task = asyncio.create_task(process_account_jobs(account_id, account_jobs[account_id]))
-                tasks.append(task)
-
-        # Ждём завершения всех задач
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Собираем результаты
-        for result in results:
-            if isinstance(result, tuple):
-                s, f, sk = result
-                sent += s
-                failed += f
-                skipped += sk
-                unsubscribed += s
-            elif isinstance(result, Exception):
-                log.error(f"Ошибка в задаче: {result}")
-
-        # Итоговый отчёт
-        remaining = len(state["common_recipients"]) + sum(
-            len(state["individual_recipients"].get(acc_id, []))
-            for acc_id in state["accounts"]
-        )
-        
-        await bot.send_message(
-            chat_id,
-            "✅ <b>Рассылка завершена (ПАРАЛЛЕЛЬНЫЙ РЕЖИМ)</b>\n\n"
-            f"Успешно отписано: <b>{unsubscribed}</b>\n"
-            f"Ошибок: <b>{failed}</b>\n"
-            f"Пропущено пересечений: <b>{skipped}</b>\n"
-            f"Осталось получателей: <b>{remaining}</b>",
-            reply_markup=main_keyboard(),
-        )
-
-    except Exception as exc:
-        log.exception("Критическая ошибка рассылки")
-        await bot.send_message(
-            chat_id,
-            f"❌ Критическая ошибка: <code>{html.escape(str(exc))}</code>",
-            reply_markup=main_keyboard(),
-        )
-    finally:
-        # Удаляем задачу из словаря
-        broadcast_tasks.pop(user_id, None)
-        # Удаляем событие остановки
-        stop_events.pop(user_id, None)
-
-
-# ============================================================
-# QR-ВХОД
-# ============================================================
-
-async def perform_qr_login(
-    bot: Bot,
-    chat_id: int,
-    user_id: int,
-    account_id: str,
-) -> None:
-    try:
-        client = await rebuild_client(user_id, account_id)
-        qr_login = await client.qr_login()
-
-        qr = qrcode.QRCode(border=3)
-        qr.add_data(qr_login.url)
-        qr.make(fit=True)
-        image = qr.make_image(fill_color="black", back_color="white")
-
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-
-        sent_message = await bot.send_photo(
-            chat_id,
-            BufferedInputFile(buffer.getvalue(), filename="telegram_login_qr.png"),
-            caption=(
-                "<b>Вход по QR-коду</b>\n\n"
-                "Telegram → Настройки → Устройства → Подключить устройство."
-            ),
-        )
-
-        try:
-            await qr_login.wait(timeout=120)
-        except errors.SessionPasswordNeededError:
-            flow_data.setdefault(user_id, {})["account_id"] = account_id
-            user_steps[user_id] = "await_qr_2fa"
-            await bot.send_message(chat_id, "Введите пароль двухэтапной аутентификации.")
-            return
-
-        await update_account_identity(user_id, account_id, client)
-        await bot.send_message(
-            chat_id,
-            "✅ Аккаунт подключён.",
-            reply_markup=main_keyboard(),
-        )
-
-        try:
-            await sent_message.delete()
-        except Exception:
-            pass
-
-    except asyncio.TimeoutError:
-        await bot.send_message(chat_id, "QR-код истёк. Запустите вход снова.")
-    except Exception as exc:
-        await bot.send_message(
-            chat_id,
-            f"Ошибка QR-входа: <code>{html.escape(str(exc))}</code>",
-        )
-    finally:
-        qr_tasks.pop(user_id, None)
-
-
-# ============================================================
-# КОМАНДЫ И ГРУППЫ
-# ============================================================
-
-@router.message(CommandStart())
-async def start_handler(message: Message, bot: Bot) -> None:
-    load_state(message.from_user.id)
-    await message.answer(
-        "<b>Панель рассылки</b>",
-        reply_markup=main_keyboard(),
-    )
-    await admin_log(bot, f"Запустил бота:\n{event_user_label(message)}")
-
-
-@router.message(Command("menu"))
-async def menu_handler(message: Message) -> None:
-    user_steps.pop(message.from_user.id, None)
-    flow_data.pop(message.from_user.id, None)
-    await message.answer("Главное меню:", reply_markup=main_keyboard())
-
-
-@router.message(Command("bind"))
-async def bind_handler(message: Message) -> None:
-    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        await message.answer("Команду /bind нужно отправить в группе.")
-        return
-
-    state = load_state(message.from_user.id)
-    group_id = int(message.chat.id)
-
-    if group_id not in state["bound_groups"]:
-        state["bound_groups"].append(group_id)
-        save_state(message.from_user.id, state)
-
-    await message.answer(
-        "✅ Группа привязана. Используйте кнопку "
-        "«Просканировать шаблоны» в разделе шаблонов."
-    )
-
-
-def owners_for_group(group_id: int) -> list[int]:
-    owners = []
-    if not DATA_DIR.exists():
-        return owners
-
-    for directory in DATA_DIR.iterdir():
-        if not directory.is_dir() or not directory.name.isdigit():
-            continue
-        owner_id = int(directory.name)
-        state = load_state(owner_id)
-        if int(group_id) in [int(item) for item in state["bound_groups"]]:
-            owners.append(owner_id)
-
-    return owners
-
-
-@router.message(F.chat.type == ChatType.GROUP)
-@router.message(F.chat.type == ChatType.SUPERGROUP)
-async def capture_template(message: Message, bot: Bot) -> None:
-    if message.text and message.text.startswith("/bind"):
-        return
-
-    text = (message.text or message.caption or "").strip()
-    if not contains_required_phrase(text):
-        return
-
-    for owner_id in owners_for_group(message.chat.id):
-        state = load_state(owner_id)
-        ref = {
-            "chat_id": int(message.chat.id),
-            "message_id": int(message.message_id),
-        }
-
-        if ref in state["group_templates"]:
-            continue
-
-        state["group_templates"].append(ref)
-        state["group_templates"] = state["group_templates"][-MAX_GROUP_TEMPLATES:]
-
-        key = make_template_key(ref["chat_id"], ref["message_id"])
-        state["template_usage"].setdefault(key, 0)
-        save_state(owner_id, state)
-
-        try:
-            await bot.send_message(
-                owner_id,
-                "✅ <b>Шаблон добавлен</b>\n\n"
-                f"Всего шаблонов: <b>{len(state['group_templates'])}</b>",
-            )
-        except Exception:
-            pass
-
-
-# ============================================================
-# ПРИВАТНЫЙ ВВОД
-# ============================================================
-
-@router.message(F.chat.type == ChatType.PRIVATE)
-async def private_input(message: Message, bot: Bot) -> None:
-    user_id = message.from_user.id
-    step = user_steps.get(user_id)
-    text = (message.text or "").strip()
-    data = flow_data.setdefault(user_id, {})
-
-    if not step:
-        await message.answer("Используйте кнопки меню.", reply_markup=main_keyboard())
-        return
-
-    if step == "await_account_tag":
-        if not text:
-            await message.answer("Тег не может быть пустым.")
-            return
-
-        state = load_state(user_id)
-        account_id = f"account_{state['next_account_number']}"
-        state["next_account_number"] += 1
-        state["accounts"][account_id] = {
-            "tag": text[:50],
-            "proxy": None,
-            "telegram_id": None,
-            "username": None,
-            "first_name": None,
-        }
-        state["individual_recipients"][account_id] = []
-        state["active_account_id"] = account_id
-        save_state(user_id, state)
-
-        user_steps.pop(user_id, None)
-        await message.answer(
-            "Аккаунт создан. Выберите протокол прокси:",
-            reply_markup=proxy_protocol_keyboard(account_id),
-        )
-        return
-
-    if step == "await_rename_account":
-        account_id = data.get("account_id")
-        state = load_state(user_id)
-        if account_id not in state["accounts"]:
-            await message.answer("Аккаунт не найден.")
-            return
-        state["accounts"][account_id]["tag"] = text[:50]
-        save_state(user_id, state)
-        user_steps.pop(user_id, None)
-        await message.answer("✅ Тег изменён.", reply_markup=accounts_keyboard(state))
-        return
-
-    if step == "await_proxy":
-        account_id = data.get("account_id")
-        protocol = data.get("protocol")
-        try:
-            proxy = parse_proxy(text, protocol)
-            state = load_state(user_id)
-            state["accounts"][account_id]["proxy"] = proxy
-            save_state(user_id, state)
-
-            client = await rebuild_client(user_id, account_id)
-            user_steps.pop(user_id, None)
-
-            if await client.is_user_authorized():
-                await update_account_identity(user_id, account_id, client)
-                await message.answer(
-                    "✅ Прокси подключён. Аккаунт уже авторизован.",
-                    reply_markup=main_keyboard(),
-                )
-            else:
-                await message.answer(
-                    "✅ Прокси подключён. Выберите способ входа:",
-                    reply_markup=login_method_keyboard(account_id),
-                )
-        except Exception as exc:
-            await message.answer(
-                f"Прокси не подключён:\n<code>{html.escape(str(exc))}</code>"
-            )
-        return
-
-    if step == "await_phone":
-        account_id = data.get("account_id")
-        try:
-            client = await rebuild_client(user_id, account_id)
-            await client.send_code_request(text)
-            data["phone"] = text
-            user_steps[user_id] = "await_code"
-            await message.answer("Код отправлен. Введите его цифрами через пробел (1 2 3 4 5).")
-        except Exception as exc:
-            await message.answer(
-                f"Не удалось отправить код:\n<code>{html.escape(str(exc))}</code>"
-            )
-        return
-
-    if step == "await_code":
-        account_id = data.get("account_id")
-        phone = data.get("phone")
-        try:
-            client = await get_client(user_id, account_id)
-            await client.sign_in(phone=phone, code=text.replace(" ", ""))
-            await update_account_identity(user_id, account_id, client)
-            user_steps.pop(user_id, None)
-            await message.answer("✅ Аккаунт подключён.", reply_markup=main_keyboard())
-        except errors.SessionPasswordNeededError:
-            user_steps[user_id] = "await_2fa"
-            await message.answer("Введите пароль двухэтапной аутентификации.")
-        except Exception as exc:
-            await message.answer(
-                f"Ошибка входа:\n<code>{html.escape(str(exc))}</code>"
-            )
-        return
-
-    if step in {"await_2fa", "await_qr_2fa"}:
-        account_id = data.get("account_id")
-        try:
-            client = await get_client(user_id, account_id)
-            await client.sign_in(password=text)
-            await update_account_identity(user_id, account_id, client)
-            user_steps.pop(user_id, None)
-            await message.answer("✅ Аккаунт подключён.", reply_markup=main_keyboard())
-        except Exception as exc:
-            await message.answer(
-                f"Ошибка 2FA:\n<code>{html.escape(str(exc))}</code>"
-            )
-        return
-
-    if step == "await_messages":
-        if not text:
-            await message.answer(
-                "Сообщение не может быть пустым.",
-                reply_markup=adding_messages_keyboard(),
-            )
-            return
-
-        state = load_state(user_id)
-        if len(state["messages"]) >= MAX_TEXT_MESSAGES:
-            user_steps.pop(user_id, None)
-            await message.answer(
-                f"Достигнут лимит {MAX_TEXT_MESSAGES}.",
-                reply_markup=messages_keyboard(),
-            )
-            return
-
-        state["messages"].append(text)
-        save_state(user_id, state)
-
-        await message.answer(
-            f"✅ Добавлено: {len(state['messages'])}/{MAX_TEXT_MESSAGES}\n"
-            "Отправьте следующее или нажмите «Завершить».",
-            reply_markup=adding_messages_keyboard(),
-        )
-        return
-
-    if step == "await_common_recipients":
-        state = load_state(user_id)
-        values = parse_recipients(text)
-        existing = {normalize_recipient(item) for item in state["common_recipients"]}
-        added = 0
-
-        for item in values:
-            key = normalize_recipient(item)
-            if key not in existing:
-                state["common_recipients"].append(item)
-                existing.add(key)
-                added += 1
-
-        save_state(user_id, state)
-        user_steps.pop(user_id, None)
-        await message.answer(
-            f"✅ В общий список добавлено: {added}\n"
-            f"Всего: {len(state['common_recipients'])}",
-            reply_markup=recipients_keyboard(),
-        )
-        return
-
-    if step == "await_individual_recipients":
-        account_id = data.get("account_id")
-        state = load_state(user_id)
-        target = state["individual_recipients"].setdefault(account_id, [])
-        values = parse_recipients(text)
-        existing = {normalize_recipient(item) for item in target}
-        added = 0
-
-        for item in values:
-            key = normalize_recipient(item)
-            if key not in existing:
-                target.append(item)
-                existing.add(key)
-                added += 1
-
-        save_state(user_id, state)
-        user_steps.pop(user_id, None)
-        account = state["accounts"][account_id]
-        await message.answer(
-            f"✅ Для аккаунта <b>{html.escape(account['tag'])}</b> добавлено: {added}\n"
-            f"Всего: {len(target)}",
-            reply_markup=recipients_keyboard(),
-        )
-        return
-
-
-# ============================================================
-# CALLBACK: МЕНЮ
-# ============================================================
-
-@router.callback_query(F.data == "menu")
-async def menu_callback(callback: CallbackQuery) -> None:
-    user_steps.pop(callback.from_user.id, None)
-    flow_data.pop(callback.from_user.id, None)
-    await callback.message.edit_text(
-        "<b>Панель рассылки</b>",
-        reply_markup=main_keyboard(),
-    )
-    await callback.answer()
-
-
-# ============================================================
-# CALLBACK: АККАУНТЫ
-# ============================================================
-
-@router.callback_query(F.data == "accounts")
-async def accounts_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    await callback.message.edit_text(
-        f"<b>Аккаунты: {len(state['accounts'])}</b>\n\n"
-        "У каждого аккаунта собственный тег, прокси, сессия "
-        "и индивидуальный список получателей.",
-        reply_markup=accounts_keyboard(state),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "add_account")
-async def add_account_callback(callback: CallbackQuery) -> None:
-    user_steps[callback.from_user.id] = "await_account_tag"
-    await callback.message.edit_text(
-        "Введите названия нового аккаунта для бота.\n\n"
-        "Например: <code>Аккаунт1</code> или <code>Аккаунт2</code>",
-        reply_markup=back_keyboard("accounts"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("select_account:"))
-async def select_account_callback(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    account_id = callback.data.split(":", 1)[1]
-    state = load_state(user_id)
-    account = state["accounts"].get(account_id)
-
-    if not account:
-        await callback.answer("Аккаунт не найден", show_alert=True)
-        return
-
-    state["active_account_id"] = account_id
-    save_state(user_id, state)
-
-    proxy = account.get("proxy")
-    proxy_name = proxy["type"].upper() if proxy else "не задан"
-    individual_count = len(state["individual_recipients"].get(account_id, []))
-
-    await callback.message.edit_text(
-        "<b>Аккаунт</b>\n\n"
-        f"Тег: <b>{html.escape(account.get('tag') or account_id)}</b>\n"
-        f"Telegram ID: <code>{account.get('telegram_id') or 'не подключён'}</code>\n"
-        f"Username: "
-        f"{'@' + account['username'] if account.get('username') else 'нет'}\n"
-        f"Прокси: <b>{proxy_name}</b>\n"
-        f"Индивидуальных получателей: <b>{individual_count}</b>",
-        reply_markup=account_actions_keyboard(account_id),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("rename_account:"))
-async def rename_account_callback(callback: CallbackQuery) -> None:
-    account_id = callback.data.split(":", 1)[1]
-    flow_data[callback.from_user.id] = {"account_id": account_id}
-    user_steps[callback.from_user.id] = "await_rename_account"
-    await callback.message.edit_text(
-        "Введите новый тег аккаунта:",
-        reply_markup=back_keyboard(f"select_account:{account_id}"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("account_proxy:"))
-async def account_proxy_callback(callback: CallbackQuery) -> None:
-    account_id = callback.data.split(":", 1)[1]
-    await callback.message.edit_text(
-        "<b>Выберите протокол прокси:</b>",
-        reply_markup=proxy_protocol_keyboard(account_id),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("proxy_protocol:"))
-async def proxy_protocol_callback(callback: CallbackQuery) -> None:
-    _, account_id, protocol = callback.data.split(":", 2)
-    flow_data[callback.from_user.id] = {
-        "account_id": account_id,
-        "protocol": protocol,
-    }
-    user_steps[callback.from_user.id] = "await_proxy"
-
-    if protocol == "mtproto":
-        format_text = "IP:ПОРТ:SECRET"
-        example = "196.19.123.231:443:SECRET"
-    else:
-        format_text = "IP:ПОРТ:ЛОГИН:ПАРОЛЬ"
-        example = "196.19.123.231:8000:xm4Wj1:D2mF2K"
-
-    await callback.message.edit_text(
-        f"<b>Введите {protocol.upper()}-прокси</b>\n\n"
-        f"Формат: <code>{format_text}</code>\n"
-        f"Пример: <code>{html.escape(example)}</code>",
-        reply_markup=back_keyboard(f"select_account:{account_id}"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("login_phone:"))
-async def login_phone_callback(callback: CallbackQuery) -> None:
-    account_id = callback.data.split(":", 1)[1]
-    flow_data[callback.from_user.id] = {"account_id": account_id}
-    user_steps[callback.from_user.id] = "await_phone"
-
-    await callback.message.edit_text(
-        "Введите номер телефона (с +7):\nПример: <code>+79991234567</code>",
-        reply_markup=back_keyboard(f"select_account:{account_id}"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("login_qr:"))
-async def login_qr_callback(callback: CallbackQuery, bot: Bot) -> None:
-    user_id = callback.from_user.id
-    account_id = callback.data.split(":", 1)[1]
-
-    old = qr_tasks.get(user_id)
-    if old and not old.done():
-        await callback.answer("QR-вход уже запущен", show_alert=True)
-        return
-
-    flow_data[user_id] = {"account_id": account_id}
-    qr_tasks[user_id] = asyncio.create_task(
-        perform_qr_login(bot, callback.message.chat.id, user_id, account_id)
-    )
-    await callback.answer("Создаю QR-код")
-
-
-@router.callback_query(F.data.startswith("logout_account:"))
-async def logout_account_callback(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    account_id = callback.data.split(":", 1)[1]
-
-    try:
-        client = await get_client(user_id, account_id)
-        await client.log_out()
-        user_clients.pop((user_id, account_id), None)
-
-        state = load_state(user_id)
-        account = state["accounts"].get(account_id)
-        if account:
-            account["telegram_id"] = None
-            account["username"] = None
-            account["first_name"] = None
-            save_state(user_id, state)
-
-        await callback.message.edit_text(
-            "Аккаунт отключён.",
-            reply_markup=accounts_keyboard(state),
-        )
-    except Exception as exc:
-        await callback.answer(str(exc), show_alert=True)
-        return
-
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("delete_account:"))
-async def delete_account_callback(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    account_id = callback.data.split(":", 1)[1]
-    state = load_state(user_id)
-
-    client = user_clients.pop((user_id, account_id), None)
-    if client:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
-    state["accounts"].pop(account_id, None)
-    state["individual_recipients"].pop(account_id, None)
-
-    state["recipient_owners"] = {
-        key: owner
-        for key, owner in state["recipient_owners"].items()
-        if owner != account_id
-    }
-
-    if state.get("active_account_id") == account_id:
-        state["active_account_id"] = next(iter(state["accounts"]), None)
-
-    save_state(user_id, state)
-
-    await callback.message.edit_text(
-        "Аккаунт удалён.",
-        reply_markup=accounts_keyboard(state),
-    )
-    await callback.answer()
-
-
-# ============================================================
-# CALLBACK: СООБЩЕНИЯ
-# ============================================================
-
-@router.callback_query(F.data == "messages")
-async def messages_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    preview = "\n\n".join(
-        f"<b>{index}.</b> {html.escape(text[:300])}"
-        for index, text in enumerate(state["messages"], 1)
-    ) or "Сообщения ещё не добавлены."
-
-    await callback.message.edit_text(
-        f"<b>Сообщения: {len(state['messages'])}/{MAX_TEXT_MESSAGES}</b>\n\n"
-        f"{preview}",
-        reply_markup=messages_keyboard(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "add_messages")
-async def add_messages_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    if len(state["messages"]) >= MAX_TEXT_MESSAGES:
-        await callback.answer("Достигнут лимит", show_alert=True)
-        return
-
-    user_steps[callback.from_user.id] = "await_messages"
-    await callback.message.edit_text(
-        "Введите сообщение. После сохранения можно сразу отправить следующее.\n"
-        "Когда закончите — нажмите «Завершить».",
-        reply_markup=adding_messages_keyboard(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "finish_messages")
-async def finish_messages_callback(callback: CallbackQuery) -> None:
-    user_steps.pop(callback.from_user.id, None)
-    await callback.answer("Добавление завершено")
-    await messages_callback(callback)
-
-
-@router.callback_query(F.data == "delete_message")
-async def delete_message_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    if not state["messages"]:
-        await callback.answer("Удалять нечего", show_alert=True)
-        return
-
-    rows = [
-        [InlineKeyboardButton(
-            text=f"Удалить №{index + 1}",
-            callback_data=f"delete_message_index:{index}",
-        )]
-        for index in range(len(state["messages"]))
-    ]
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="messages")])
-
-    await callback.message.edit_text(
-        "Выберите сообщение:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("delete_message_index:"))
-async def delete_message_index_callback(callback: CallbackQuery) -> None:
-    index = int(callback.data.split(":", 1)[1])
-    state = load_state(callback.from_user.id)
-
-    if 0 <= index < len(state["messages"]):
-        state["messages"].pop(index)
-        save_state(callback.from_user.id, state)
-
-    await callback.answer("Удалено")
-    await messages_callback(callback)
-
-
-# ============================================================
-# CALLBACK: ПОЛУЧАТЕЛИ
-# ============================================================
-
-@router.callback_query(F.data == "recipients")
-async def recipients_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-
-    lines = [
-        "<b>Получатели</b>",
-        "",
-        f"Общий список: <b>{len(state['common_recipients'])}</b>",
-        "",
-        "<b>Индивидуальные списки:</b>",
-    ]
-
-    if state["accounts"]:
-        for account_id, account in state["accounts"].items():
-            count = len(state["individual_recipients"].get(account_id, []))
-            lines.append(
-                f"• {html.escape(account_label(account_id, account))}: <b>{count}</b>"
-            )
-    else:
-        lines.append("Нет аккаунтов.")
-
-    lines.extend([
-        "",
-        "<b>Общий</b> — список распределяется между всеми аккаунтами.",
-        "<b>Индивидуальный</b> — список используется только выбранным аккаунтом.",
-        "",
-        "Один и тот же получатель не отправляется двум разным аккаунтам.",
-    ])
-
-    await callback.message.edit_text(
-        "\n".join(lines),
-        reply_markup=recipients_keyboard(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "recipient_mode")
-async def recipient_mode_callback(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(
-        "<b>Выберите режим добавления</b>\n\n"
-        "<b>Индивидуальный</b> — список только для одного аккаунта.\n"
-        "<b>Общий</b> — список для всех аккаунтов сразу.",
-        reply_markup=recipient_mode_keyboard(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "recipient_mode:common")
-async def common_mode_callback(callback: CallbackQuery) -> None:
-    user_steps[callback.from_user.id] = "await_common_recipients"
-    await callback.message.edit_text(
-        "Отправьте получателей через пробел, запятую или новую строку.\n\n"
-        "Пример:\n<code>@user1, @user2\n123456789</code>",
-        reply_markup=back_keyboard("recipients"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "recipient_mode:individual")
-async def individual_mode_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    if not state["accounts"]:
-        await callback.answer("Сначала добавьте аккаунт", show_alert=True)
-        return
-
-    await callback.message.edit_text(
-        "Выберите аккаунт по тегу и Telegram ID:",
-        reply_markup=account_choice_keyboard(
-            state,
-            "choose_individual_account",
-            back="recipients",
-        ),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("choose_individual_account:"))
-async def choose_individual_account_callback(callback: CallbackQuery) -> None:
-    account_id = callback.data.split(":", 1)[1]
-    flow_data[callback.from_user.id] = {"account_id": account_id}
-    user_steps[callback.from_user.id] = "await_individual_recipients"
-
-    await callback.message.edit_text(
-        "Отправьте получателей через пробел, запятую или новую строку.",
-        reply_markup=back_keyboard("recipients"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "clear_recipients_menu")
-async def clear_recipients_menu_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    await callback.message.edit_text(
-        "Что очистить?",
-        reply_markup=clear_recipients_keyboard(state),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "clear_common_recipients")
-async def clear_common_recipients_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    state["common_recipients"] = []
-    save_state(callback.from_user.id, state)
-    await callback.answer("Общий список очищен")
-    await recipients_callback(callback)
-
-
-@router.callback_query(F.data == "clear_all_recipients")
-async def clear_all_recipients_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    state["common_recipients"] = []
-    state["individual_recipients"] = {
-        account_id: [] for account_id in state["accounts"]
-    }
-    state["recipient_owners"] = {}
-    save_state(callback.from_user.id, state)
-    await callback.answer("Все списки очищены")
-    await recipients_callback(callback)
-
-
-@router.callback_query(F.data == "choose_clear_individual")
-async def choose_clear_individual_callback(callback: CallbackQuery) -> None:
-    state = load_state(callback.from_user.id)
-    await callback.message.edit_text(
-        "Выберите аккаунт:",
-        reply_markup=account_choice_keyboard(
-            state,
-            "clear_individual_account",
-            back="recipients",
-        ),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("clear_individual_account:"))
-async def clear_individual_account_callback(callback: CallbackQuery) -> None:
-    account_id = callback.data.split(":", 1)[1]
-    state = load_state(callback.from_user.id)
-    state["individual_recipients"][account_id] = []
-    save_state(callback.from_user.id, state)
-    await callback.answer("Индивидуальный список очищен")
-    await recipients_callback(callback)
-
-
-# ============================================================
-# CALLBACK: ШАБЛОНЫ
-# ============================================================
-
-async def group_names(bot: Bot, group_ids: list[int]) -> str:
-    if not group_ids:
-        return "Нет привязанных групп."
-
-    result = []
-    for group_id in group_ids:
-        try:
-            chat = await bot.get_chat(group_id)
-            result.append(f"• {html.escape(chat.title or str(group_id))}")
-        except Exception:
-            result.append(f"• {group_id}")
     return "\n".join(result)
 
 
-@router.callback_query(F.data == "group_templates")
-async def group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
-    state = load_state(callback.from_user.id)
-    names = await group_names(bot, state["bound_groups"])
+# ============================================================
+# РАЗДЕЛЕНИЕ ПОСТОВ
+# ============================================================
 
-    total_sends = sum(int(value) for value in state["template_usage"].values())
-    exhausted = sum(
-        1
-        for template in state["group_templates"]
-        if int(state["template_usage"].get(
-            make_template_key(template["chat_id"], template["message_id"]),
-            0,
-        )) >= MAX_TEMPLATE_SENDS
-    )
+POST_SEPARATOR_PATTERN = re.compile(
+    r"""
+    (?mx)
+    ^[ \t]*
+    -/
+    [ \t]*
+    \(?
+    [ \t]*
+    [«»"'“”‘’]*
+    [ \t]*
+    \d+
+    [ \t]*
+    [«»"'“”‘’]*
+    [ \t]*
+    \)?
+    [ \t]*
+    (?:\r?\n|$)
+    """
+)
 
-    # Формируем текст с учётом наличия привязанных групп
-    if state["bound_groups"]:
-        groups_text = names
-        instruction_text = ""
-    else:
-        groups_text = "<b>отсутствуют</b>"
-        instruction_text = (
-            "\n\n<b>1. Создайте группу\n"
-            "2. Добавьте туда бота\n"
-            "3. Выдайте боту администратора\n"
-            "4. Добавьте шаблоны (минимум 2)\n"
-            "5. Пропишите /bind\n"
-            "6. Просканируйте шаблоны</b>"
+
+def split_posts(text: str) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if not normalized:
+        return []
+
+    matches = list(POST_SEPARATOR_PATTERN.finditer(normalized))
+
+    if not matches:
+        return [normalized]
+
+    posts: list[str] = []
+
+    prefix = normalized[:matches[0].start()].strip()
+    if prefix:
+        posts.append(prefix)
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(normalized)
         )
 
-    await callback.message.edit_text(
-        "<b>Шаблоны из групп</b>\n\n"
-        f"Привязанные группы:\n{groups_text}\n\n"
-        f"Сохранено шаблонов: <b>{len(state['group_templates'])}</b>\n"
-        f"Всего отправок шаблонов: <b>{total_sends}</b>\n"
-        f"Исчерпали лимит: <b>{exhausted}</b>"
-        f"{instruction_text}\n\n"
-        "Каждому получателю пересылается один случайный шаблон. "
-        "Он не повторяется два раза подряд и может быть использован "
-        f"не более {MAX_TEMPLATE_SENDS} раз.",
-        reply_markup=group_templates_keyboard(),
+        post = normalized[start:end].strip()
+
+        if post:
+            posts.append(post)
+
+    return posts
+
+
+# ============================================================
+# КАНАЛЫ
+# ============================================================
+
+async def can_edit_channel(
+    client: TelegramClient,
+    entity: types.Channel,
+) -> bool:
+    if getattr(entity, "creator", False):
+        return True
+
+    admin_rights = getattr(entity, "admin_rights", None)
+
+    if admin_rights is None:
+        return False
+
+    return bool(
+        getattr(admin_rights, "edit_messages", False)
+        or getattr(admin_rights, "post_messages", False)
     )
-    await callback.answer()
 
 
-@router.callback_query(F.data == "scan_group_templates")
-async def scan_group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
-    user_id = callback.from_user.id
-    state = load_state(user_id)
+async def get_editable_channels() -> list[dict[str, Any]]:
+    client = await get_telethon_client()
 
-    if not state["bound_groups"]:
-        await callback.answer("Сначала привяжите группу через /bind", show_alert=True)
-        return
+    if not await client.is_user_authorized():
+        raise RuntimeError("Аккаунт Telethon не авторизован")
 
-    accounts = await authorized_accounts(user_id)
-    if not accounts:
-        await callback.answer("Сначала подключите аккаунт", show_alert=True)
-        return
+    channels: list[dict[str, Any]] = []
 
-    await callback.answer("Сканирование запущено")
-    status = await callback.message.answer("🔎 Сканирую сообщения…")
+    async for dialog in client.iter_dialogs():
+        entity = dialog.entity
 
-    added = 0
-    scanned = 0
-    errors_count = 0
-
-    existing_refs = {
-        make_template_key(item["chat_id"], item["message_id"])
-        for item in state["group_templates"]
-    }
-
-    for group_id in state["bound_groups"]:
-        source = None
-        source_client = None
-
-        for _, _, client in accounts:
-            try:
-                source = await resolve_dialog_entity(client, int(group_id))
-                source_client = client
-                break
-            except Exception:
-                continue
-
-        if source is None or source_client is None:
-            errors_count += 1
+        if not isinstance(entity, types.Channel):
             continue
 
+        if not getattr(entity, "broadcast", False):
+            continue
+
+        if not await can_edit_channel(client, entity):
+            continue
+
+        channels.append(
+            {
+                "id": entity.id,
+                "title": dialog.name or "Без названия",
+                "username": getattr(entity, "username", None),
+            }
+        )
+
+    channels.sort(key=lambda item: item["title"].casefold())
+    return channels
+
+
+def channels_keyboard(
+    channels: list[dict[str, Any]],
+    page: int,
+) -> InlineKeyboardMarkup:
+    total_pages = max(
+        1,
+        (len(channels) + CHANNELS_PER_PAGE - 1) // CHANNELS_PER_PAGE,
+    )
+
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * CHANNELS_PER_PAGE
+    end = start + CHANNELS_PER_PAGE
+    page_channels = channels[start:end]
+
+    builder = InlineKeyboardBuilder()
+
+    for channel in page_channels:
+        title = channel["title"]
+        if len(title) > 40:
+            title = title[:37] + "..."
+
+        builder.button(
+            text=f"📢 {title}",
+            callback_data=f"channel:{channel['id']}",
+        )
+
+    builder.adjust(1)
+
+    navigation: list[InlineKeyboardButton] = []
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"channels_page:{page - 1}",
+            )
+        )
+
+    navigation.append(
+        InlineKeyboardButton(
+            text=f"{page + 1}/{total_pages}",
+            callback_data="channels_page:noop",
+        )
+    )
+
+    if page < total_pages - 1:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"channels_page:{page + 1}",
+            )
+        )
+
+    builder.row(*navigation)
+
+    builder.row(
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data="replace:cancel",
+        )
+    )
+
+    return builder.as_markup()
+
+
+# ============================================================
+# ПОЛУЧЕНИЕ СООБЩЕНИЙ
+# ============================================================
+
+async def resolve_channel(channel_id: int) -> types.Channel:
+    client = await get_telethon_client()
+
+    entity = await client.get_entity(
+        types.PeerChannel(channel_id)
+    )
+
+    if not isinstance(entity, types.Channel):
+        raise RuntimeError("Выбранный объект не является каналом")
+
+    return entity
+
+
+async def get_messages_for_dates(
+    channel_id: int,
+    dates: list[str],
+) -> list[types.Message]:
+    """
+    Возвращает существующие сообщения канала за выбранные даты.
+    Даты сравниваются в часовом поясе Europe/Moscow.
+    Новые сообщения эта функция не создаёт.
+    """
+    client = await get_telethon_client()
+    channel = await resolve_channel(channel_id)
+
+    target_dates = {
+        datetime.strptime(value, "%d.%m.%Y").date()
+        for value in dates
+    }
+
+    first_date = min(target_dates)
+    last_date = max(target_dates)
+
+    # Верхняя граница поиска: начало следующего дня по Москве,
+    # преобразованное в UTC для Telethon.
+    local_end = datetime.combine(
+        last_date + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=CHANNEL_TIMEZONE,
+    )
+    offset_date = local_end.astimezone(timezone.utc)
+
+    found: list[types.Message] = []
+
+    async for message in client.iter_messages(
+        channel,
+        offset_date=offset_date,
+    ):
+        if message.date is None:
+            continue
+
+        local_message_date = message.date.astimezone(
+            CHANNEL_TIMEZONE
+        ).date()
+
+        if local_message_date < first_date:
+            break
+
+        if local_message_date not in target_dates:
+            continue
+
+        if getattr(message, "action", None) is not None:
+            continue
+
+        # Берём только реальные публикации. У медиапоста будет
+        # заменена подпись, само медиа останется прежним.
+        if message.message is None and message.media is None:
+            continue
+
+        found.append(message)
+
+    found.sort(
+        key=lambda item: (
+            item.date,
+            item.id,
+        )
+    )
+
+    return found
+
+
+# ============================================================
+# РЕДАКТИРОВАНИЕ
+# ============================================================
+
+async def edit_channel_message(
+    channel: types.Channel,
+    old_message: types.Message,
+    new_text: str,
+) -> None:
+    client = await get_telethon_client()
+
+    await client.edit_message(
+        entity=channel,
+        message=old_message.id,
+        text=new_text,
+        parse_mode=None,
+        link_preview=False,
+    )
+
+
+async def perform_replacement(
+    channel_id: int,
+    dates: list[str],
+    new_posts: list[str],
+) -> tuple[int, list[str]]:
+    """
+    Только редактирует уже существующие публикации канала.
+    Отправка новых сообщений в канал отсутствует.
+    """
+    channel = await resolve_channel(channel_id)
+    old_messages = await get_messages_for_dates(channel_id, dates)
+
+    if len(old_messages) < len(new_posts):
+        raise RuntimeError(
+            f"Найдено только {len(old_messages)} сообщений, "
+            f"а новых текстов передано {len(new_posts)}."
+        )
+
+    selected_messages = old_messages[:len(new_posts)]
+    edited_count = 0
+    errors_list: list[str] = []
+
+    for index, (old_message, new_text) in enumerate(
+        zip(selected_messages, new_posts),
+        start=1,
+    ):
         try:
-            async for tg_message in source_client.iter_messages(
-                source,
-                limit=SCAN_MESSAGE_LIMIT,
-            ):
-                scanned += 1
-                if not contains_required_phrase(tg_message.message or ""):
-                    continue
+            await edit_channel_message(
+                channel=channel,
+                old_message=old_message,
+                new_text=new_text,
+            )
+            edited_count += 1
 
-                ref_key = make_template_key(group_id, tg_message.id)
-                if ref_key in existing_refs:
-                    continue
+        except errors.FloodWaitError as error:
+            await asyncio.sleep(int(error.seconds) + 1)
 
-                state["group_templates"].append({
-                    "chat_id": int(group_id),
-                    "message_id": int(tg_message.id),
-                })
-                state["template_usage"].setdefault(ref_key, 0)
-                existing_refs.add(ref_key)
-                added += 1
+            try:
+                await edit_channel_message(
+                    channel=channel,
+                    old_message=old_message,
+                    new_text=new_text,
+                )
+                edited_count += 1
+            except Exception as retry_error:
+                logger.exception(
+                    "Ошибка повторного редактирования сообщения %s",
+                    old_message.id,
+                )
+                errors_list.append(
+                    f"Пост {index}, ID {old_message.id}: "
+                    f"{type(retry_error).__name__}: {retry_error}"
+                )
 
-                if len(state["group_templates"]) >= MAX_GROUP_TEMPLATES:
-                    break
-        except Exception:
-            errors_count += 1
-            log.exception("Ошибка сканирования группы %s", group_id)
+        except errors.MessageNotModifiedError:
+            # Текст уже совпадает с новым.
+            edited_count += 1
 
-    state["group_templates"] = state["group_templates"][-MAX_GROUP_TEMPLATES:]
-    valid_keys = {
-        make_template_key(item["chat_id"], item["message_id"])
-        for item in state["group_templates"]
-    }
-    state["template_usage"] = {
-        key: int(value)
-        for key, value in state["template_usage"].items()
-        if key in valid_keys
-    }
-    save_state(user_id, state)
+        except errors.MessageEditTimeExpiredError:
+            errors_list.append(
+                f"Пост {index}, ID {old_message.id}: "
+                "истёк допустимый срок редактирования"
+            )
+
+        except errors.ChatAdminRequiredError:
+            errors_list.append(
+                f"Пост {index}, ID {old_message.id}: "
+                "недостаточно прав администратора"
+            )
+
+        except errors.MessageAuthorRequiredError:
+            errors_list.append(
+                f"Пост {index}, ID {old_message.id}: "
+                "аккаунт не может редактировать этот пост"
+            )
+
+        except Exception as error:
+            logger.exception(
+                "Ошибка редактирования сообщения %s",
+                old_message.id,
+            )
+            errors_list.append(
+                f"Пост {index}, ID {old_message.id}: "
+                f"{type(error).__name__}: {error}"
+            )
+
+        # Небольшая пауза снижает вероятность FloodWait.
+        await asyncio.sleep(0.7)
+
+    return edited_count, errors_list
+
+
+def post_preview(text: str, max_length: int = 170) -> str:
+    one_line = " ".join(text.split())
+
+    if len(one_line) > max_length:
+        one_line = one_line[:max_length - 3] + "..."
+
+    return html.escape(one_line)
+
+
+# ============================================================
+# КОМАНДЫ
+# ============================================================
+
+@router.message(CommandStart())
+async def command_start(message: Message, state: FSMContext) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "👋 <b>Редактор постов канала</b>\n\n"
+        "Авторизуйте аккаунт через Telethon, выберите канал, "
+        "укажите даты и отправьте новые посты.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@router.message(Command("cancel"))
+@router.message(F.text == "❌ Отмена")
+async def cancel_handler(message: Message, state: FSMContext) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "❌ Действие отменено.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@router.message(F.text == "👤 Статус аккаунта")
+async def account_status(message: Message) -> None:
+    if await reject_non_admin_message(message):
+        return
 
     try:
-        await status.delete()
-    except Exception:
-        pass
+        client = await get_telethon_client()
 
-    total = len(state["group_templates"])
-    if total < 2:
-        await bot.send_message(
-            callback.message.chat.id,
-            "❌ <b>Недостаточно шаблонов</b>\n\n"
-            f"Найдено: <b>{total}</b>. Нужно минимум 2.\n"
-            "Пополните привязанную группу подходящими сообщениями.",
-            reply_markup=group_templates_keyboard(),
+        if not await client.is_user_authorized():
+            await message.answer(
+                "❌ Пользовательский аккаунт не авторизован.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        me = await client.get_me()
+
+        username = f"@{me.username}" if me.username else "не установлен"
+        phone = f"+{me.phone}" if me.phone else "скрыт"
+
+        await message.answer(
+            "✅ <b>Аккаунт авторизован</b>\n\n"
+            f"Имя: <b>{html.escape(me.first_name or '')}</b>\n"
+            f"Username: <b>{html.escape(username)}</b>\n"
+            f"Телефон: <code>{html.escape(phone)}</code>\n"
+            f"ID: <code>{me.id}</code>",
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка получения статуса аккаунта")
+        await message.answer(
+            f"❌ Ошибка проверки аккаунта:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+# ============================================================
+# АВТОРИЗАЦИЯ
+# ============================================================
+
+@router.message(F.text == "🔐 Авторизация")
+async def authorization_start(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    client = await get_telethon_client()
+
+    if await client.is_user_authorized():
+        me = await client.get_me()
+
+        await message.answer(
+            "✅ Аккаунт уже авторизован.\n\n"
+            f"ID: <code>{me.id}</code>",
+            reply_markup=main_keyboard(),
         )
         return
 
-    await bot.send_message(
-        callback.message.chat.id,
-        "✅ <b>Сканирование завершено</b>\n\n"
-        f"Проверено сообщений: <b>{scanned}</b>\n"
-        f"Добавлено новых шаблонов: <b>{added}</b>\n"
-        f"Всего шаблонов: <b>{total}</b>\n"
-        f"Ошибок групп: <b>{errors_count}</b>",
-        reply_markup=group_templates_keyboard(),
+    await state.clear()
+    await state.set_state(AuthorizationStates.waiting_phone)
+
+    await message.answer(
+        "📱 Отправьте номер телефона аккаунта.\n\n"
+        "Формат: <code>+79991234567</code>",
+        reply_markup=phone_keyboard(),
     )
 
 
-@router.callback_query(F.data == "clear_group_templates")
-async def clear_group_templates_callback(callback: CallbackQuery, bot: Bot) -> None:
-    state = load_state(callback.from_user.id)
-    state["group_templates"] = []
-    state["template_usage"] = {}
-    state["last_template_key"] = None
-    save_state(callback.from_user.id, state)
-    await callback.answer("Шаблоны очищены")
-    await group_templates_callback(callback, bot)
+@router.message(AuthorizationStates.waiting_phone)
+async def authorization_phone(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    phone: str | None = None
+
+    if message.contact:
+        if message.contact.user_id != message.from_user.id:
+            await message.answer("❌ Отправьте собственный контакт.")
+            return
+
+        phone = message.contact.phone_number
+    elif message.text:
+        phone = message.text.strip()
+
+    if not phone:
+        await message.answer("❌ Не удалось получить номер телефона.")
+        return
+
+    phone = re.sub(r"[^\d+]", "", phone)
+
+    if not phone.startswith("+"):
+        phone = "+" + phone
+
+    if not re.fullmatch(r"\+\d{7,15}", phone):
+        await message.answer(
+            "❌ Неверный формат.\n"
+            "Пример: <code>+79991234567</code>"
+        )
+        return
+
+    try:
+        client = await recreate_telethon_client()
+        sent_code = await client.send_code_request(phone)
+
+        await state.update_data(
+            phone=phone,
+            phone_code_hash=sent_code.phone_code_hash,
+        )
+        await state.set_state(AuthorizationStates.waiting_code)
+
+        await message.answer(
+            "✉️ Telegram отправил код входа.\n\n"
+            "Отправьте код цифрами.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    except errors.PhoneNumberInvalidError:
+        await message.answer("❌ Telegram считает номер некорректным.")
+
+    except errors.PhoneNumberBannedError:
+        await message.answer("❌ Этот номер заблокирован Telegram.")
+
+    except errors.FloodWaitError as error:
+        await message.answer(
+            f"⏳ Слишком много попыток. Повторите через "
+            f"<b>{error.seconds} сек.</b>"
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка отправки кода")
+        await message.answer(
+            "❌ Не удалось отправить код:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+@router.message(AuthorizationStates.waiting_code)
+async def authorization_code(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    if not message.text:
+        await message.answer("❌ Отправьте код текстом.")
+        return
+
+    code = re.sub(r"\D", "", message.text)
+
+    if not code:
+        await message.answer("❌ Код должен содержать цифры.")
+        return
+
+    data = await state.get_data()
+    phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash")
+
+    if not phone or not phone_code_hash:
+        await state.clear()
+        await message.answer(
+            "❌ Данные авторизации потеряны. Начните заново.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    try:
+        client = await get_telethon_client()
+
+        await client.sign_in(
+            phone=phone,
+            code=code,
+            phone_code_hash=phone_code_hash,
+        )
+
+        await save_current_telethon_session(client)
+        await state.clear()
+
+        me = await client.get_me()
+
+        await message.answer(
+            "✅ <b>Авторизация выполнена</b>\n\n"
+            f"Аккаунт: <b>{html.escape(me.first_name or '')}</b>\n"
+            f"ID: <code>{me.id}</code>",
+            reply_markup=main_keyboard(),
+        )
+
+    except errors.SessionPasswordNeededError:
+        await state.set_state(AuthorizationStates.waiting_password)
+
+        await message.answer(
+            "🔐 На аккаунте включён облачный пароль.\n\n"
+            "Отправьте пароль двухэтапной аутентификации."
+        )
+
+    except errors.PhoneCodeInvalidError:
+        await message.answer("❌ Неверный код. Попробуйте ещё раз.")
+
+    except errors.PhoneCodeExpiredError:
+        await state.clear()
+        await message.answer(
+            "❌ Код истёк. Начните авторизацию заново.",
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка входа по коду")
+        await message.answer(
+            "❌ Ошибка авторизации:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+@router.message(AuthorizationStates.waiting_password)
+async def authorization_password(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    if not message.text:
+        await message.answer("❌ Отправьте пароль текстом.")
+        return
+
+    try:
+        client = await get_telethon_client()
+        await client.sign_in(password=message.text)
+
+        await save_current_telethon_session(client)
+        await state.clear()
+
+        me = await client.get_me()
+
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "✅ <b>Авторизация выполнена</b>\n\n"
+                f"Аккаунт: <b>{html.escape(me.first_name or '')}</b>\n"
+                f"ID: <code>{me.id}</code>"
+            ),
+            reply_markup=main_keyboard(),
+        )
+
+    except errors.PasswordHashInvalidError:
+        await message.answer("❌ Неверный облачный пароль.")
+
+    except Exception as error:
+        logger.exception("Ошибка входа по паролю")
+        await message.answer(
+            "❌ Ошибка авторизации:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+@router.message(F.text == "🚪 Выйти из аккаунта")
+async def logout_handler(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    global telethon_client
+
+    if await reject_non_admin_message(message):
+        return
+
+    await state.clear()
+
+    try:
+        client = await get_telethon_client()
+
+        if await client.is_user_authorized():
+            await client.log_out()
+
+        telethon_client = None
+        delete_session_file()
+
+        await message.answer(
+            "✅ Сессия пользовательского аккаунта удалена.",
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка выхода из аккаунта")
+        await message.answer(
+            "❌ Ошибка выхода:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
 
 
 # ============================================================
-# CALLBACK: СТАТУС И РАССЫЛКА
+# ВЫБОР КАНАЛА
 # ============================================================
 
-@router.callback_query(F.data == "status")
-async def status_callback(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    state = load_state(user_id)
-    accounts = await authorized_accounts(user_id)
-    running = is_running(user_id)
+@router.message(F.text == "📝 Заменить посты")
+async def replacement_start(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
 
-    total_individual = sum(
-        len(items) for items in state["individual_recipients"].values()
-    )
-    
-    total_recipients = len(state["common_recipients"]) + total_individual
+    client = await get_telethon_client()
 
-    await callback.message.edit_text(
-        "<b>Статус</b>\n\n"
-        f"Аккаунтов в базе: <b>{len(state['accounts'])}</b>\n"
-        f"Авторизовано: <b>{len(accounts)}</b>\n"
-        f"Основных сообщений: <b>{len(state['messages'])}</b>\n"
-        f"Общих получателей: <b>{len(state['common_recipients'])}</b>\n"
-        f"Индивидуальных получателей: <b>{total_individual}</b>\n"
-        f"Всего получателей: <b>{total_recipients}</b>\n"
-        f"Шаблонов: <b>{len(state['group_templates'])}</b>\n"
-        f"Рассылка: <b>{'идёт (параллельно)' if running else 'остановлена'}</b>\n\n"
-        f"Скорость печати: <b>{CHAR_TYPING_SPEED} сек/символ</b>",
-        reply_markup=main_keyboard(),
+    if not await client.is_user_authorized():
+        await message.answer(
+            "❌ Сначала авторизуйте пользовательский аккаунт.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    loading = await message.answer("🔍 Получаю список каналов...")
+
+    try:
+        channels = await get_editable_channels()
+
+        if not channels:
+            await loading.edit_text(
+                "❌ Не найдено каналов, в которых аккаунт может "
+                "редактировать посты."
+            )
+            return
+
+        await state.clear()
+        await state.update_data(channels=channels)
+        await state.set_state(ReplacementStates.choosing_channel)
+
+        await loading.edit_text(
+            "📢 <b>Выберите канал</b>",
+            reply_markup=channels_keyboard(channels, page=0),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка получения каналов")
+
+        await loading.edit_text(
+            "❌ Не удалось получить каналы:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+@router.callback_query(
+    ReplacementStates.choosing_channel,
+    F.data.startswith("channels_page:"),
+)
+async def channels_page_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_callback(callback):
+        return
+
+    value = callback.data.split(":", maxsplit=1)[1]
+
+    if value == "noop":
+        await callback.answer()
+        return
+
+    page = int(value)
+    data = await state.get_data()
+    channels = data.get("channels", [])
+
+    await callback.message.edit_reply_markup(
+        reply_markup=channels_keyboard(channels, page)
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "start_broadcast")
-async def start_broadcast_callback(callback: CallbackQuery, bot: Bot) -> None:
-    user_id = callback.from_user.id
-
-    # Проверяем, не запущена ли уже рассылка
-    if is_running(user_id):
-        await callback.answer("❌ Рассылка уже идёт!", show_alert=True)
+@router.callback_query(
+    ReplacementStates.choosing_channel,
+    F.data.startswith("channel:"),
+)
+async def channel_selected(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_callback(callback):
         return
 
-    # Очищаем старые события остановки
-    stop_events.pop(user_id, None)
+    channel_id = int(callback.data.split(":", maxsplit=1)[1])
 
-    task = asyncio.create_task(
-        run_broadcast(bot, user_id, callback.message.chat.id)
+    data = await state.get_data()
+    channels: list[dict[str, Any]] = data.get("channels", [])
+
+    selected = next(
+        (
+            channel
+            for channel in channels
+            if channel["id"] == channel_id
+        ),
+        None,
     )
-    broadcast_tasks[user_id] = task
-    await callback.answer("✅ Рассылка запущена в параллельном режиме")
 
-
-@router.callback_query(F.data == "stop_broadcast")
-async def stop_broadcast_callback(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-
-    if not is_running(user_id):
-        await callback.answer("❌ Активной рассылки нет", show_alert=True)
+    if selected is None:
+        await callback.answer(
+            "Канал не найден. Начните заново.",
+            show_alert=True,
+        )
         return
 
-    # Устанавливаем событие остановки
-    stop_events.setdefault(user_id, asyncio.Event()).set()
-    
-    # Отменяем задачу
-    task = broadcast_tasks.get(user_id)
-    if task and not task.done():
-        task.cancel()
-    
-    await callback.answer("⏹ Остановка запрошена", show_alert=True)
+    await state.update_data(
+        channel_id=channel_id,
+        channel_title=selected["title"],
+        channels=None,
+    )
+    await state.set_state(ReplacementStates.waiting_dates)
+
+    await callback.message.edit_text(
+        "✅ Выбран канал:\n"
+        f"<b>{html.escape(selected['title'])}</b>"
+    )
+
+    await callback.message.answer(
+        "📅 <b>Отправьте даты сообщений</b>\n\n"
+        "<code>03.03.2026\n"
+        "04.04.2026\n"
+        "15.05.2026</code>"
+    )
+
+    await callback.answer()
 
 
 # ============================================================
-# ЗАПУСК
+# ДАТЫ И ПОСТЫ
 # ============================================================
 
-async def main() -> None:
-    if not BOT_TOKEN or ":" not in BOT_TOKEN:
-        raise RuntimeError("Проверьте BOT_TOKEN")
-    if API_ID <= 0 or not API_HASH:
-        raise RuntimeError("Проверьте API_ID и API_HASH")
-    if MIN_DELAY_SECONDS < 1 or MAX_DELAY_SECONDS < MIN_DELAY_SECONDS:
-        raise RuntimeError("Некорректная задержка")
+@router.message(ReplacementStates.waiting_dates)
+async def dates_received(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    bot = Bot(
-        BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher()
-    dp.include_router(router)
+    if not message.text:
+        await message.answer("❌ Отправьте даты текстовым сообщением.")
+        return
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await admin_log(bot, "Бот запущен.")
+        parsed_dates = parse_dates(message.text)
+    except ValueError as error:
+        await message.answer(
+            f"❌ {html.escape(str(error))}\n\n"
+            "Пример:\n"
+            "<code>03.03.2026\n04.04.2026</code>"
+        )
+        return
+
+    dates_strings = [
+        date.strftime("%d.%m.%Y")
+        for date in parsed_dates
+    ]
+
+    await state.update_data(
+        dates=dates_strings,
+        posts=[],
+    )
+    await state.set_state(ReplacementStates.collecting_posts)
+
+    await message.answer(
+        "✅ <b>Даты сохранены</b>\n\n"
+        f"<code>{html.escape(format_dates(dates_strings))}</code>\n\n"
+        "Теперь отправляйте новые посты.\n\n"
+        "Разделители:\n"
+        "<code>-/1\n-/2\n-/3</code>\n\n"
+        "или:\n"
+        "<code>-/(1)\n-/(2)</code>\n\n"
+        "Номера игнорируются, учитывается только порядок.\n"
+        f"Максимум: <b>{MAX_POSTS}</b>.",
+        reply_markup=collection_keyboard(),
+    )
+
+
+@router.message(
+    ReplacementStates.collecting_posts,
+    F.text == "🗑 Очистить посты",
+)
+async def clear_collected_posts(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await state.update_data(posts=[])
+
+    await message.answer(
+        "🗑 Все принятые посты удалены."
+    )
+
+
+@router.message(
+    ReplacementStates.collecting_posts,
+    F.text == "✅ Готово",
+)
+async def finish_collecting_posts(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    data = await state.get_data()
+
+    channel_id = data.get("channel_id")
+    channel_title = data.get("channel_title")
+    dates: list[str] = data.get("dates", [])
+    posts: list[str] = data.get("posts", [])
+
+    if not channel_id or not dates:
+        await state.clear()
+        await message.answer(
+            "❌ Данные операции потеряны. Начните заново.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if not posts:
+        await message.answer(
+            "❌ Вы ещё не отправили ни одного поста."
+        )
+        return
+
+    try:
+        old_messages = await get_messages_for_dates(
+            channel_id=channel_id,
+            dates=dates,
+        )
+
+        if len(old_messages) < len(posts):
+            await message.answer(
+                "❌ <b>Недостаточно сообщений для замены</b>\n\n"
+                f"Новых текстов: <b>{len(posts)}</b>\n"
+                f"Найдено существующих постов: "
+                f"<b>{len(old_messages)}</b>\n\n"
+                "Новые сообщения в канал создаваться не будут.",
+                reply_markup=collection_keyboard(),
+            )
+            return
+
+        preview_lines: list[str] = []
+
+        for index, post in enumerate(posts[:5], start=1):
+            preview_lines.append(
+                f"<b>{index}.</b> {post_preview(post)}"
+            )
+
+        if len(posts) > 5:
+            preview_lines.append(
+                f"\n…и ещё <b>{len(posts) - 5}</b>"
+            )
+
+        await state.set_state(ReplacementStates.confirmation)
+
+        await message.answer(
+            "⚠️ <b>Подтвердите замену</b>\n\n"
+            f"Канал: <b>{html.escape(channel_title)}</b>\n"
+            f"Дат выбрано: <b>{len(dates)}</b>\n"
+            f"Найдено существующих постов: "
+            f"<b>{len(old_messages)}</b>\n"
+            f"Новых текстов: <b>{len(posts)}</b>\n\n"
+            + "\n\n".join(preview_lines)
+            + "\n\nБот только изменит существующие посты. "
+              "Ничего нового в канал отправлено не будет.",
+            reply_markup=confirmation_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка проверки сообщений")
+        await state.clear()
+
+        await message.answer(
+            "❌ Ошибка проверки канала:\n"
+            f"<code>{html.escape(str(error))}</code>",
+            reply_markup=main_keyboard(),
+        )
+
+
+@router.message(ReplacementStates.collecting_posts)
+async def collect_posts(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    incoming_text = message.text or message.caption
+
+    if not incoming_text:
+        await message.answer(
+            "❌ Поддерживаются текстовые сообщения и подписи к медиа."
+        )
+        return
+
+    new_parts = split_posts(incoming_text)
+
+    if not new_parts:
+        await message.answer(
+            "❌ В сообщении не найден текст поста."
+        )
+        return
+
+    data = await state.get_data()
+    current_posts: list[str] = data.get("posts", [])
+
+    available = MAX_POSTS - len(current_posts)
+
+    if available <= 0:
+        await message.answer(
+            f"❌ Уже принято максимальное количество: "
+            f"{MAX_POSTS} постов."
+        )
+        return
+
+    accepted_parts = new_parts[:available]
+    rejected_count = len(new_parts) - len(accepted_parts)
+
+    current_posts.extend(accepted_parts)
+    await state.update_data(posts=current_posts)
+
+    response = (
+        f"✅ Принято из сообщения: <b>{len(accepted_parts)}</b>\n"
+        f"Всего: <b>{len(current_posts)}/{MAX_POSTS}</b>"
+    )
+
+    if rejected_count:
+        response += (
+            f"\n⚠️ Не принято из-за лимита: "
+            f"<b>{rejected_count}</b>"
+        )
+
+    await message.answer(response)
+
+
+# ============================================================
+# ПОДТВЕРЖДЕНИЕ
+# ============================================================
+
+@router.callback_query(
+    ReplacementStates.confirmation,
+    F.data == "replace:cancel",
+)
+@router.callback_query(
+    ReplacementStates.choosing_channel,
+    F.data == "replace:cancel",
+)
+async def replacement_cancel_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_callback(callback):
+        return
+
+    await state.clear()
+
+    await callback.message.answer(
+        "❌ Операция отменена.",
+        reply_markup=main_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@router.callback_query(
+    ReplacementStates.confirmation,
+    F.data == "replace:confirm",
+)
+async def replacement_confirm_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_callback(callback):
+        return
+
+    data = await state.get_data()
+
+    channel_id = data.get("channel_id")
+    channel_title = data.get("channel_title")
+    dates: list[str] = data.get("dates", [])
+    posts: list[str] = data.get("posts", [])
+
+    if not channel_id or not dates or not posts:
+        await state.clear()
+        await callback.answer(
+            "Данные операции потеряны",
+            show_alert=True,
+        )
+        await callback.message.answer(
+            "❌ Начните операцию заново.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    await state.set_state(ReplacementStates.processing)
+    await callback.answer("Замена началась")
+
+    try:
+        edited_count, errors_list = await perform_replacement(
+            channel_id=channel_id,
+            dates=dates,
+            new_posts=posts,
+        )
+
+        error_text = ""
+
+        if errors_list:
+            shown_errors = errors_list[:10]
+            error_text = (
+                "\n\n⚠️ <b>Ошибки:</b>\n"
+                + "\n".join(
+                    f"• {html.escape(value)}"
+                    for value in shown_errors
+                )
+            )
+
+            if len(errors_list) > 10:
+                error_text += (
+                    f"\n• …и ещё {len(errors_list) - 10}"
+                )
+
+        await callback.message.answer(
+            "✅ <b>Замена завершена</b>\n\n"
+            f"Канал: <b>{html.escape(channel_title)}</b>\n"
+            f"Изменено: <b>{edited_count}/{len(posts)}</b>\n"
+            f"Ошибок: <b>{len(errors_list)}</b>"
+            f"{error_text}\n\n"
+            "Новые сообщения в канал не отправлялись.",
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Критическая ошибка замены")
+
+        await callback.message.answer(
+            "❌ <b>Замена остановлена</b>\n\n"
+            f"<code>{html.escape(str(error))}</code>\n\n"
+            "Новые сообщения в канал не отправлялись.",
+            reply_markup=main_keyboard(),
+        )
+
+    finally:
+        await state.clear()
+
+
+@router.message(ReplacementStates.processing)
+async def processing_message_handler(message: Message) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await message.answer(
+        "⏳ Сейчас выполняется замена сообщений."
+    )
+
+
+@router.message(StateFilter(None))
+async def unknown_message(message: Message) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await message.answer(
+        "Выберите действие в меню.",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def on_shutdown() -> None:
+    global telethon_client
+
+    if telethon_client is not None:
+        try:
+            await telethon_client.disconnect()
+        except Exception:
+            logger.exception("Ошибка отключения Telethon")
+
+
+async def main() -> None:
+    logger.info("Запуск бота")
+
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    try:
         await dp.start_polling(bot)
     finally:
-        for task in list(qr_tasks.values()) + list(broadcast_tasks.values()):
-            if not task.done():
-                task.cancel()
-
-        for client in list(user_clients.values()):
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
+        await on_shutdown()
         await bot.session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен")
