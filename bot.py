@@ -105,23 +105,18 @@ def detect_stage(text: str) -> Optional[int]:
 
 
 def detect_client_payment_trigger(message: Message) -> Optional[str]:
-    """Клиентский триггер: PDF-файл во входящем business-сообщении."""
+    """Клиентский триггер: любой PDF-документ во входящем business-сообщении."""
     document = message.document
-
-    # В PTB документ обычно доступен через message.document, но для
-    # надёжности также проверяем effective_attachment.
     if document is None:
         attachment = message.effective_attachment
-        if attachment is not None and hasattr(attachment, "file_name"):
+        if attachment is not None and hasattr(attachment, "mime_type") and hasattr(attachment, "file_name"):
             document = attachment
-
     if document is None:
         return None
 
-    filename = (getattr(document, "file_name", None) or "").strip().casefold()
-    mime_type = (getattr(document, "mime_type", None) or "").strip().casefold()
-
-    if filename.endswith(".pdf") or mime_type == "application/pdf" or mime_type.endswith("/pdf"):
+    filename = (getattr(document, "file_name", None) or "").casefold().strip()
+    mime_type = (getattr(document, "mime_type", None) or "").casefold().split(";", 1)[0].strip()
+    if filename.endswith(".pdf") or mime_type == "application/pdf":
         return "PDF-файл от клиента"
     return None
 
@@ -137,6 +132,7 @@ def detect_owner_payment_trigger(message: Message) -> Optional[str]:
 
 
 class ClientRepository:
+    """Хранилище, изолированное по owner_id + user_id."""
     def __init__(self, path: Path) -> None:
         self.path = path
         self.initialize()
@@ -146,16 +142,13 @@ class ClientRepository:
         db.row_factory = sqlite3.Row
         return db
 
-    @staticmethod
-    def _columns(db: sqlite3.Connection, table: str) -> set[str]:
-        return {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
-
     def initialize(self) -> None:
         with self.connect() as db:
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS clients (
-                    user_id INTEGER PRIMARY KEY,
+            db.execute("PRAGMA foreign_keys = ON")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS clients_scoped (
+                    owner_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
                     username TEXT,
                     first_name TEXT NOT NULL,
                     stage INTEGER NOT NULL,
@@ -166,322 +159,200 @@ class ClientRepository:
                     stage_updated_at TEXT,
                     reminder_3_sent INTEGER NOT NULL DEFAULT 0,
                     reminder_6_sent INTEGER NOT NULL DEFAULT 0,
-                    reminder_13_sent INTEGER NOT NULL DEFAULT 0
+                    reminder_13_sent INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(owner_id, user_id)
                 )
-                """
-            )
-
-            # Миграция базы, созданной предыдущей версией бота.
-            columns = self._columns(db, "clients")
-            additions = {
-                "stage_updated_at": "TEXT",
-                "reminder_3_sent": "INTEGER NOT NULL DEFAULT 0",
-                "reminder_6_sent": "INTEGER NOT NULL DEFAULT 0",
-                "reminder_13_sent": "INTEGER NOT NULL DEFAULT 0",
-            }
-            for name, definition in additions.items():
-                if name not in columns:
-                    db.execute(f"ALTER TABLE clients ADD COLUMN {name} {definition}")
-
-            db.execute(
-                """
-                UPDATE clients
-                SET stage_updated_at = COALESCE(stage_updated_at, updated_at, last_active)
-                WHERE stage_updated_at IS NULL
-                """
-            )
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS payment_reminders (
-                    user_id INTEGER PRIMARY KEY,
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS payment_reminders_scoped (
+                    owner_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
                     trigger_type TEXT NOT NULL,
                     trigger_message_id INTEGER,
-                    baseline_stage INTEGER,
+                    baseline_stage INTEGER NOT NULL,
                     due_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    reminder_mode TEXT NOT NULL DEFAULT 'standard',
                     repeat_seconds INTEGER NOT NULL DEFAULT 300,
-                    FOREIGN KEY(user_id) REFERENCES clients(user_id) ON DELETE CASCADE
+                    PRIMARY KEY(owner_id, user_id),
+                    FOREIGN KEY(owner_id, user_id)
+                        REFERENCES clients_scoped(owner_id, user_id) ON DELETE CASCADE
                 )
-                """
-            )
-            payment_columns = self._columns(db, "payment_reminders")
-            payment_additions = {
-                "reminder_mode": "TEXT NOT NULL DEFAULT 'standard'",
-                "repeat_seconds": "INTEGER NOT NULL DEFAULT 300",
-            }
-            for name, definition in payment_additions.items():
-                if name not in payment_columns:
-                    db.execute(f"ALTER TABLE payment_reminders ADD COLUMN {name} {definition}")
+            """)
 
-    def ensure_client(
-        self,
-        user_id: int,
-        username: Optional[str],
-        first_name: str,
-    ) -> sqlite3.Row:
+    def adopt_legacy_client(self, owner_id: int, user_id: int) -> None:
+        """Однократно подхватывает старую запись при первом событии именно этого business-аккаунта."""
+        with self.connect() as db:
+            exists = db.execute(
+                "SELECT 1 FROM clients_scoped WHERE owner_id=? AND user_id=?",
+                (owner_id, user_id),
+            ).fetchone()
+            if exists:
+                return
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='clients'"
+            ).fetchone()
+            if not table:
+                return
+            old = db.execute("SELECT * FROM clients WHERE user_id=?", (user_id,)).fetchone()
+            if old is None:
+                return
+            keys = set(old.keys())
+            now_s = dt_to_str(utc_now())
+            db.execute("""
+                INSERT OR IGNORE INTO clients_scoped
+                (owner_id,user_id,username,first_name,stage,status,last_active,hidden_at,
+                 updated_at,stage_updated_at,reminder_3_sent,reminder_6_sent,reminder_13_sent)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                owner_id, user_id, old['username'], old['first_name'], int(old['stage']),
+                old['status'], old['last_active'], old['hidden_at'], old['updated_at'],
+                old['stage_updated_at'] if 'stage_updated_at' in keys else old['updated_at'],
+                int(old['reminder_3_sent']) if 'reminder_3_sent' in keys else 0,
+                int(old['reminder_6_sent']) if 'reminder_6_sent' in keys else 0,
+                int(old['reminder_13_sent']) if 'reminder_13_sent' in keys else 0,
+            ))
+
+    def upsert_stage(self, owner_id: int, user_id: int, username: Optional[str],
+                     first_name: str, detected_stage: int) -> tuple[int, bool]:
         now_s = dt_to_str(utc_now())
         with self.connect() as db:
             row = db.execute(
-                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
+                "SELECT stage FROM clients_scoped WHERE owner_id=? AND user_id=?",
+                (owner_id, user_id),
             ).fetchone()
             if row is None:
-                db.execute(
-                    """
-                    INSERT INTO clients
-                    (user_id, username, first_name, stage, status, last_active,
-                     hidden_at, updated_at, stage_updated_at)
-                    VALUES (?, ?, ?, 0, 'active', ?, NULL, ?, ?)
-                    """,
-                    (user_id, username, first_name, now_s, now_s, now_s),
-                )
-            else:
-                db.execute(
-                    """
-                    UPDATE clients
-                    SET username = ?, first_name = ?, last_active = ?, updated_at = ?
-                    WHERE user_id = ?
-                    """,
-                    (username, first_name, now_s, now_s, user_id),
-                )
-            return db.execute(
-                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
-
-    def upsert_stage(
-        self,
-        user_id: int,
-        username: Optional[str],
-        first_name: str,
-        detected_stage: int,
-    ) -> tuple[int, bool]:
-        now_s = dt_to_str(utc_now())
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT stage FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
-
-            if row is None:
-                new_stage = detected_stage
-                changed = True
-                db.execute(
-                    """
-                    INSERT INTO clients
-                    (user_id, username, first_name, stage, status, last_active,
-                     hidden_at, updated_at, stage_updated_at,
-                     reminder_3_sent, reminder_6_sent, reminder_13_sent)
-                    VALUES (?, ?, ?, ?, 'active', ?, NULL, ?, ?, 0, 0, 0)
-                    """,
-                    (user_id, username, first_name, new_stage, now_s, now_s, now_s),
-                )
+                new_stage, changed = detected_stage, True
+                db.execute("""
+                    INSERT INTO clients_scoped
+                    (owner_id,user_id,username,first_name,stage,status,last_active,hidden_at,
+                     updated_at,stage_updated_at,reminder_3_sent,reminder_6_sent,reminder_13_sent)
+                    VALUES (?,?,?,?,?,'active',?,NULL,?,?,0,0,0)
+                """, (owner_id,user_id,username,first_name,new_stage,now_s,now_s,now_s))
             else:
                 old_stage = int(row["stage"])
                 new_stage = max(old_stage, detected_stage)
                 changed = new_stage > old_stage
-
-                # Любая найденная ключевая фраза считается обновлением этапа,
-                # даже если этот же этап уже был установлен ранее.
+                db.execute("""
+                    UPDATE clients_scoped SET username=?,first_name=?,stage=?,status='active',
+                        last_active=?,hidden_at=NULL,updated_at=?,stage_updated_at=?,
+                        reminder_3_sent=0,reminder_6_sent=0,reminder_13_sent=0
+                    WHERE owner_id=? AND user_id=?
+                """, (username,first_name,new_stage,now_s,now_s,now_s,owner_id,user_id))
                 db.execute(
-                    """
-                    UPDATE clients
-                    SET username = ?, first_name = ?, stage = ?, status = 'active',
-                        last_active = ?, hidden_at = NULL, updated_at = ?,
-                        stage_updated_at = ?, reminder_3_sent = 0,
-                        reminder_6_sent = 0, reminder_13_sent = 0
-                    WHERE user_id = ?
-                    """,
-                    (username, first_name, new_stage, now_s, now_s, now_s, user_id),
+                    "DELETE FROM payment_reminders_scoped WHERE owner_id=? AND user_id=?",
+                    (owner_id,user_id),
                 )
-                # Ключевая фраза означает, что новый платёж уже выдан.
-                # Поэтому отменяем ожидающее платёжное напоминание и при
-                # повышении этапа, и при повторной фразе того же этапа.
-                db.execute(
-                    "DELETE FROM payment_reminders WHERE user_id = ?", (user_id,)
-                )
-
         return new_stage, changed
 
-    def schedule_payment_reminder(
-        self,
-        user_id: int,
-        username: Optional[str],
-        first_name: str,
-        trigger_type: str,
-        trigger_message_id: int,
-        due_at: datetime,
-        reminder_mode: str = "standard",
-        replace_existing: bool = False,
-    ) -> bool:
-        # Триггер разрешён только для уже существующего клиента,
-        # который был добавлен в базу одной из семи ключевых фраз.
+    def schedule_payment_reminder(self, owner_id: int, user_id: int,
+                                  username: Optional[str], first_name: str,
+                                  trigger_type: str, trigger_message_id: int,
+                                  due_at: datetime, replace_existing: bool = True) -> bool:
         with self.connect() as db:
             client = db.execute(
-                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
+                "SELECT * FROM clients_scoped WHERE owner_id=? AND user_id=?",
+                (owner_id,user_id),
             ).fetchone()
             if client is None:
-                logger.info(
-                    "PAYMENT_TRIGGER_IGNORED | client_id=%s | reason=no_stage | trigger=%s",
-                    user_id,
-                    trigger_type,
-                )
+                logger.info("PAYMENT_TRIGGER_IGNORED | owner_id=%s | client_id=%s | reason=no_stage | trigger=%s",
+                            owner_id,user_id,trigger_type)
                 return False
-
             existing = db.execute(
-                "SELECT 1 FROM payment_reminders WHERE user_id = ?", (user_id,)
+                "SELECT 1 FROM payment_reminders_scoped WHERE owner_id=? AND user_id=?",
+                (owner_id,user_id),
             ).fetchone()
             if existing and not replace_existing:
                 return False
-            if existing and replace_existing:
-                db.execute("DELETE FROM payment_reminders WHERE user_id = ?", (user_id,))
-
-            db.execute(
-                """
-                UPDATE clients
-                SET username = ?, first_name = ?, status = 'active',
-                    last_active = ?, hidden_at = NULL, updated_at = ?
-                WHERE user_id = ?
-                """,
-                (
-                    username,
-                    first_name,
-                    dt_to_str(utc_now()),
-                    dt_to_str(utc_now()),
-                    user_id,
-                ),
-            )
-            db.execute(
-                """
-                INSERT INTO payment_reminders
-                (user_id, trigger_type, trigger_message_id, baseline_stage, due_at, created_at,
-                 reminder_mode, repeat_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    trigger_type,
-                    trigger_message_id,
-                    int(client["stage"]),
-                    dt_to_str(due_at),
-                    dt_to_str(utc_now()),
-                    reminder_mode,
-                    PAYMENT_REPEAT_SECONDS,
-                ),
-            )
+            if existing:
+                db.execute("DELETE FROM payment_reminders_scoped WHERE owner_id=? AND user_id=?",
+                           (owner_id,user_id))
+            now_s=dt_to_str(utc_now())
+            db.execute("""
+                UPDATE clients_scoped SET username=?,first_name=?,status='active',last_active=?,
+                    hidden_at=NULL,updated_at=? WHERE owner_id=? AND user_id=?
+            """, (username,first_name,now_s,now_s,owner_id,user_id))
+            db.execute("""
+                INSERT INTO payment_reminders_scoped
+                (owner_id,user_id,trigger_type,trigger_message_id,baseline_stage,due_at,created_at,repeat_seconds)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (owner_id,user_id,trigger_type,trigger_message_id,int(client["stage"]),
+                  dt_to_str(due_at),now_s,PAYMENT_REPEAT_SECONDS))
             return True
 
-    def reschedule_payment_reminder(self, user_id: int, due_at: datetime) -> None:
+    def reschedule_payment_reminder(self, owner_id: int, user_id: int, due_at: datetime) -> None:
         with self.connect() as db:
-            db.execute(
-                "UPDATE payment_reminders SET due_at = ? WHERE user_id = ?",
-                (dt_to_str(due_at), user_id),
-            )
+            db.execute("UPDATE payment_reminders_scoped SET due_at=? WHERE owner_id=? AND user_id=?",
+                       (dt_to_str(due_at),owner_id,user_id))
 
     def due_payment_reminders(self, now: datetime) -> list[sqlite3.Row]:
         with self.connect() as db:
-            return db.execute(
-                """
-                SELECT p.*, c.username, c.first_name, c.stage
-                FROM payment_reminders p
-                JOIN clients c ON c.user_id = p.user_id
-                WHERE p.due_at <= ?
-                ORDER BY p.due_at
-                """,
-                (dt_to_str(now),),
-            ).fetchall()
+            return db.execute("""
+                SELECT p.*,c.username,c.first_name,c.stage
+                FROM payment_reminders_scoped p
+                JOIN clients_scoped c ON c.owner_id=p.owner_id AND c.user_id=p.user_id
+                WHERE p.due_at<=? ORDER BY p.due_at
+            """, (dt_to_str(now),)).fetchall()
 
-    def delete_payment_reminder(self, user_id: int) -> None:
+    def delete_payment_reminder(self, owner_id: int, user_id: int) -> None:
         with self.connect() as db:
-            db.execute("DELETE FROM payment_reminders WHERE user_id = ?", (user_id,))
+            db.execute("DELETE FROM payment_reminders_scoped WHERE owner_id=? AND user_id=?",
+                       (owner_id,user_id))
 
-    def due_stage_reminders(self, now: datetime) -> list[tuple[sqlite3.Row, int]]:
-        result: list[tuple[sqlite3.Row, int]] = []
+    def due_stage_reminders(self, now: datetime) -> list[tuple[sqlite3.Row,int]]:
+        result=[]
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM clients").fetchall()
-            for row in rows:
-                stage_updated_at = str_to_dt(row["stage_updated_at"])
-                if not stage_updated_at:
-                    continue
-                elapsed = now - stage_updated_at
+            for row in db.execute("SELECT * FROM clients_scoped").fetchall():
+                stage_updated_at=str_to_dt(row["stage_updated_at"])
+                if not stage_updated_at: continue
+                elapsed=now-stage_updated_at
                 for day in STAGE_REMINDER_DAYS:
-                    column = f"reminder_{day}_sent"
-                    if elapsed >= timedelta(days=day) and not int(row[column]):
-                        result.append((row, day))
+                    if elapsed>=timedelta(days=day) and not int(row[f"reminder_{day}_sent"]):
+                        result.append((row,day))
         return result
 
-    def mark_stage_reminder_sent(self, user_id: int, day: int) -> None:
-        if day not in STAGE_REMINDER_DAYS:
-            raise ValueError("Недопустимый срок напоминания")
+    def mark_stage_reminder_sent(self, owner_id: int, user_id: int, day: int) -> None:
+        if day not in STAGE_REMINDER_DAYS: raise ValueError("Недопустимый срок напоминания")
         with self.connect() as db:
-            db.execute(
-                f"UPDATE clients SET reminder_{day}_sent = 1 WHERE user_id = ?",
-                (user_id,),
-            )
+            db.execute(f"UPDATE clients_scoped SET reminder_{day}_sent=1 WHERE owner_id=? AND user_id=?",
+                       (owner_id,user_id))
 
-    def set_status(self, user_id: int, status: str) -> bool:
-        now_s = dt_to_str(utc_now())
-        hidden_at = now_s if status == "inactive" else None
+    def set_status(self, owner_id: int, user_id: int, status: str) -> bool:
+        now_s=dt_to_str(utc_now()); hidden_at=now_s if status=='inactive' else None
         with self.connect() as db:
-            cursor = db.execute(
-                """
-                UPDATE clients
-                SET status = ?, hidden_at = ?,
-                    last_active = CASE WHEN ? = 'active' THEN ? ELSE last_active END,
-                    updated_at = ?
-                WHERE user_id = ?
-                """,
-                (status, hidden_at, status, now_s, now_s, user_id),
-            )
-            return cursor.rowcount > 0
+            cur=db.execute("""
+                UPDATE clients_scoped SET status=?,hidden_at=?,
+                    last_active=CASE WHEN ?='active' THEN ? ELSE last_active END,updated_at=?
+                WHERE owner_id=? AND user_id=?
+            """, (status,hidden_at,status,now_s,now_s,owner_id,user_id))
+            return cur.rowcount>0
 
-    def get(self, user_id: int) -> Optional[sqlite3.Row]:
+    def get(self, owner_id: int, user_id: int) -> Optional[sqlite3.Row]:
         with self.connect() as db:
-            return db.execute(
-                "SELECT * FROM clients WHERE user_id = ?", (user_id,)
-            ).fetchone()
+            return db.execute("SELECT * FROM clients_scoped WHERE owner_id=? AND user_id=?",
+                              (owner_id,user_id)).fetchone()
 
-    def list_by_status(self, status: str) -> list[sqlite3.Row]:
-        order = "last_active DESC" if status == "active" else "hidden_at DESC"
+    def list_by_status(self, owner_id: int, status: str) -> list[sqlite3.Row]:
+        order='last_active DESC' if status=='active' else 'hidden_at DESC'
         with self.connect() as db:
-            return db.execute(
-                f"SELECT * FROM clients WHERE status = ? ORDER BY {order}",
-                (status,),
-            ).fetchall()
+            return db.execute(f"SELECT * FROM clients_scoped WHERE owner_id=? AND status=? ORDER BY {order}",
+                              (owner_id,status)).fetchall()
 
-    def auto_cleanup(self) -> tuple[int, int]:
-        now = utc_now()
-        inactive_before = now - timedelta(hours=INACTIVE_AFTER_HOURS)
-        delete_before = now - timedelta(days=DELETE_AFTER_DAYS)
-        hidden_count = 0
-        deleted_count = 0
-
+    def auto_cleanup(self) -> tuple[int,int]:
+        now=utc_now(); inactive_before=now-timedelta(hours=INACTIVE_AFTER_HOURS); delete_before=now-timedelta(days=DELETE_AFTER_DAYS)
+        hidden_count=deleted_count=0
         with self.connect() as db:
-            rows = db.execute(
-                "SELECT user_id, last_active FROM clients WHERE status = 'active'"
-            ).fetchall()
-            for row in rows:
-                last_active = str_to_dt(row["last_active"])
-                if last_active and last_active < inactive_before:
-                    db.execute(
-                        """
-                        UPDATE clients
-                        SET status = 'inactive', hidden_at = ?, updated_at = ?
-                        WHERE user_id = ?
-                        """,
-                        (dt_to_str(now), dt_to_str(now), row["user_id"]),
-                    )
-                    hidden_count += 1
-
-            rows = db.execute(
-                "SELECT user_id, hidden_at FROM clients WHERE status = 'inactive'"
-            ).fetchall()
-            for row in rows:
-                hidden_at = str_to_dt(row["hidden_at"])
-                if hidden_at and hidden_at < delete_before:
-                    db.execute("DELETE FROM payment_reminders WHERE user_id = ?", (row["user_id"],))
-                    db.execute("DELETE FROM clients WHERE user_id = ?", (row["user_id"],))
-                    deleted_count += 1
-
-        return hidden_count, deleted_count
+            for row in db.execute("SELECT owner_id,user_id,last_active FROM clients_scoped WHERE status='active'").fetchall():
+                last_active=str_to_dt(row['last_active'])
+                if last_active and last_active<inactive_before:
+                    db.execute("UPDATE clients_scoped SET status='inactive',hidden_at=?,updated_at=? WHERE owner_id=? AND user_id=?",
+                               (dt_to_str(now),dt_to_str(now),row['owner_id'],row['user_id']))
+                    hidden_count+=1
+            for row in db.execute("SELECT owner_id,user_id,hidden_at FROM clients_scoped WHERE status='inactive'").fetchall():
+                hidden_at=str_to_dt(row['hidden_at'])
+                if hidden_at and hidden_at<delete_before:
+                    db.execute("DELETE FROM clients_scoped WHERE owner_id=? AND user_id=?",(row['owner_id'],row['user_id']))
+                    deleted_count+=1
+        return hidden_count,deleted_count
 
 
 repo = ClientRepository(DB_PATH)
@@ -550,20 +421,34 @@ def payment_reminder_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-async def send_to_owners(application: Application, text: str, reply_markup) -> bool:
-    """Отправляет уведомление всем владельцам; успех хотя бы одному достаточен."""
-    delivered = False
-    for owner_id in OWNER_IDS:
-        try:
-            await application.bot.send_message(
-                chat_id=owner_id,
-                text=text,
-                reply_markup=reply_markup,
-            )
-            delivered = True
-        except Exception:
-            logger.exception("Не удалось отправить уведомление owner_id=%s", owner_id)
-    return delivered
+_BUSINESS_OWNER_CACHE: dict[str, int] = {}
+
+async def resolve_business_owner(application: Application, message: Message) -> Optional[int]:
+    connection_id = message.business_connection_id
+    if not connection_id:
+        logger.warning("BUSINESS_OWNER_UNKNOWN | chat_id=%s | reason=no_connection_id", message.chat.id)
+        return None
+    if connection_id in _BUSINESS_OWNER_CACHE:
+        return _BUSINESS_OWNER_CACHE[connection_id]
+    try:
+        connection = await application.bot.get_business_connection(connection_id)
+        owner_id = int(connection.user.id)
+    except Exception:
+        logger.exception("Не удалось определить владельца Business Connection %s", connection_id)
+        return None
+    if owner_id not in OWNER_IDS:
+        logger.warning("BUSINESS_OWNER_UNKNOWN | connection_id=%s | owner_id=%s | reason=not_allowed", connection_id, owner_id)
+        return None
+    _BUSINESS_OWNER_CACHE[connection_id] = owner_id
+    return owner_id
+
+async def send_to_owner(application: Application, owner_id: int, text: str, reply_markup) -> bool:
+    try:
+        await application.bot.send_message(chat_id=owner_id,text=text,reply_markup=reply_markup)
+        return True
+    except Exception:
+        logger.exception("Не удалось отправить уведомление owner_id=%s", owner_id)
+        return False
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -576,8 +461,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def show_list(query, status: str) -> None:
-    rows = repo.list_by_status(status)
+async def show_list(query, owner_id: int, status: str) -> None:
+    rows = repo.list_by_status(owner_id, status)
     title = "📋 Актуальные клиенты" if status == "active" else "📂 Неактуальные клиенты"
 
     if not rows:
@@ -604,8 +489,8 @@ async def show_list(query, status: str) -> None:
     )
 
 
-async def show_client(query, user_id: int) -> None:
-    row = repo.get(user_id)
+async def show_client(query, owner_id: int, user_id: int) -> None:
+    row = repo.get(owner_id, user_id)
     if row is None:
         await query.edit_message_text("Клиент не найден.", reply_markup=main_menu())
         return
@@ -642,20 +527,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "menu":
         await query.edit_message_text("Управление клиентами:", reply_markup=main_menu())
     elif data.startswith("list:"):
-        await show_list(query, data.split(":", 1)[1])
+        await show_list(query, query.from_user.id, data.split(":", 1)[1])
     elif data.startswith("client:"):
-        await show_client(query, int(data.split(":", 1)[1]))
+        await show_client(query, query.from_user.id, int(data.split(":", 1)[1]))
     elif data.startswith("hide:"):
         user_id = int(data.split(":", 1)[1])
-        repo.set_status(user_id, "inactive")
-        await show_client(query, user_id)
+        repo.set_status(query.from_user.id, user_id, "inactive")
+        await show_client(query, query.from_user.id, user_id)
     elif data.startswith("restore:"):
         user_id = int(data.split(":", 1)[1])
-        repo.set_status(user_id, "active")
-        await show_client(query, user_id)
+        repo.set_status(query.from_user.id, user_id, "active")
+        await show_client(query, query.from_user.id, user_id)
     elif data.startswith("mute_payment:"):
         user_id = int(data.split(":", 1)[1])
-        repo.delete_payment_reminder(user_id)
+        repo.delete_payment_reminder(query.from_user.id, user_id)
         try:
             await query.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup(
@@ -675,7 +560,10 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     if message is None:
         return
 
-    is_owner_message = bool(message.from_user and message.from_user.id in OWNER_IDS)
+    owner_id = await resolve_business_owner(context.application, message)
+    if owner_id is None:
+        return
+    is_owner_message = bool(message.from_user and message.from_user.id == owner_id)
     direction = "OUTGOING" if is_owner_message else "INCOMING"
     attachment_name = (
         message.effective_attachment.__class__.__name__
@@ -697,6 +585,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     client_id, username, first_name = message_client_data(message)
+    repo.adopt_legacy_client(owner_id, client_id)
 
     # Триггеры распределены по отправителю и срабатывают только для
     # клиентов, уже добавленных на один из этапов:
@@ -713,6 +602,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         )
         due_at = utc_now() + timedelta(seconds=delay)
         created = repo.schedule_payment_reminder(
+            owner_id,
             client_id,
             username,
             first_name,
@@ -740,7 +630,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     if stage is None:
         return
 
-    new_stage, changed = repo.upsert_stage(client_id, username, first_name, stage)
+    new_stage, changed = repo.upsert_stage(owner_id, client_id, username, first_name, stage)
     display_name = f"@{username}" if username else first_name
     logger.info(
         "CLIENT_STAGE | client_id=%s | client=%s | stage=%s | stage_name=%s | changed=%s",
@@ -759,8 +649,9 @@ async def reminder_loop(application: Application) -> None:
             # Напоминания через 3/6/13 дней без любой новой ключевой фразы этапа.
             for row, day in repo.due_stage_reminders(now):
                 try:
-                    delivered = await send_to_owners(
+                    delivered = await send_to_owner(
                         application,
+                        int(row["owner_id"]),
                         (
                             f"⏰ {day} дн. без обновления этапа\n\n"
                             f"Клиент: {row_name(row)}\n"
@@ -770,7 +661,7 @@ async def reminder_loop(application: Application) -> None:
                         open_client_keyboard(int(row["user_id"])),
                     )
                     if delivered:
-                        repo.mark_stage_reminder_sent(int(row["user_id"]), day)
+                        repo.mark_stage_reminder_sent(int(row["owner_id"]), int(row["user_id"]), day)
                 except Exception:
                     logger.exception(
                         "Не удалось отправить напоминание %s дней для client_id=%s",
@@ -787,12 +678,13 @@ async def reminder_loop(application: Application) -> None:
                 # Повышение этапа — дополнительная защита. Любая ключевая фраза
                 # также удаляет напоминание сразу в upsert_stage().
                 if current_stage > baseline_stage:
-                    repo.delete_payment_reminder(user_id)
+                    repo.delete_payment_reminder(int(row["owner_id"]), user_id)
                     continue
 
                 try:
-                    delivered = await send_to_owners(
+                    delivered = await send_to_owner(
                         application,
+                        int(row["owner_id"]),
                         (
                             f"💳 Пора выдать новый платёж\n\n"
                             f"Клиент: {row_name(row)}\n"
@@ -805,6 +697,7 @@ async def reminder_loop(application: Application) -> None:
                     )
                     if delivered:
                         repo.reschedule_payment_reminder(
+                            int(row["owner_id"]),
                             user_id,
                             utc_now() + timedelta(seconds=int(row["repeat_seconds"])),
                         )
