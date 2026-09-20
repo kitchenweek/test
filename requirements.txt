@@ -1,6 +1,1 @@
-aiogram==3.22.0
-telethon==1.41.2
-aiohttp>=3.9
-aiofiles>=24.1.0
-pydantic>=2.11
-typing-extensions>=4.12
+python-telegram-bot==22.7
