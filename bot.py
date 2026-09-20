@@ -105,14 +105,23 @@ def detect_stage(text: str) -> Optional[int]:
 
 
 def detect_client_payment_trigger(message: Message) -> Optional[str]:
-    """Клиентский триггер: только PDF-файл во входящем сообщении."""
+    """Клиентский триггер: PDF-файл во входящем business-сообщении."""
     document = message.document
-    if not document:
+
+    # В PTB документ обычно доступен через message.document, но для
+    # надёжности также проверяем effective_attachment.
+    if document is None:
+        attachment = message.effective_attachment
+        if attachment is not None and hasattr(attachment, "file_name"):
+            document = attachment
+
+    if document is None:
         return None
 
-    filename = (document.file_name or "").casefold()
-    mime_type = (document.mime_type or "").casefold()
-    if filename.endswith(".pdf") or mime_type == "application/pdf":
+    filename = (getattr(document, "file_name", None) or "").strip().casefold()
+    mime_type = (getattr(document, "mime_type", None) or "").strip().casefold()
+
+    if filename.endswith(".pdf") or mime_type == "application/pdf" or mime_type.endswith("/pdf"):
         return "PDF-файл от клиента"
     return None
 
@@ -312,16 +321,6 @@ class ClientRepository:
             if client is None:
                 logger.info(
                     "PAYMENT_TRIGGER_IGNORED | client_id=%s | reason=no_stage | trigger=%s",
-                    user_id,
-                    trigger_type,
-                )
-                return False
-
-            # После этапа «Перерасчёт залога» и всех последующих этапов
-            # пятиминутные платёжные напоминания больше не запускаются.
-            if int(client["stage"]) >= 4:
-                logger.info(
-                    "PAYMENT_TRIGGER_IGNORED | client_id=%s | reason=deposit_recalculated | trigger=%s",
                     user_id,
                     trigger_type,
                 )
